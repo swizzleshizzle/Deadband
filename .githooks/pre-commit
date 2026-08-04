@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# Deadband pre-commit guard. This repository is PUBLIC.
+#
+# Four checks, cheapest first. Any failure blocks the commit.
+#   1. Files that must never be tracked at all
+#   2. Local deny-list of environment-specific strings (untracked, optional)
+#   3. gitleaks secret scan of staged content
+#   4. Large-file guard
+#
+# Bypass is `git commit --no-verify`. If you find yourself reaching for it,
+# the right move is almost always to fix the content, not the hook.
+
+set -uo pipefail
+
+RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+fail() { printf '%s\n' "${RED}BLOCKED${OFF} $*" >&2; FAILED=1; }
+FAILED=0
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR)"
+[ -z "$STAGED" ] && exit 0
+
+# --- 1. Paths that must never be tracked --------------------------------------
+
+while IFS= read -r f; do
+  case "$f" in
+    docs/ops/*)
+      fail "docs/ops/ is the private runbook and must never be committed: $f" ;;
+    imports/*|*.dump|*.sql.gz)
+      fail "looks like real venue data or a database dump: $f" ;;
+    *.csv)
+      case "$f" in
+        */fixtures/*) : ;;  # anonymized test fixtures are deliberate
+        *) fail "CSV outside fixtures/ — real venue exports contain account numbers: $f" ;;
+      esac ;;
+    .env|.env.*)
+      case "$f" in
+        .env.example) : ;;
+        *) fail "environment file: $f" ;;
+      esac ;;
+    *id_rsa*|*id_ed25519*|*.pem|*.p12|*.pfx|*.key)
+      fail "key material: $f" ;;
+  esac
+done <<< "$STAGED"
+
+# --- 2. Local deny-list (untracked; absent is fine) ---------------------------
+#
+# One pattern per line, POSIX ERE. Blank lines and # comments ignored.
+# Lives in docs/ops/ precisely so the deny-list itself is never published.
+#
+# This checks EVERY tracked file, not only the staged ones. Checking staged
+# files alone let a violation in README.md survive a commit made before this
+# hook existed. The repo is small enough that scanning it whole is free, and a
+# violation anywhere in the tree should block a push regardless of who put it
+# there or when.
+
+DENY="$REPO_ROOT/docs/ops/deny-list.txt"
+if [ -f "$DENY" ]; then
+  PATTERNS="$(grep -Ev '^[[:space:]]*(#|$)' "$DENY" || true)"
+  if [ -n "$PATTERNS" ]; then
+    ALL="$(git ls-files; printf '%s\n' "$STAGED")"
+    while IFS= read -r f; do
+      [ -n "$f" ] && [ -f "$REPO_ROOT/$f" ] || continue
+      case "$f" in .githooks/*|.gitleaks.toml|.claude/skills/*) continue ;; esac
+      HITS="$(grep -nEi -f <(printf '%s\n' "$PATTERNS") "$REPO_ROOT/$f" 2>/dev/null || true)"
+      if [ -n "$HITS" ]; then
+        fail "environment-specific string in $f"
+        printf '%s\n' "$HITS" | head -5 | sed "s/^/    ${DIM}/;s/\$/${OFF}/" >&2
+      fi
+    done <<< "$(printf '%s\n' "$ALL" | sort -u)"
+  fi
+fi
+
+# --- 3. gitleaks --------------------------------------------------------------
+
+GITLEAKS="$(command -v gitleaks || echo /root/bin/gitleaks)"
+if [ -x "$GITLEAKS" ]; then
+  if ! "$GITLEAKS" git --staged --pre-commit --no-banner --redact \
+        -c "$REPO_ROOT/.gitleaks.toml" "$REPO_ROOT" >/dev/null 2>&1; then
+    fail "gitleaks found a secret in staged content:"
+    "$GITLEAKS" git --staged --pre-commit --no-banner --redact \
+      -c "$REPO_ROOT/.gitleaks.toml" "$REPO_ROOT" 2>&1 | sed 's/^/    /' >&2
+  fi
+else
+  printf '%s\n' "${YEL}WARNING${OFF} gitleaks not found — secret scanning SKIPPED." >&2
+  printf '%s\n' "        Install it before trusting this hook. See .claude/skills/." >&2
+fi
+
+# --- 4. Large files -----------------------------------------------------------
+
+while IFS= read -r f; do
+  [ -f "$REPO_ROOT/$f" ] || continue
+  SZ=$(wc -c < "$REPO_ROOT/$f")
+  if [ "$SZ" -gt 5242880 ]; then
+    fail "file over 5 MB ($((SZ/1048576)) MB): $f — is this real data?"
+  fi
+done <<< "$STAGED"
+
+# ------------------------------------------------------------------------------
+
+if [ "$FAILED" -ne 0 ]; then
+  printf '\n%s\n' "${RED}Commit blocked.${OFF} This repository is public — assume anything" >&2
+  printf '%s\n\n' "committed is permanent, cached, and indexed, even if deleted later." >&2
+  exit 1
+fi
+exit 0

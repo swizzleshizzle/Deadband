@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+build/
+.vite/
+
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# === PUBLIC REPO — the rules below are load-bearing ===
+
+# Operational runbooks: hostnames, ports, paths, infrastructure detail.
+# The public contract lives in the design spec; the specifics stay local.
+/docs/ops/
+
+# Never commit real venue exports — they contain account numbers and positions.
+# Anonymized fixtures belong in importers/*/fixtures/ and are committed deliberately.
+/imports/
+*.csv
+!**/fixtures/**/*.csv
+
+# Local database dumps
+*.sql.gz
+*.dump
+
+.DS_Store

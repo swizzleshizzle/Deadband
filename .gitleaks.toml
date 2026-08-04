@@ -1,0 +1,85 @@
+# Deadband secret-scanning config.
+#
+# This repository is PUBLIC and will hold code for a system that touches real
+# brokerage and exchange accounts. The rules below extend gitleaks' default
+# ruleset with the failure modes specific to this project.
+#
+# Deliberately absent: any literal hostname, IP, or path from the real
+# deployment. This file is public, so a deny-list of specific strings would
+# publish exactly what it is meant to protect. Those live in the untracked
+# docs/ops/deny-list.txt, which the pre-commit hook reads if present.
+
+[extend]
+useDefault = true
+
+# --- Infrastructure disclosure ------------------------------------------------
+
+[[rules]]
+id = "deadband-tailscale-ip"
+description = "Tailscale CGNAT address (100.64.0.0/10) — internal network topology"
+regex = '''\b100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}\b'''
+tags = ["infrastructure", "network"]
+
+[[rules]]
+id = "deadband-windows-path"
+description = "Absolute Windows path — discloses deployment host layout"
+regex = '''\b[A-Za-z]:\\[A-Za-z0-9_.\-]+\\'''
+tags = ["infrastructure"]
+
+[[rules]]
+id = "deadband-wsl-mount"
+description = "WSL drive mount path — discloses deployment host layout"
+regex = '''(?:^|[\s"'`(])/mnt/[a-z](?:/|\b)'''
+tags = ["infrastructure"]
+
+# --- Credentials --------------------------------------------------------------
+
+[[rules]]
+id = "deadband-db-dsn-password"
+description = "Database connection string containing an inline password"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^:@\s/]+:[^@\s/]{3,}@'''
+tags = ["credential", "database"]
+
+[[rules]]
+id = "deadband-exchange-api-key"
+description = "Exchange or brokerage API credential assignment"
+regex = '''(?i)\b(?:coinbase|kraken|binance|alpaca|fidelity|tastytrade|schwab|tradier|polygon|finnhub|alphavantage)[_\-]?(?:api)?[_\-]?(?:key|secret|token|passphrase)\s*[:=]\s*['"][^'"\s]{8,}['"]'''
+tags = ["credential", "broker"]
+
+[[rules]]
+id = "deadband-seed-phrase"
+description = "Possible wallet seed phrase — catastrophic if published"
+regex = '''(?i)\b(?:mnemonic|seed[_\s\-]?phrase|recovery[_\s\-]?phrase)\s*[:=]\s*['"](?:[a-z]+\s+){11,}[a-z]+['"]'''
+tags = ["credential", "crypto"]
+
+[[rules]]
+id = "deadband-evm-private-key"
+description = "EVM private key (32-byte hex)"
+regex = '''(?i)\b(?:private[_\-]?key|privkey)\s*[:=]\s*['"]?0x[a-fA-F0-9]{64}['"]?'''
+tags = ["credential", "crypto"]
+
+# --- Personal financial data --------------------------------------------------
+
+[[rules]]
+id = "deadband-account-number"
+description = "Possible brokerage account number assignment"
+regex = '''(?i)\b(?:account[_\-]?(?:number|no|num)|acct[_\-]?(?:number|no))\s*[:=]\s*['"]?[A-Z0-9\-]{6,}['"]?'''
+tags = ["pii", "financial"]
+
+# --- Allowlist ----------------------------------------------------------------
+
+[allowlist]
+description = "Files that legitimately contain rule patterns or synthetic data"
+paths = [
+  '''\.gitleaks\.toml$''',
+  '''\.githooks/''',
+  '''\.claude/skills/''',
+  '''(^|/)fixtures/''',
+  '''(^|/)tests?/''',
+]
+regexTarget = "match"
+regexes = [
+  '''EXAMPLE''',
+  '''REDACTED''',
+  '''<[A-Za-z_ -]+>''',
+]
