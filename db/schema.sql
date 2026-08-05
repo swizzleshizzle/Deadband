@@ -1,0 +1,188 @@
+-- Deadband ledger schema. All money and quantity columns are NUMERIC, never
+-- FLOAT. All timestamps are TIMESTAMPTZ, stored UTC.
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name        TEXT PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS account (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    venue           TEXT NOT NULL,
+    external_ref    TEXT,
+    account_type    TEXT NOT NULL CHECK (account_type IN ('cash','margin','funded','wallet')),
+    default_intent  TEXT NOT NULL DEFAULT 'trade'
+                    CHECK (default_intent IN ('trade','investment','mixed')),
+    base_currency   TEXT NOT NULL DEFAULT 'USD',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    opened_at       TIMESTAMPTZ,
+    closed_at       TIMESTAMPTZ,
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (venue, external_ref)
+);
+
+CREATE TABLE IF NOT EXISTS funded_account_rule (
+    account_id          UUID PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
+    max_drawdown        NUMERIC,
+    drawdown_type       TEXT CHECK (drawdown_type IN ('static','trailing')),
+    daily_loss_limit    NUMERIC,
+    profit_target       NUMERIC,
+    payout_split        NUMERIC,
+    consistency_rule    TEXT,
+    current_state       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evaluated_at        TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS instrument (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    natural_key         TEXT NOT NULL UNIQUE,
+    asset_class         TEXT NOT NULL
+                        CHECK (asset_class IN
+                               ('crypto_spot','crypto_perp','equity','option','future')),
+    symbol              TEXT NOT NULL,
+    quote_currency      TEXT NOT NULL DEFAULT 'USD',
+    underlying          TEXT,
+    strike              NUMERIC,
+    expiry              DATE,
+    option_right        TEXT CHECK (option_right IN ('call','put')),
+    root                TEXT,
+    contract_multiplier NUMERIC NOT NULL DEFAULT 1,
+    chain               TEXT,
+    contract_address    TEXT,
+    active_from         DATE,
+    active_to           DATE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- fill is created before trade: trade.opening_fill_id references fill(id), so
+-- fill must exist first or the schema will not apply to a clean database.
+CREATE TABLE IF NOT EXISTS fill (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    instrument_id   UUID NOT NULL REFERENCES instrument(id),
+    executed_at     TIMESTAMPTZ NOT NULL,
+    side            TEXT NOT NULL CHECK (side IN ('buy','sell')),
+    quantity        NUMERIC NOT NULL CHECK (quantity > 0),
+    price           NUMERIC NOT NULL CHECK (price >= 0),
+    fee             NUMERIC NOT NULL DEFAULT 0,
+    fee_currency    TEXT NOT NULL DEFAULT 'USD',
+    source          TEXT NOT NULL
+                    CHECK (source IN ('manual','csv','api','opening_balance')),
+    venue_order_id  TEXT,
+    venue_fill_id   TEXT,
+    content_hash    TEXT,
+    is_estimated    BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Idempotent import rests on these two. A venue fill id is authoritative when
+-- present; the content hash is the fallback for exports that carry no id.
+CREATE UNIQUE INDEX IF NOT EXISTS fill_venue_id_uniq
+    ON fill (account_id, venue_fill_id) WHERE venue_fill_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS fill_content_hash_uniq
+    ON fill (account_id, content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS fill_account_instrument_time_idx
+    ON fill (account_id, instrument_id, executed_at);
+
+CREATE TABLE IF NOT EXISTS trade (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id          UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    primary_underlying  TEXT,
+    direction           TEXT NOT NULL CHECK (direction IN ('long','short','spread')),
+    status              TEXT NOT NULL CHECK (status IN ('open','closed')),
+    intent              TEXT NOT NULL DEFAULT 'unassigned'
+                        CHECK (intent IN ('trade','investment','unassigned')),
+    grouping_mode       TEXT NOT NULL DEFAULT 'auto'
+                        CHECK (grouping_mode IN ('auto','manual')),
+    -- Stable identity for auto trades. Regroup upserts on this instead of
+    -- deleting and rebuilding, so user-authored fields survive re-imports.
+    opening_fill_id     UUID REFERENCES fill(id) ON DELETE CASCADE,
+    opened_at           TIMESTAMPTZ NOT NULL,
+    closed_at           TIMESTAMPTZ,
+    qty_opened          NUMERIC,
+    qty_closed          NUMERIC,
+    avg_entry           NUMERIC,
+    avg_exit            NUMERIC,
+    realized_pnl        NUMERIC,
+    gross_realized_pnl  NUMERIC,
+    fees_total          NUMERIC,
+    planned_risk        NUMERIC,
+    r_multiple          NUMERIC,
+    strategy_tag        TEXT,
+    rolled_from_id      UUID REFERENCES trade(id) ON DELETE SET NULL,
+    notes               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
+CREATE INDEX IF NOT EXISTS trade_opened_at_idx ON trade (opened_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_fill_uniq
+    ON trade (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL;
+
+-- Association is an allocation, not a foreign key on fill: one fill that crosses
+-- zero belongs to two trades, split by quantity.
+CREATE TABLE IF NOT EXISTS trade_fill (
+    trade_id    UUID NOT NULL REFERENCES trade(id) ON DELETE CASCADE,
+    fill_id     UUID NOT NULL REFERENCES fill(id) ON DELETE CASCADE,
+    quantity    NUMERIC NOT NULL CHECK (quantity > 0),
+    PRIMARY KEY (trade_id, fill_id)
+);
+
+CREATE INDEX IF NOT EXISTS trade_fill_fill_idx ON trade_fill (fill_id);
+
+CREATE TABLE IF NOT EXISTS cash_movement (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN
+                    ('deposit','withdrawal','fee','funding','interest',
+                     'dividend','payout','rebate')),
+    amount          NUMERIC NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'USD',
+    instrument_id   UUID REFERENCES instrument(id),
+    venue_ref       TEXT,
+    content_hash    TEXT,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS cash_content_hash_uniq
+    ON cash_movement (account_id, content_hash) WHERE content_hash IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mark (
+    instrument_id   UUID NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
+    as_of           TIMESTAMPTZ NOT NULL,
+    price           NUMERIC NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'manual',
+    PRIMARY KEY (instrument_id, as_of)
+);
+
+CREATE TABLE IF NOT EXISTS corporate_action (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    instrument_id           UUID NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
+    action_type             TEXT NOT NULL CHECK (action_type IN
+                            ('split','reverse_split','merger','spinoff','symbol_change')),
+    ex_date                 DATE NOT NULL,
+    ratio_numerator         NUMERIC NOT NULL CHECK (ratio_numerator > 0),
+    ratio_denominator       NUMERIC NOT NULL CHECK (ratio_denominator > 0),
+    resulting_instrument_id UUID REFERENCES instrument(id),
+    cash_component          NUMERIC,
+    basis_allocation        NUMERIC,
+    note                    TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS account_snapshot (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    as_of           TIMESTAMPTZ NOT NULL,
+    cash_balance    NUMERIC NOT NULL,
+    total_equity    NUMERIC NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'statement',
+    note            TEXT,
+    UNIQUE (account_id, as_of)
+);
