@@ -14,7 +14,7 @@ from decimal import Decimal, localcontext
 from enum import StrEnum
 from uuid import UUID, uuid5
 
-from ledger.types import Fill
+from ledger.types import Fill, Side
 
 
 class ActionType(StrEnum):
@@ -53,17 +53,53 @@ class CorporateAction:
         if self.action_type in {ActionType.MERGER, ActionType.SPINOFF, ActionType.SYMBOL_CHANGE}:
             if self.resulting_instrument_id is None:
                 raise ValueError(f"{self.action_type} requires resulting_instrument_id")
+        if self.action_type is ActionType.SPINOFF:
+            if self.basis_allocation is None:
+                raise ValueError("spinoff requires basis_allocation")
+            if not (Decimal(0) <= self.basis_allocation <= Decimal(1)):
+                raise ValueError(
+                    f"basis_allocation must be between 0 and 1, got {self.basis_allocation}"
+                )
+        elif self.basis_allocation is not None:
+            if not (Decimal(0) <= self.basis_allocation <= Decimal(1)):
+                raise ValueError(
+                    f"basis_allocation must be between 0 and 1, got {self.basis_allocation}"
+                )
+
+
+_ACTION_PRECEDENCE = {
+    ActionType.SPLIT: 0,
+    ActionType.REVERSE_SPLIT: 0,
+    ActionType.SPINOFF: 1,
+    ActionType.SYMBOL_CHANGE: 2,
+    ActionType.MERGER: 3,
+}
 
 
 def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> list[Fill]:
-    """Return adjusted copies of `fills`, applying `actions` in ex-date order."""
+    """Return adjusted copies of `fills`, applying `actions` in ex-date order.
+
+    Adjustments apply only to fills executed strictly BEFORE ex_date (UTC day
+    boundary). This compares at UTC-day granularity, while ex_date is exchange-
+    local, so sessions crossing midnight UTC can have adjacent fills treated
+    differently — a known limitation pending position-aware calcs in a later task.
+
+    For spinoffs, only BUY fills get basis reallocated. A fully-closed pre-
+    ex_date position still has its BUY fills' basis reduced — correcting this
+    needs position awareness (later task). SELL fills are untouched by spinoffs."""
+    missing = [f for f in fills if f.id is None]
+    if missing:
+        raise ValueError(f"adjust_fills requires persisted fills; {len(missing)} have id=None")
+
     result = list(fills)
 
     with localcontext() as ctx:
         ctx.prec = 50
 
-        for action in sorted(actions, key=lambda a: (a.ex_date, a.action_type.value)):
-            ratio = action.ratio_numerator / action.ratio_denominator
+        for action in sorted(
+            actions,
+            key=lambda a: (a.ex_date, _ACTION_PRECEDENCE[a.action_type], str(a.instrument_id)),
+        ):
             next_result: list[Fill] = []
 
             for f in result:
@@ -76,12 +112,23 @@ def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> l
 
                 if action.action_type in {ActionType.SPLIT, ActionType.REVERSE_SPLIT}:
                     next_result.append(
-                        dataclasses.replace(f, quantity=f.quantity * ratio, price=f.price / ratio)
+                        dataclasses.replace(
+                            f,
+                            quantity=f.quantity * action.ratio_numerator / action.ratio_denominator,
+                            price=f.price * action.ratio_denominator / action.ratio_numerator,
+                            venue_fill_id=None,
+                            content_hash=None,
+                        )
                     )
 
                 elif action.action_type is ActionType.SYMBOL_CHANGE:
                     next_result.append(
-                        dataclasses.replace(f, instrument_id=action.resulting_instrument_id)
+                        dataclasses.replace(
+                            f,
+                            instrument_id=action.resulting_instrument_id,
+                            venue_fill_id=None,
+                            content_hash=None,
+                        )
                     )
 
                 elif action.action_type is ActionType.MERGER:
@@ -89,32 +136,37 @@ def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> l
                         dataclasses.replace(
                             f,
                             instrument_id=action.resulting_instrument_id,
-                            quantity=f.quantity * ratio,
-                            price=f.price / ratio,
+                            quantity=f.quantity * action.ratio_numerator / action.ratio_denominator,
+                            price=f.price * action.ratio_denominator / action.ratio_numerator,
+                            venue_fill_id=None,
+                            content_hash=None,
                         )
                     )
 
                 elif action.action_type is ActionType.SPINOFF:
-                    fraction = action.basis_allocation or Decimal(0)
-                    spun_qty = f.quantity * ratio
+                    if f.side is not Side.BUY:
+                        next_result.append(f)
+                        continue
+
+                    fraction = action.basis_allocation
+                    spun_qty = f.quantity * action.ratio_numerator / action.ratio_denominator
                     total_basis = f.quantity * f.price
                     next_result.append(
                         dataclasses.replace(f, price=f.price * (Decimal(1) - fraction))
                     )
-                    if spun_qty > 0:
-                        next_result.append(
-                            dataclasses.replace(
-                                f,
-                                id=_spinoff_fill_id(f.id, action),
-                                instrument_id=action.resulting_instrument_id,
-                                quantity=spun_qty,
-                                price=(total_basis * fraction) / spun_qty,
-                                fee=Decimal(0),
-                                is_estimated=True,
-                                venue_fill_id=None,
-                                content_hash=None,
-                            )
+                    next_result.append(
+                        dataclasses.replace(
+                            f,
+                            id=_spinoff_fill_id(f.id, action),
+                            instrument_id=action.resulting_instrument_id,
+                            quantity=spun_qty,
+                            price=(total_basis * fraction) / spun_qty,
+                            fee=Decimal(0),
+                            is_estimated=True,
+                            venue_fill_id=None,
+                            content_hash=None,
                         )
+                    )
 
             result = next_result
 

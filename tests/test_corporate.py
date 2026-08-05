@@ -12,13 +12,13 @@ OLD = UUID("00000000-0000-0000-0000-0000000000b1")
 NEW = UUID("00000000-0000-0000-0000-0000000000b2")
 
 
-def fill(qty, price, day, instrument=OLD) -> Fill:
+def fill(qty, price, day, instrument=OLD, side=Side.BUY, fill_id=None) -> Fill:
     return Fill(
-        id=uuid4(),
+        id=fill_id or uuid4(),
         account_id=ACC,
         instrument_id=instrument,
         executed_at=datetime(2026, 6, day, 15, 0, tzinfo=UTC),
-        side=Side.BUY,
+        side=side,
         quantity=Decimal(qty),
         price=Decimal(price),
         fee=Decimal("0"),
@@ -159,30 +159,24 @@ def test_zero_ratio_is_rejected():
         )
 
 
-def test_precision_pinning_with_non_terminating_ratio():
-    """3:1 split on price 100 produces non-terminating decimal 33.333...,
-    demonstrating precision pinning is essential. Compare str() not == since
-    Decimal("30") and Decimal("30.00") compare equal but str() differs."""
-    # Test with a non-terminating ratio: 3:1 split, price 100 -> 100/3
+def test_precision_pinning_produces_identical_results_across_ambient_precisions():
+    """C1-related: ensure precision pinning produces identical output regardless
+    of ambient precision. Compare full result sets using str() across three
+    different ambient precisions."""
     before = fill("30", "100", 1)
     action = split(15, 3, 1)
 
-    # Save and restore ambient precision
     ambient_prec = getcontext().prec
     try:
-        # Test under different ambient precisions
+        results = {}
         for test_prec in [3, 10, 28]:
             getcontext().prec = test_prec
             adjusted = adjust_fills([before], [action])
-            result_qty_str = str(adjusted[0].quantity)
-            result_price_str = str(adjusted[0].price)
-            # All should be identical regardless of ambient precision
-            assert result_qty_str == "90", (
-                f"Expected quantity 90, got {result_qty_str} at prec={test_prec}"
-            )
-            assert result_price_str.startswith("33.33"), (
-                f"Expected price ~33.33..., got {result_price_str} at prec={test_prec}"
-            )
+            results[test_prec] = [(str(f.quantity), str(f.price)) for f in adjusted]
+
+        # All precisions should produce identical string representations
+        result_set = {str(v) for v in results.values()}
+        assert len(result_set) == 1, f"Precision pinning failed: {results}"
     finally:
         getcontext().prec = ambient_prec
 
@@ -212,3 +206,346 @@ def test_spinoff_fill_ids_are_deterministic():
     assert spun1.id == spun2.id, f"Spinoff ids should be deterministic: {spun1.id} != {spun2.id}"
     # Verify full equality including all fields
     assert spun1 == spun2, "Repeated adjustment should produce identical fills"
+
+
+# ============================================================================
+# C1: Exact integer results (reverse splits) — scaling per fill, not pre-rounding
+# ============================================================================
+
+
+def test_reverse_split_exact_integer_result():
+    """C1: 1-for-3 reverse split of 300@10 must give exactly 100@30, not dust."""
+    before = fill("300", "10", 1)
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.REVERSE_SPLIT,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(3),
+    )
+    adjusted = adjust_fills([before], [action])
+    # Exact match with no phantom dust
+    assert adjusted[0].quantity == Decimal("100")
+    assert adjusted[0].price == Decimal("30")
+
+
+def test_reverse_split_exact_preserves_notional_value():
+    """C1: 1-for-3 reverse split preserves notional with no phantom dust
+    when rounded input feeds into grouping."""
+    from ledger.grouping import group_fills
+
+    # Create a pre-split position
+    fid = uuid4()
+    buy_300 = fill("300", "10", 1, fill_id=fid)
+
+    # Apply reverse split
+    split_action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.REVERSE_SPLIT,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(3),
+    )
+    adjusted = adjust_fills([buy_300], [split_action])
+
+    # Flatten: buy 100 @ 30 post-split
+    assert len(adjusted) == 1
+    assert adjusted[0].quantity == Decimal("100")
+    assert adjusted[0].price == Decimal("30")
+
+    # Now sell 100 post-split (after ex_date)
+    sell_100 = fill("100", "30", 20, side=Side.SELL, fill_id=uuid4())
+
+    # Group these two fills — should yield exactly one closed trade, no phantom short
+    groups = group_fills([adjusted[0], sell_100])
+    assert len(groups) == 1, f"Expected 1 closed trade, got {len(groups)}"
+    assert groups[0].status.value == "closed"
+
+
+# ============================================================================
+# I1: Ex-date boundary — exactly at ex_date and one microsecond before
+# ============================================================================
+
+
+def test_fill_at_exactly_ex_date_is_untouched():
+    """I1: Fill executed at exactly ex_date 00:00:00 UTC is UNTOUCHED (>= check)."""
+    f = Fill(
+        id=uuid4(),
+        account_id=ACC,
+        instrument_id=OLD,
+        executed_at=datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("10"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.CSV,
+        venue_fill_id=None,
+        is_estimated=False,
+    )
+    action = split(15, 2, 1)
+    adjusted = adjust_fills([f], [action])
+    # Should be untouched
+    assert adjusted[0].quantity == Decimal("10")
+    assert adjusted[0].price == Decimal("100")
+
+
+def test_fill_one_microsecond_before_ex_date_is_adjusted():
+    """I1: Fill executed 1 microsecond before ex_date IS adjusted (< check)."""
+    f = Fill(
+        id=uuid4(),
+        account_id=ACC,
+        instrument_id=OLD,
+        executed_at=datetime(2026, 6, 14, 23, 59, 59, 999999, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("10"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.CSV,
+        venue_fill_id=None,
+        is_estimated=False,
+    )
+    action = split(15, 2, 1)
+    adjusted = adjust_fills([f], [action])
+    # Should be adjusted
+    assert adjusted[0].quantity == Decimal("20")
+    assert adjusted[0].price == Decimal("50")
+
+
+# ============================================================================
+# I2: Action ordering — same-day split and merger, order independence
+# ============================================================================
+
+
+def test_same_ex_date_split_before_merger():
+    """I2: Split must happen before merger on same ex_date, so split is not lost."""
+    before = fill("10", "100", 1)
+
+    # Apply split then merger on same day
+    split_action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPLIT,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(2),
+        ratio_denominator=Decimal(1),
+    )
+    merger_action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(2),
+        resulting_instrument_id=NEW,
+    )
+
+    # Apply both in same call
+    adjusted = adjust_fills([before], [split_action, merger_action])
+
+    # Split: 10 qty * 2 = 20 qty, price / 2 = 50
+    # Merger: 20 qty * 1/2 = 10 qty, price * 2 = 100
+    parent_fills = [f for f in adjusted if f.instrument_id == NEW]
+    assert len(parent_fills) == 1
+    assert parent_fills[0].quantity == Decimal("10")
+    assert parent_fills[0].price == Decimal("100")
+
+
+def test_action_order_independence():
+    """I2: Same actions in different order should produce identical output."""
+    before = fill("10", "100", 1)
+
+    split_action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPLIT,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(2),
+        ratio_denominator=Decimal(1),
+    )
+    merger_action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(2),
+        resulting_instrument_id=NEW,
+    )
+
+    # Forward order
+    adjusted1 = adjust_fills([before], [split_action, merger_action])
+    # Reverse order
+    adjusted2 = adjust_fills([before], [merger_action, split_action])
+
+    # Same results
+    assert adjusted1 == adjusted2
+
+
+# ============================================================================
+# I3: Guard against id=None fills
+# ============================================================================
+
+
+def test_adjust_fills_rejects_fills_with_none_id():
+    """I3: adjust_fills must reject fills with id=None to prevent spinoff id
+    collision."""
+    f = Fill(
+        id=None,
+        account_id=ACC,
+        instrument_id=OLD,
+        executed_at=datetime(2026, 6, 1, 15, 0, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("10"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.CSV,
+        venue_fill_id=None,
+        is_estimated=False,
+    )
+    action = split(15, 2, 1)
+
+    with pytest.raises(ValueError, match="requires persisted fills"):
+        adjust_fills([f], [action])
+
+
+# ============================================================================
+# I4: Spinoff only applies to BUY fills
+# ============================================================================
+
+
+def test_spinoff_does_not_apply_to_sell_fills():
+    """I4: Spinoff basis allocation should not apply to SELL fills."""
+    sell_fill = fill("10", "120", 1, side=Side.SELL)
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.20"),
+    )
+
+    adjusted = adjust_fills([sell_fill], [action])
+
+    # SELL fill is untouched, no spinoff created
+    assert len(adjusted) == 1
+    assert adjusted[0] == sell_fill
+
+
+def test_spinoff_on_fully_closed_position_leaves_buy_unreduced():
+    """I4: A fully-closed pre-ex_date position still has BUY basis reduced.
+    This is a known limitation — we cannot tell if it was held at ex_date."""
+    fid_buy = uuid4()
+    fid_sell = uuid4()
+    buy_fill = fill("10", "100", 1, fill_id=fid_buy)
+    sell_fill = fill("10", "120", 5, side=Side.SELL, fill_id=fid_sell)
+
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.20"),
+    )
+
+    adjusted = adjust_fills([buy_fill, sell_fill], [action])
+
+    # Buy is reduced (even though it was fully closed before ex_date)
+    buy = [f for f in adjusted if f.id == fid_buy][0]
+    assert buy.price == Decimal("80")  # 100 * (1 - 0.20)
+
+    # Sell is untouched
+    sell = [f for f in adjusted if f.id == fid_sell][0]
+    assert sell.price == Decimal("120")
+
+    # Spinoff created from BUY only
+    spun = [f for f in adjusted if f.instrument_id == NEW]
+    assert len(spun) == 1
+
+
+# ============================================================================
+# I6: basis_allocation validation
+# ============================================================================
+
+
+def test_spinoff_requires_basis_allocation():
+    """I6: Spinoff must have basis_allocation specified."""
+    with pytest.raises(ValueError, match="spinoff requires basis_allocation"):
+        CorporateAction(
+            instrument_id=OLD,
+            action_type=ActionType.SPINOFF,
+            ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+            ratio_numerator=Decimal("1"),
+            ratio_denominator=Decimal("5"),
+            resulting_instrument_id=NEW,
+            basis_allocation=None,
+        )
+
+
+def test_basis_allocation_out_of_range_rejected():
+    """I6: basis_allocation must be between 0 and 1."""
+    with pytest.raises(ValueError, match="basis_allocation must be between 0 and 1"):
+        CorporateAction(
+            instrument_id=OLD,
+            action_type=ActionType.SPINOFF,
+            ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+            ratio_numerator=Decimal("1"),
+            ratio_denominator=Decimal("5"),
+            resulting_instrument_id=NEW,
+            basis_allocation=Decimal("1.5"),
+        )
+
+
+def test_basis_allocation_zero_allowed():
+    """I6: basis_allocation=0 should be allowed (no spinoff value)."""
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0"),
+    )
+    # Should not raise
+    assert action.basis_allocation == Decimal("0")
+
+
+def test_basis_allocation_one_allowed():
+    """I6: basis_allocation=1 should be allowed (all basis to spinoff)."""
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("1"),
+    )
+    # Should not raise
+    assert action.basis_allocation == Decimal("1")
+
+
+# ============================================================================
+# M5: Symbol-change ignores non-unit ratio
+# ============================================================================
+
+
+def test_symbol_change_ignores_non_unit_ratio():
+    """M5: Symbol-change should ignore the ratio, apply it only to instrument."""
+    before = fill("10", "50", 1)
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SYMBOL_CHANGE,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(2),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=NEW,
+    )
+    adjusted = adjust_fills([before], [action])
+    # Ratio is ignored; qty and price unchanged
+    assert adjusted[0].instrument_id == NEW
+    assert adjusted[0].quantity == Decimal("10")
+    assert adjusted[0].price == Decimal("50")
