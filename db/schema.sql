@@ -75,7 +75,10 @@ CREATE TABLE IF NOT EXISTS fill (
     content_hash    TEXT,
     is_estimated    BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Composite target for trade.opening_fill_id and trade_fill's cross-account
+    -- guard: a fill can only be referenced together with its own account_id.
+    CONSTRAINT fill_id_account_uniq UNIQUE (id, account_id)
 );
 
 -- Idempotent import rests on these two. A venue fill id is authoritative when
@@ -99,7 +102,10 @@ CREATE TABLE IF NOT EXISTS trade (
                         CHECK (grouping_mode IN ('auto','manual')),
     -- Stable identity for auto trades. Regroup upserts on this instead of
     -- deleting and rebuilding, so user-authored fields survive re-imports.
-    opening_fill_id     UUID REFERENCES fill(id) ON DELETE CASCADE,
+    -- ON DELETE SET NULL, never CASCADE: deleting a mis-imported fill must not take the
+    -- trade's user-authored fields (notes, planned_risk, strategy_tag, intent) with it.
+    -- A trade orphaned this way keeps its judgment; regroup decides what to do with it.
+    opening_fill_id     UUID,
     opened_at           TIMESTAMPTZ NOT NULL,
     closed_at           TIMESTAMPTZ,
     qty_opened          NUMERIC,
@@ -115,7 +121,18 @@ CREATE TABLE IF NOT EXISTS trade (
     rolled_from_id      UUID REFERENCES trade(id) ON DELETE SET NULL,
     notes               TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Composite target for trade_fill's cross-account guard (see below).
+    CONSTRAINT trade_id_account_uniq UNIQUE (id, account_id),
+    -- Composite FK, not a plain fill(id) reference: pins opening_fill_id's account
+    -- to match trade.account_id, so a trade in account B can never anchor on a
+    -- fill from account A. The column-scoped "SET NULL (opening_fill_id)" (PG15+)
+    -- is required, not stylistic: a bare "ON DELETE SET NULL" on a composite FK
+    -- nulls every column in the constraint, including account_id — which then
+    -- violates account_id's own NOT NULL and makes the fill un-deletable.
+    CONSTRAINT trade_opening_fill_fk
+        FOREIGN KEY (opening_fill_id, account_id)
+        REFERENCES fill (id, account_id) ON DELETE SET NULL (opening_fill_id)
 );
 
 CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
@@ -124,12 +141,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_fill_uniq
     ON trade (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL;
 
 -- Association is an allocation, not a foreign key on fill: one fill that crosses
--- zero belongs to two trades, split by quantity.
+-- zero belongs to two trades, split by quantity. account_id is a deliberate
+-- denormalization: it is what lets the composite FKs below make a cross-account
+-- allocation impossible to insert, rather than merely unlikely.
 CREATE TABLE IF NOT EXISTS trade_fill (
-    trade_id    UUID NOT NULL REFERENCES trade(id) ON DELETE CASCADE,
-    fill_id     UUID NOT NULL REFERENCES fill(id) ON DELETE CASCADE,
+    trade_id    UUID NOT NULL,
+    fill_id     UUID NOT NULL,
+    account_id  UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     quantity    NUMERIC NOT NULL CHECK (quantity > 0),
-    PRIMARY KEY (trade_id, fill_id)
+    PRIMARY KEY (trade_id, fill_id),
+    CONSTRAINT trade_fill_trade_fk FOREIGN KEY (trade_id, account_id)
+        REFERENCES trade (id, account_id) ON DELETE CASCADE,
+    CONSTRAINT trade_fill_fill_fk FOREIGN KEY (fill_id, account_id)
+        REFERENCES fill (id, account_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS trade_fill_fill_idx ON trade_fill (fill_id);

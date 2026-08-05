@@ -23,6 +23,8 @@ async def apply(conn: asyncpg.Connection) -> list[str]:
     done = {r["name"] for r in await conn.fetch("SELECT name FROM schema_migrations")}
     applied: list[str] = []
 
+    # sorted() on filenames is lexicographic, not numeric: migration files must be
+    # zero-padded (001_foo.sql, 002_bar.sql, ...) or 10_x.sql would sort before 2_y.sql.
     for path in sorted(MIGRATIONS.glob("*.sql")):
         if path.name in done:
             continue
