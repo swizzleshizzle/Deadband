@@ -60,7 +60,7 @@ tests; set it to run them too).
 | **D** | Market data, screeners, pre-trade gate | [spec](docs/superpowers/specs/2026-08-05-market-data-screeners-design.md) | — |
 | **E** | Strategy lab (dispatches to QuantConnect) | [spec](docs/superpowers/specs/2026-08-05-strategy-lab-design.md) | — |
 
-Parked ideas live in [`docs/ideas.md`](docs/ideas.md).
+Parked ideas live in [`docs/ideas.md`](docs/ideas.md); gaps carried out of A-1 are in [`docs/known-gaps.md`](docs/known-gaps.md).
 
 ## Principles
 
