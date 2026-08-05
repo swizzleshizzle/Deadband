@@ -99,6 +99,25 @@ def test_hash_normalizes_timezones_to_utc():
     assert h_utc == h_eastern, "same instant in different timezones must hash identically"
 
 
+def test_hash_occurrence_distinguishes_otherwise_identical_rows():
+    """Two rows with the same account/time/symbol/side/quantity/price — e.g. two
+    genuine same-day trades from a venue whose export has no time component —
+    must hash differently when given different occurrence indices, or the
+    second is silently deduped away as a "duplicate" of the first. Fails if
+    occurrence is ignored (payload construction drops it) or not distinguishing."""
+    base = (ACC, T, "SPY", "buy", Decimal("10"), Decimal("500"))
+    assert content_hash(*base, 0) != content_hash(*base, 1)
+    assert content_hash(*base, 1) != content_hash(*base, 2)
+
+
+def test_hash_occurrence_defaults_to_zero():
+    """The default keeps every pre-existing 6-arg call site (and its hash value)
+    unchanged. Fails if the default were anything other than 0, or if omitting
+    the argument produced a different hash than passing 0 explicitly."""
+    base = (ACC, T, "SPY", "buy", Decimal("10"), Decimal("500"))
+    assert content_hash(*base) == content_hash(*base, 0)
+
+
 def test_hash_rejects_naive_datetime():
     """Naive datetimes (no timezone) must raise ValueError.
 

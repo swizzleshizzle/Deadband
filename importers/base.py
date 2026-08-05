@@ -47,12 +47,23 @@ def content_hash(
     side: str,
     quantity: Decimal,
     price: Decimal,
+    occurrence: int = 0,
 ) -> str:
     """Dedupe key for exports that carry no venue fill id.
 
     Account-scoped, so the same trade in two accounts is two fills.
     Requires timezone-aware executed_at so the same instant always hashes
     identically regardless of which timezone offset it arrived in.
+
+    `occurrence` distinguishes genuinely repeated rows that otherwise hash
+    identically — e.g. two identical Fidelity trades on the same day, where the
+    export carries no time component at all. The caller assigns 0, 1, 2, ... to
+    successive rows with the same (executed_at, symbol, side, quantity, price)
+    shape within a batch, in the order they appear. That is stable across
+    re-imports of the same file (the same rows always get the same indices in
+    the same order), so re-importing still dedupes to zero, while two distinct
+    same-day repeats no longer collide onto the same hash. Default 0 keeps
+    every caller that never has same-shape repeats unaffected.
     """
     if executed_at.tzinfo is None:
         raise ValueError("content_hash requires a timezone-aware executed_at")
@@ -65,6 +76,7 @@ def content_hash(
             _escape(side.lower()),
             _canon(quantity),
             _canon(price),
+            str(occurrence),
         ]
     )
     return hashlib.sha256(payload.encode()).hexdigest()

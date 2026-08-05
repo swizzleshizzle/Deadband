@@ -34,6 +34,23 @@ async def cmd_import(args) -> int:
     if batch.unmapped_rows:
         print(f"  {len(batch.unmapped_rows)} row(s) not mapped", file=sys.stderr)
 
+    # A single export can carry rows for more than one venue account (Fidelity's
+    # "Account" column, for instance). Full routing is out of scope here — every
+    # row still lands in the one --account given — but silently merging two
+    # accounts' history is exactly the kind of thing that must never happen
+    # without at least a loud warning.
+    external_refs = sorted(
+        {f.external_ref for f in batch.fills if f.external_ref}
+        | {c.external_ref for c in batch.cash if c.external_ref}
+    )
+    if len(external_refs) > 1:
+        print(
+            "  warning: this file mixes multiple account refs "
+            f"({', '.join(external_refs)}); all rows will be committed to the "
+            "single --account given",
+            file=sys.stderr,
+        )
+
     if not args.commit:
         print("\npreview only — rerun with --commit to write")
         return 0
@@ -102,7 +119,17 @@ def main() -> int:
     args = parser.parse_args()
     if getattr(args, "commit", False) and not args.account:
         parser.error("--commit requires --account")
-    return asyncio.run(args.fn(args))
+
+    # A typo'd file path or a malformed --account UUID are the most likely first
+    # mistakes a user makes; a raw traceback for either is unfriendly and (for
+    # OSError especially) can leak a full local path. Anything from the database
+    # layer is deliberately left unwrapped — a bad account id that passes UUID
+    # parsing but doesn't exist is a real error worth seeing in full.
+    try:
+        return asyncio.run(args.fn(args))
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

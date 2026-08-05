@@ -10,6 +10,7 @@ that outer transaction rather than fighting it.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -67,8 +68,20 @@ async def commit_batch(
 ) -> CommitResult:
     fills: list[Fill] = []
 
+    # Fidelity (and some other venues) export a date with no time component, so
+    # two genuinely distinct same-day trades with identical symbol/side/qty/price
+    # would otherwise hash identically and one would be silently deduped away as
+    # a "duplicate" of the other — a real trade lost, not a benign re-import. The
+    # occurrence counter below breaks that tie while staying stable across
+    # re-imports: the same batch, walked in the same order, always assigns the
+    # same indices, so a genuine re-import still dedupes to zero.
+    fill_occurrence: dict[tuple, int] = defaultdict(int)
+
     for cf in batch.fills:
         instrument_id = await upsert_instrument(conn, cf.instrument)
+        key = (cf.executed_at, cf.instrument.symbol, cf.side.value, cf.quantity, cf.price)
+        occurrence = fill_occurrence[key]
+        fill_occurrence[key] += 1
         fills.append(
             Fill(
                 id=uuid4(),
@@ -96,6 +109,7 @@ async def commit_batch(
                         cf.side.value,
                         cf.quantity,
                         cf.price,
+                        occurrence,
                     )
                 ),
                 is_estimated=False,
@@ -105,6 +119,7 @@ async def commit_batch(
     fill_result = await insert_fills(conn, fills)
 
     cash_inserted = 0
+    cash_occurrence: dict[tuple, int] = defaultdict(int)
     for c in batch.cash:
         instrument_id = None
         note = c.note
@@ -118,6 +133,11 @@ async def commit_batch(
                 # sharing a symbol) both leave instrument_id NULL. Never guess;
                 # preserve the symbol instead so a human can resolve it later.
                 note = _append_symbol_note(note, c.symbol)
+
+        cash_key = (c.occurred_at, c.symbol or c.kind, c.kind, c.amount)
+        cash_occ = cash_occurrence[cash_key]
+        cash_occurrence[cash_key] += 1
+
         row = await conn.fetchval(
             """
             INSERT INTO cash_movement (account_id, occurred_at, kind, amount,
@@ -135,7 +155,13 @@ async def commit_batch(
             instrument_id,
             c.venue_ref,
             content_hash(
-                account_id, c.occurred_at, c.symbol or c.kind, c.kind, c.amount, Decimal(0)
+                account_id,
+                c.occurred_at,
+                c.symbol or c.kind,
+                c.kind,
+                c.amount,
+                Decimal(0),
+                cash_occ,
             ),
             note,
         )
