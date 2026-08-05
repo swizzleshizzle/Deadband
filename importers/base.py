@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, localcontext
 from typing import Protocol
 from uuid import UUID
 
 from ledger.types import Instrument, Side
+
+
+def _escape(part: str) -> str:
+    """Make a component free of the '|' delimiter, injectively.
+
+    '%' is escaped first so the mapping cannot be ambiguous.
+    """
+    return part.replace("%", "%25").replace("|", "%7C")
 
 
 def _canon(value: Decimal) -> str:
@@ -43,13 +51,18 @@ def content_hash(
     """Dedupe key for exports that carry no venue fill id.
 
     Account-scoped, so the same trade in two accounts is two fills.
+    Requires timezone-aware executed_at so the same instant always hashes
+    identically regardless of which timezone offset it arrived in.
     """
+    if executed_at.tzinfo is None:
+        raise ValueError("content_hash requires a timezone-aware executed_at")
+
     payload = "|".join(
         [
             str(account_id),
-            executed_at.astimezone(tz=executed_at.tzinfo).isoformat(),
-            symbol.upper(),
-            side.lower(),
+            executed_at.astimezone(UTC).isoformat(),
+            _escape(symbol.upper()),
+            _escape(side.lower()),
             _canon(quantity),
             _canon(price),
         ]

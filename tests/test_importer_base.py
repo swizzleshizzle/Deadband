@@ -1,6 +1,8 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
+
+import pytest
 
 from importers.base import content_hash
 
@@ -50,3 +52,58 @@ def test_hash_precision_pinning_distinguishes_quantities():
 
     # They must produce different hashes
     assert h1 != h2, "quantities differing beyond low precision must not be deduplicated"
+
+
+def test_hash_escapes_delimiter_in_symbol():
+    """Symbol and side containing | must not create collisions.
+
+    Without escaping, these two inputs would join to the same payload:
+      symbol="AAA|1", side="23"  -> "AAA|1|23|..."
+      symbol="AAA", side="1|23"  -> "AAA|1|23|..."
+    This silently drops one trade on import.
+    """
+    h1 = content_hash(ACC, T, "AAA|1", "23", Decimal("10"), Decimal("500"))
+    h2 = content_hash(ACC, T, "AAA", "1|23", Decimal("10"), Decimal("500"))
+    assert h1 != h2, "delimiter in symbol must not collide with one in side"
+
+
+def test_hash_escapes_percent_in_symbol():
+    """Escaping must be injective: %7C (escaped |) vs a literal | must differ.
+
+    This ensures that a symbol containing a literal "%7C" (which becomes "%%7C"
+    in JSON exports) does not collide with one containing a real "|".
+    """
+    # Symbol with a literal | that becomes %7C when escaped
+    h1 = content_hash(ACC, T, "A|B", "buy", Decimal("10"), Decimal("500"))
+    # Symbol with the literal string that results from the above escaping
+    # (this would be a pathological real-world symbol, but tests the injectivity)
+    h2 = content_hash(ACC, T, "A%7CB", "buy", Decimal("10"), Decimal("500"))
+    assert h1 != h2, "escaped pipe must not collide with literal %7C in symbol"
+
+
+def test_hash_normalizes_timezones_to_utc():
+    """Same instant in different timezone offsets must produce the same hash.
+
+    Two exports of the same trade with different offset conventions should
+    dedupe, not import twice. Without UTC normalization:
+      2026-08-01 14:30:00+00:00  ->  hash_A
+      2026-08-01 09:30:00-05:00  ->  hash_B  (the same instant!)
+    """
+    utc_time = datetime(2026, 8, 1, 14, 30, tzinfo=UTC)
+    eastern_tz = timezone(timedelta(hours=-5))
+    eastern_time = datetime(2026, 8, 1, 9, 30, tzinfo=eastern_tz)
+
+    h_utc = content_hash(ACC, utc_time, "SPY", "buy", Decimal("10"), Decimal("500"))
+    h_eastern = content_hash(ACC, eastern_time, "SPY", "buy", Decimal("10"), Decimal("500"))
+    assert h_utc == h_eastern, "same instant in different timezones must hash identically"
+
+
+def test_hash_rejects_naive_datetime():
+    """Naive datetimes (no timezone) must raise ValueError.
+
+    A naive datetime is silently interpreted as local machine time, which
+    violates the "pure" contract and makes hashing host-dependent.
+    """
+    naive_time = datetime(2026, 8, 1, 14, 30)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        content_hash(ACC, naive_time, "SPY", "buy", Decimal("10"), Decimal("500"))
