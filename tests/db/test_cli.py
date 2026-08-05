@@ -16,13 +16,16 @@ pytestmark = requires_db
 
 
 class _FakeAcquireCtx:
-    def __init__(self, conn):
+    def __init__(self, pool, conn):
+        self._pool = pool
         self._conn = conn
 
     async def __aenter__(self):
+        self._pool._checked_out = True
         return self._conn
 
     async def __aexit__(self, *exc_info):
+        self._pool._checked_out = False
         return False
 
 
@@ -30,16 +33,31 @@ class _FakePool:
     """Stands in for the real asyncpg.Pool returned by db.pool.create_pool, so
     cmd_import runs against the test fixture's own connection (already inside a
     transaction that conftest rolls back at teardown) instead of opening a real
-    pool from PG_DSN."""
+    pool from PG_DSN.
+
+    close() has real semantics for whether a connection is currently checked
+    out, unlike the original `pass`-bodied stand-in that could not model the
+    real asyncpg.Pool.close() deadlock (it waits for every checked-out
+    connection to be released) that cli.py's `await pool.close()` calls
+    inside `async with pool.acquire() as conn:` used to trigger — that stub
+    let those calls succeed silently instead of catching the bug.
+    """
 
     def __init__(self, conn):
         self._conn = conn
+        self._checked_out = False
 
     def acquire(self):
-        return _FakeAcquireCtx(self._conn)
+        return _FakeAcquireCtx(self, self._conn)
 
     async def close(self):
-        pass
+        if self._checked_out:
+            raise AssertionError(
+                "Pool.close() called while a connection is still acquired — "
+                "this deadlocks against a real asyncpg.Pool, which waits for "
+                "every checked-out connection to be released before close() "
+                "returns"
+            )
 
 
 async def test_a_crash_during_regroup_leaves_no_fills_through_the_real_cli(conn, monkeypatch):
@@ -126,6 +144,33 @@ async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, ca
     assert "002_fake.sql" in out
 
 
+# --- Blocker pass, item 6: db/migrations/ is empty, so apply() returns []
+# --- both when nothing was pending AND on a virgin database that just had
+# --- its entire schema created by apply()'s own schema.sql call — those are
+# --- different outcomes and must not share the "already up to date" message.
+
+
+async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, monkeypatch, capsys):
+    """Drops and recreates the public schema on `conn` (rolled back by
+    conftest's `conn` fixture at teardown, same as every other test here) to
+    put it in the "never migrated" state a brand-new Postgres would be in,
+    then runs the real cmd_migrate against it. Fails if cmd_migrate still says
+    "already up to date": that is what it said before this fix, on a database
+    that had zero tables a moment earlier."""
+    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already up to date" not in out
+    assert "schema applied" in out
+
+
 async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monkeypatch, capsys):
     """Fails if cmd_accounts_add doesn't actually call create_account, or
     prints something other than the raw UUID (the CLI's only shipped way to
@@ -168,7 +213,19 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
 ):
     """Fails if the venue check is missing (or backwards): rc would be 0 and
     the fidelity account would end up with committed coinbase fills instead
-    of being refused."""
+    of being refused.
+
+    Blocker pass, item 2: this is also the test that must catch cli.py's
+    `await pool.close()` deadlock in this exact branch (blocker item 1) — but
+    only because _FakePool.close() above now has real "still checked out"
+    semantics. Against the un-fixed cli.py (the mismatch branch calling
+    `await pool.close()` from inside `async with pool.acquire() as conn:`),
+    this test errors out with the fake pool's AssertionError instead of
+    reaching `assert rc == 2`, which is exactly what a real asyncpg.Pool would
+    do by hanging instead of erroring. Verified: temporarily restored the two
+    inner `await pool.close()` calls cli.py had before the item-1 fix and
+    reran this test — it failed with `AssertionError: Pool.close() called
+    while a connection is still acquired ...` instead of passing."""
     acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
 
     async def fake_create_pool(*_a, **_kw):

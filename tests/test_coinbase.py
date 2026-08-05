@@ -120,7 +120,63 @@ def test_zero_quantity_buy_row_is_skipped_not_fatal():
     assert len(result.fills) == 2
     assert [f.side for f in result.fills] == [Side.BUY, Side.SELL]
     assert len(result.unmapped_rows) == 1
-    assert any("zero quantity" in w for w in result.warnings)
+    assert any("non-positive quantity" in w for w in result.warnings)
+
+
+# --- Blocker pass, item 3: the guard above used `quantity == 0`, so a --------
+# --- negative Quantity Transacted (unlike Fidelity, Coinbase never abs()'s ---
+# --- it) still reached Fill.__post_init__'s `quantity <= 0` check at commit --
+# --- and took the whole batch down with it, same failure mode as item 1. ----
+
+
+def test_negative_quantity_buy_row_is_skipped_not_fatal():
+    """Fails if the guard is still `quantity == 0`: the negative-quantity row
+    would show up in fills with quantity -0.3 (a Fill that raises in
+    __post_init__ downstream, since Coinbase — unlike Fidelity — never takes
+    abs() of the parsed quantity) instead of being warned about, marked
+    unmapped, and skipped, leaving the two good rows to commit successfully."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,61200.00,30600.00,30753.00,153.00,ok",
+            "2026-01-16T09:05:00Z,Buy,BTC,-0.30000000,USD,60800.00,0,0,0,negative quantity",
+            "2026-02-03T11:20:00Z,Sell,BTC,0.25000000,USD,68000.00,17000.00,16915.00,85.00,ok",
+        ]
+    )
+    result = CoinbaseImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+    assert [f.side for f in result.fills] == [Side.BUY, Side.SELL]
+    assert len(result.unmapped_rows) == 1
+    assert any("non-positive quantity" in w for w in result.warnings)
+
+
+# --- Blocker pass, item 4: fee and (for non-fiat-priced cash) amount were ----
+# --- computed from the same poison-prone Decimal fields as quantity/price ---
+# --- but were not checked for finiteness anywhere. -------------------------
+
+
+def test_non_finite_fee_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,61200.00,0,0,Infinity,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
+def test_non_finite_cash_amount_is_rejected():
+    """Deposit rows compute amount directly from Quantity Transacted (asset ==
+    currency, so no multiplication needed to reach Infinity). Fails if the
+    cash branch has no finiteness guard: the deposit would show up in `cash`
+    with amount Decimal("Infinity") instead of being warned about and
+    skipped."""
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-02-10T00:00:00Z,Deposit,USD,Infinity,USD,1.00,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
 
 
 # --- Final fix wave, item 2: poison Decimal values (NaN/Infinity) pass the --

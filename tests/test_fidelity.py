@@ -243,6 +243,33 @@ def test_non_finite_price_is_rejected():
     assert any("non-finite" in w for w in result.warnings)
 
 
+# --- Blocker pass, item 4: fee (commission + fees) and cash amount were -----
+# --- computed from the same poison-prone Decimal fields as quantity/price ---
+# --- but were not checked for finiteness anywhere. Fill.__post_init__ never
+# --- validates fee at all, and cash_movement.amount has no CHECK constraint.
+
+
+def test_non_finite_fee_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad_row = header + "\n06/01/2026,X1,YOU BOUGHT,SPY,SPDR,10,500.00,Infinity,0.00,-5000.00\n"
+    result = FidelityImporter().parse(bad_row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
+def test_non_finite_cash_amount_is_rejected():
+    """Fails if the cash branch has no finiteness guard: this row would show
+    up in `cash` with amount Decimal("Infinity") instead of being warned
+    about and skipped."""
+    header = FIXTURE.splitlines()[0]
+    bad_row = header + "\n06/01/2026,X1,INTEREST EARNED,,Interest,0,0,0.00,0.00,Infinity\n"
+    result = FidelityImporter().parse(bad_row)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
 def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
     """The header row is located case-insensitively ("run date" in line.lower()),
     so a differently-cased real export must not then read zero usable fields —

@@ -125,6 +125,14 @@ class FidelityImporter:
                     warnings.append(f"line {line_no}: bad amount ({exc})")
                     unmapped.append(str(raw_row))
                     continue
+                # Decimal("Infinity")/Decimal("NaN") are valid constructions and slip
+                # past the `except InvalidOperation` above (same hazard as quantity/
+                # price below); cash_movement.amount has no CHECK constraint to catch
+                # one downstream.
+                if not amount.is_finite():
+                    warnings.append(f"line {line_no}: non-finite amount, skipped")
+                    unmapped.append(str(raw_row))
+                    continue
                 cash.append(
                     CanonicalCash(
                         occurred_at=when,
@@ -161,7 +169,9 @@ class FidelityImporter:
             # not caught by the `except InvalidOperation` above. Left unchecked,
             # Infinity survives Fill.__post_init__'s `quantity > 0` check and the
             # DB's `quantity > 0` CHECK, becoming a live allocation in group_fills.
-            if not raw_qty.is_finite() or not price.is_finite():
+            # fee is included too: Fill.__post_init__ never validates fee, and
+            # Postgres NUMERIC (PG14+) accepts Infinity, so nothing else catches it.
+            if not raw_qty.is_finite() or not price.is_finite() or not fee.is_finite():
                 warnings.append(f"line {line_no}: non-finite number, skipped")
                 unmapped.append(str(raw_row))
                 continue

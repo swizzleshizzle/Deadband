@@ -19,12 +19,21 @@ from importers.registry import get_importer, list_importers
 async def cmd_migrate(_args) -> int:
     pool = await create_pool()
     async with pool.acquire() as conn:
+        # apply() unconditionally (re-)executes schema.sql, and db/migrations/
+        # is currently empty, so `applied` is [] both when nothing was pending
+        # AND on a virgin database that just had its entire schema created —
+        # those are different outcomes and must not share one message. Check
+        # for a table schema.sql creates before calling apply(), while it's
+        # still meaningful to ask "did this exist already?".
+        existed_before = await conn.fetchval("SELECT to_regclass('public.account') IS NOT NULL")
         applied = await apply_migrations(conn)
     await pool.close()
     if applied:
         print(f"applied {len(applied)} migration(s):")
         for name in applied:
             print(f"  {name}")
+    elif not existed_before:
+        print("schema applied; no pending migrations")
     else:
         print("already up to date")
     return 0
@@ -87,29 +96,35 @@ async def cmd_import(args) -> int:
         return 0
 
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        account_id = UUID(args.account)
-        account = await get_account(conn, account_id)
-        if account is None:
-            print(f"error: no account with id {account_id}", file=sys.stderr)
-            await pool.close()
-            return 2
-        # A file parsed by one venue's importer must never be committed to an
-        # account belonging to a different venue — that would permanently
-        # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
-        # path to undo it.
-        if account["venue"] != importer.venue:
-            print(
-                f"error: account {account_id} is a {account['venue']!r} account; "
-                f"refusing to commit a {importer.venue!r} import to it",
-                file=sys.stderr,
-            )
-            await pool.close()
-            return 2
-        async with conn.transaction():
-            result = await commit_batch(conn, account_id, batch)
-            written = await regroup_account(conn, account_id)
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            account_id = UUID(args.account)
+            account = await get_account(conn, account_id)
+            if account is None:
+                print(f"error: no account with id {account_id}", file=sys.stderr)
+                return 2
+            # A file parsed by one venue's importer must never be committed to an
+            # account belonging to a different venue — that would permanently
+            # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
+            # path to undo it.
+            if account["venue"] != importer.venue:
+                print(
+                    f"error: account {account_id} is a {account['venue']!r} account; "
+                    f"refusing to commit a {importer.venue!r} import to it",
+                    file=sys.stderr,
+                )
+                return 2
+            async with conn.transaction():
+                result = await commit_batch(conn, account_id, batch)
+                written = await regroup_account(conn, account_id)
+    finally:
+        # pool.close() waits for every checked-out connection to be released.
+        # It must run after the `async with pool.acquire()` block has exited
+        # (or after an early `return` inside it unwound out of that `with`) —
+        # never from inside it while the connection returned by acquire() is
+        # still held, or close() deadlocks waiting for a release that will
+        # never come from a still-open acquire block.
+        await pool.close()
 
     print(
         f"inserted {result.fills_inserted} fills "
@@ -155,9 +170,13 @@ def main() -> int:
     p_accounts_add = accounts_sub.add_parser("add", help="create a new account")
     p_accounts_add.add_argument("--name", required=True)
     p_accounts_add.add_argument("--venue", required=True)
-    p_accounts_add.add_argument("--account-type", required=True)
+    p_accounts_add.add_argument(
+        "--account-type", required=True, choices=["cash", "margin", "funded", "wallet"]
+    )
     p_accounts_add.add_argument("--external-ref", default=None)
-    p_accounts_add.add_argument("--default-intent", default="trade")
+    p_accounts_add.add_argument(
+        "--default-intent", default="trade", choices=["trade", "investment", "mixed"]
+    )
     p_accounts_add.set_defaults(fn=cmd_accounts_add)
 
     p_import = sub.add_parser("import", help="parse a venue export")

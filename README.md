@@ -30,15 +30,15 @@ uv sync --extra dev
 cp .env.example .env   # fill in PG_DSN (and TEST_PG_DSN if you'll run the DB test suite)
 set -a && . ./.env && set +a
 
-python cli.py migrate                                                    # bootstrap the schema
-python cli.py accounts add --name "Fidelity Brokerage" --venue fidelity \
-    --account-type cash                                                  # prints the account UUID
-python cli.py accounts                                                   # list accounts
+uv run python cli.py migrate                                                    # bootstrap the schema
+uv run python cli.py accounts add --name "Fidelity Brokerage" --venue fidelity \
+    --account-type cash                                                         # prints the account UUID
+uv run python cli.py accounts                                                   # list accounts
 
-python cli.py import fidelity path/to/activity.csv --account <uuid>              # preview only
-python cli.py import fidelity path/to/activity.csv --account <uuid> --commit     # write + regroup
+uv run python cli.py import fidelity path/to/activity.csv --account <uuid>              # preview only
+uv run python cli.py import fidelity path/to/activity.csv --account <uuid> --commit     # write + regroup
 
-python cli.py trades --account <uuid>
+uv run python cli.py trades --account <uuid>
 ```
 
 `import` without `--commit` never opens a database connection — it only parses the file

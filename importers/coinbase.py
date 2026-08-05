@@ -68,10 +68,14 @@ class CoinbaseImporter:
                 # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
                 # would otherwise become a CanonicalFill that survives preview, then
                 # raises inside Fill.__post_init__ during commit — taking the whole
-                # batch down with it, not just this row. Same guard as Fidelity's
-                # twin (importers/fidelity.py).
-                if quantity == 0:
-                    warnings.append(f"line {line_no}: zero quantity, skipped")
+                # batch down with it, not just this row. Fidelity's twin importer
+                # guards this by taking abs(quantity) before the equality check, so
+                # only exactly-zero rows reach it; Coinbase's Quantity Transacted is
+                # used as-is (never abs()'d), so a negative value here reaches
+                # Fill.__post_init__'s `quantity <= 0` check unguarded too — hence
+                # `<= 0`, not `== 0`.
+                if quantity <= 0:
+                    warnings.append(f"line {line_no}: non-positive quantity, skipped")
                     unmapped.append(str(row))
                     continue
 
@@ -79,7 +83,10 @@ class CoinbaseImporter:
                 # are not caught by the `except InvalidOperation` above. Left
                 # unchecked, Infinity survives Fill.__post_init__'s `quantity > 0`
                 # check and the DB's `quantity > 0` CHECK, becoming a live allocation.
-                if not quantity.is_finite() or not price.is_finite():
+                # fee is included here too: Fill.__post_init__ never validates fee at
+                # all, and Postgres NUMERIC (PG14+) happily stores Infinity, so a
+                # non-finite fee has no other guard anywhere on its way to the DB.
+                if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
                     warnings.append(f"line {line_no}: non-finite number, skipped")
                     unmapped.append(str(row))
                     continue
@@ -101,6 +108,15 @@ class CoinbaseImporter:
                     )
                 )
             elif kind in _CASH_TYPES:
+                amount = quantity if asset == currency else quantity * price
+                # Same non-finite hazard as the fill branch above: a poison
+                # Quantity Transacted or Spot Price reaches `amount` (directly, or
+                # via multiplication) with nothing downstream to catch it —
+                # cash_movement.amount has no CHECK constraint at all.
+                if not amount.is_finite():
+                    warnings.append(f"line {line_no}: non-finite amount, skipped")
+                    unmapped.append(str(row))
+                    continue
                 # For non-fiat cash (e.g., rewards in ETH), warn if price is missing
                 if asset != currency and price == 0:
                     warnings.append(
@@ -111,7 +127,7 @@ class CoinbaseImporter:
                     CanonicalCash(
                         occurred_at=when,
                         kind=_CASH_TYPES[kind],
-                        amount=quantity if asset == currency else quantity * price,
+                        amount=amount,
                         currency=currency,
                         symbol=None if asset == currency else asset,
                         note=(row.get("Notes") or "").strip() or None,

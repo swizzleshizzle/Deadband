@@ -418,6 +418,43 @@ async def test_coinbase_import_with_a_blank_quantity_row_commits_the_good_rows(c
     assert await _fill_count(conn, acc) == 2
 
 
+# --- Blocker pass, item 3: Coinbase guarded quantity == 0 but not a negative
+# --- Quantity Transacted — unlike Fidelity, Coinbase never abs()'s the parsed
+# --- quantity, so a negative value survived parse() and preview, then raised
+# --- ValueError out of Fill.__post_init__ inside commit_batch, taking the two
+# --- good rows down with it (0 fills committed, not 2), same failure mode as
+# --- item 1's blank-quantity row. ---------------------------------------------
+
+
+async def test_coinbase_import_with_a_negative_quantity_row_commits_the_good_rows(conn):
+    """Fails if the importer's parse() stops filtering the negative-quantity
+    row (i.e. the guard regresses from `quantity <= 0` back to
+    `quantity == 0`): this test would then raise ValueError out of
+    Fill.__post_init__ instead of asserting."""
+    header = (
+        "Timestamp,Transaction Type,Asset,Quantity Transacted,Spot Price Currency,"
+        "Spot Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),"
+        "Fees and/or Spread,Notes"
+    )
+    rows = "\n".join(
+        [
+            header,
+            "2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,61200.00,30600.00,30753.00,153.00,ok",
+            "2026-01-16T09:05:00Z,Buy,BTC,-0.30000000,USD,60800.00,0,0,0,negative quantity",
+            "2026-02-03T11:20:00Z,Sell,BTC,0.25000000,USD,68000.00,17000.00,16915.00,85.00,ok",
+        ]
+    )
+    batch = CoinbaseImporter().parse(rows + "\n")
+    assert len(batch.fills) == 2
+    assert len(batch.unmapped_rows) == 1
+
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="cash")
+    result = await commit_batch(conn, acc, batch, source="csv")
+
+    assert result.fills_inserted == 2
+    assert await _fill_count(conn, acc) == 2
+
+
 async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
     """A row carrying its own venue_fill_id dedupes on that id alone and must
     not also consume an occurrence slot in the shared counter — if it did, a
