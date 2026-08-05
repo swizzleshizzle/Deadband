@@ -34,7 +34,7 @@ class Drift:
     equity_difference: Decimal  # computed - reported
     computed_cash: Decimal
     reported_cash: Decimal
-    cash_difference: Decimal
+    cash_difference: Decimal  # computed - reported
     unmarked_instruments: tuple[UUID, ...]
     is_within_tolerance: bool
 
@@ -46,7 +46,11 @@ def reconcile(
     computed_cash: Decimal,
     tolerance: Decimal = Decimal("0.01"),
 ) -> Drift:
-    """Value positions at their marks, add cash, and compare to the statement."""
+    """Value positions at their marks, add cash, and compare to the statement.
+
+    Both equity_difference and cash_difference follow the convention:
+    positive means the ledger computed MORE than the statement reported.
+    """
     with localcontext() as ctx:
         ctx.prec = 50
 
@@ -63,7 +67,7 @@ def reconcile(
 
         computed_equity = computed_cash + market_value
         equity_difference = computed_equity - snapshot.total_equity
-        cash_difference = snapshot.cash_balance - computed_cash
+        cash_difference = computed_cash - snapshot.cash_balance
 
         return Drift(
             account_id=snapshot.account_id,

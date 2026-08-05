@@ -50,7 +50,7 @@ def test_cash_drift_is_reported_separately():
         marks={},
         computed_cash=Decimal("1000"),
     )
-    assert drift.cash_difference == Decimal("-100")
+    assert drift.cash_difference == Decimal("100")
 
 
 def test_multiplier_is_applied_to_position_value():
@@ -83,6 +83,48 @@ def test_tolerance_is_configurable():
         tolerance=Decimal("10"),
     )
     assert drift.equity_difference == Decimal("-5")
+    assert drift.is_within_tolerance is True
+
+
+def test_both_differences_agree_in_sign():
+    """Both equity and cash differences must share the same sign convention.
+
+    A snapshot with both cash and equity below computed values should yield
+    positive differences for both fields, confirming both use computed - reported.
+    """
+    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"))]
+    drift = reconcile(
+        snapshot=snapshot("900", "5500"),  # reported less than computed
+        positions=positions,
+        marks={SPY: Decimal("500")},
+        computed_cash=Decimal("1000"),  # computed_cash > reported_cash (900)
+    )
+    # computed_equity = 1000 + (10*500*1) = 6000
+    # equity_difference = 6000 - 5500 = 500 (positive: we computed more)
+    # cash_difference = 1000 - 900 = 100 (positive: we computed more)
+    assert drift.equity_difference == Decimal("500")
+    assert drift.cash_difference == Decimal("100")
+    assert drift.equity_difference > 0
+    assert drift.cash_difference > 0
+
+
+def test_tolerance_equality_is_within():
+    """A difference exactly equal to tolerance must pass is_within_tolerance.
+
+    Tests the boundary condition: abs(difference) <= tolerance when equal.
+    """
+    drift = reconcile(
+        snapshot=snapshot("1000", "990"),  # reported_equity < computed_equity
+        positions=[],
+        marks={},
+        computed_cash=Decimal("1000"),  # cash matches perfectly
+        tolerance=Decimal("10"),
+    )
+    # equity_difference = 1000 - 990 = 10 (exactly equal to tolerance)
+    # cash_difference = 1000 - 1000 = 0 (well within tolerance)
+    assert drift.equity_difference == Decimal("10")
+    assert drift.cash_difference == Decimal("0")
+    assert abs(drift.equity_difference) == Decimal("10")
     assert drift.is_within_tolerance is True
 
 
