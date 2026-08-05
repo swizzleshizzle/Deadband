@@ -26,28 +26,19 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         else TradeIntent(default_intent).value
     )
 
-    # PASS A (before grouping): a trade orphaned by a deleted fill has
-    # opening_fill_id IS NULL (ON DELETE SET NULL, not CASCADE — see schema).
-    # If it carries user content, protect it as manual *before* computing
-    # manual_fill_ids, so its still-live fills (if any) land in manual_fill_ids
-    # and are excluded from the auto pass below. It keeps its existing
-    # trade_fill allocations untouched, exactly like any user-created manual
-    # trade — there is nothing stale to drop here since none of its fills are
-    # about to be regrouped.
-    await conn.execute(
-        """
-        UPDATE trade
-           SET grouping_mode = 'manual', updated_at = now()
-         WHERE account_id = $1
-           AND grouping_mode = 'auto'
-           AND opening_fill_id IS NULL
-           AND (notes IS NOT NULL OR planned_risk IS NOT NULL
-                OR strategy_tag IS NOT NULL OR intent <> $2)
-        """,
-        account_id,
-        intent,  # the account-derived default; anything else is a user override
-    )
-
+    # A trade is only excluded from this run's auto pass if it is *already*
+    # manual going into this call. Fix-round-2 correction: an earlier version
+    # protected orphaned trades in a "Pass A" here, before grouping, so their
+    # fills would be excluded below. That is wrong for a zero-crossing fill: a
+    # fill that both closes trade X and opens trade Y is only PARTLY X's.
+    # Excluding it whole starved Y of its opening allocation, and Y's share was
+    # silently reaped by the final DELETE (verified: 16/200 fuzz cases lost an
+    # open position this way, with zero over-allocation — the original
+    # double-count bug was fixed, but a new under-allocation bug replaced it).
+    # A genuinely manual (user-created or previously-protected) trade has no
+    # such problem — its fills were never partially claimed by anything else —
+    # so only those are excluded here. Every other trade, including one that
+    # is about to be protected below, is regrouped in full first.
     manual_fill_ids = {
         r["fill_id"]
         for r in await conn.fetch(
@@ -164,22 +155,33 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             )
             written += 1
 
-    # PASS B (after grouping): a trade whose opening_fill_id is still set but no
-    # longer opens anything (a backdated fill changed the grouping) has just had
-    # its fills reallocated to new auto trades above. If it carries user content,
-    # protecting it as manual must ALSO drop its now-stale trade_fill rows, or the
-    # same fills end up allocated to both the new auto trade and this one —
-    # double-counted forever. A protected Pass-B trade becomes a judgment-only
-    # record with no allocations; the user re-links it. That is the honest outcome:
-    # the fills genuinely belong to a different trade now.
+    # Single protection step, AFTER grouping and BEFORE the final DELETE. A trade
+    # is stale here if it either lost its opening fill entirely
+    # (opening_fill_id IS NULL — deleted) or its opening fill no longer opens
+    # anything (NOT IN seen_openings — a backdated fill changed the grouping).
+    # By this point every live fill, including any that partially belonged to a
+    # stale trade via a zero-crossing split, has already been reallocated in
+    # full to a fresh auto trade above — that is what makes a single pass here
+    # correct where the old two-pass version was not. If a stale trade carries
+    # user content, convert it to a permanent manual record: free its
+    # opening_fill_id (so a future auto upsert can never collide with it) and
+    # null every derived column (it owns zero fills now; leaving stale P&L on
+    # it would double-count against whatever trade its fills now belong to).
+    # `status` is left as-is — it is NOT NULL and no longer meaningful once the
+    # row is judgment-only, but there is no null-able substitute for it.
     protected = await conn.fetch(
         """
         UPDATE trade
-           SET grouping_mode = 'manual', updated_at = now()
+           SET grouping_mode = 'manual',
+               updated_at = now(),
+               opening_fill_id = NULL,
+               qty_opened = NULL, qty_closed = NULL,
+               avg_entry = NULL, avg_exit = NULL,
+               realized_pnl = NULL, gross_realized_pnl = NULL,
+               fees_total = NULL, r_multiple = NULL
          WHERE account_id = $1
            AND grouping_mode = 'auto'
-           AND opening_fill_id IS NOT NULL
-           AND NOT (opening_fill_id = ANY($2::uuid[]))
+           AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))
            AND (notes IS NOT NULL OR planned_risk IS NOT NULL
                 OR strategy_tag IS NOT NULL OR intent <> $3)
         RETURNING id
@@ -194,7 +196,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             [r["id"] for r in protected],
         )
 
-    # Whatever neither pass protected is genuinely stale — reaped unconditionally.
+    # Whatever protection didn't save is genuinely stale — reaped unconditionally.
     # This runs even when `fills` was empty (IMPORTANT 1): an account whose fills
     # were all deleted must not keep reporting phantom P&L from auto trades that no
     # longer correspond to anything.

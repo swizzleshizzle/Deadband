@@ -268,11 +268,40 @@ async def test_mixed_account_leaves_intent_unassigned(conn):
 #
 # See task-10-report.md "Fix round 1" section for the exact diffs and captured
 # failure output.
+#
+# FIX ROUND 2 UPDATE: the two-pass split above (Pass A before grouping, Pass B
+# after) was itself a bug. Pass A excluded a protected trade's fills WHOLE via
+# manual_fill_ids, but a zero-crossing fill can be only PARTLY that trade's —
+# the rest belongs to a different trade that opens on the same fill. Excluding
+# it whole starved that other trade of its share, which was then silently
+# reaped by the final DELETE (0 over-allocations, 16/200 fuzz cases with an
+# under-allocation — an open position disappeared). db/trades.py now uses a
+# single protection step, AFTER grouping and BEFORE the final DELETE: every
+# live fill is regrouped in full first (manual_fill_ids only ever excludes
+# fills that were *already* manual going into this call), so there is nothing
+# left to starve by the time a stale trade is converted to manual. A protected
+# trade also has opening_fill_id and all derived P&L columns nulled — it owns
+# zero fills, so leaving stale numbers on it would double-count against
+# whatever trade its fills now belong to. Most of the Pass A/B tests above
+# still pass unchanged against the unified code (the underlying behaviour they
+# assert — a trade with content survives as manual, one without is deleted,
+# protection runs before the final DELETE — did not change, only the
+# mechanism); one (`test_orphaned_trade_with_notes_becomes_manual_and_survives_regroup`)
+# had its expectations corrected below, because its old assertion that the
+# surviving fill simply vanished was itself a symptom of the two-pass bug. See
+# task-10-report.md "Fix round 2" for the zero-crossing repro and the fuzz run.
 
 
 async def test_orphaned_trade_with_notes_becomes_manual_and_survives_regroup(conn):
-    """Kills mutant A: without Pass A protection, this trade (orphaned by a
-    deleted opening fill, carrying notes) is deleted instead of preserved."""
+    """Kills mutant A: without protection, this trade (orphaned by a deleted
+    opening fill, carrying notes) is deleted instead of preserved.
+
+    NOTE (fix round 2): the surviving SELL fill is NOT the deleted trade's alone
+    — after its BUY opening fill is gone, that SELL fill must still be
+    regrouped in full, forming its own new trade. (An earlier version of this
+    test asserted `len(trades) == 1`, i.e. that the surviving fill vanished
+    entirely — that was itself a symptom of the two-pass bug fix round 2
+    corrected, not correct behaviour.)"""
     acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
     await regroup_account(conn, acc)
     trade = (await list_trades(conn, acc))[0]
@@ -281,17 +310,20 @@ async def test_orphaned_trade_with_notes_becomes_manual_and_survives_regroup(con
 
     await regroup_account(conn, acc)
     trades = await list_trades(conn, acc)
-    assert len(trades) == 1
-    assert trades[0]["id"] == trade["id"]
-    assert trades[0]["notes"] == "keep me"
-    assert trades[0]["grouping_mode"] == "manual"
+    assert len(trades) == 2
+    protected = next(t for t in trades if t["id"] == trade["id"])
+    assert protected["notes"] == "keep me"
+    assert protected["grouping_mode"] == "manual"
+    reformed = next(t for t in trades if t["id"] != trade["id"])
+    assert reformed["grouping_mode"] == "auto"
+    assert reformed["qty_opened"] == Decimal("1")  # the surviving SELL, fully accounted for
 
-    # Idempotent under repeated regroup: no duplicate ever appears for it.
+    # Idempotent under repeated regroup: no duplicate ever appears for either.
     await regroup_account(conn, acc)
     await regroup_account(conn, acc)
     trades = await list_trades(conn, acc)
-    assert len(trades) == 1
-    assert trades[0]["id"] == trade["id"]
+    assert len(trades) == 2
+    assert {t["id"] for t in trades} == {protected["id"], reformed["id"]}
 
 
 async def test_orphaned_trade_without_user_content_is_deleted(conn):
@@ -500,3 +532,172 @@ async def test_primary_underlying_rolls_options_up_to_their_stock(conn):
     await regroup_account(conn, acc)
     trade = (await list_trades(conn, acc))[0]
     assert trade["primary_underlying"] == "SPY"
+
+
+# --- Fix round 2 additions -------------------------------------------------
+
+
+async def test_protection_does_not_starve_the_other_side_of_a_zero_crossing_fill(conn):
+    """The exact bug fix-round-2 found: a fill that both closes one trade and
+    opens another is only PARTLY the closing trade's. The old two-pass version
+    (Pass A before grouping) excluded such a fill WHOLE whenever the closing
+    trade got protected, starving the opening trade of its own share — which
+    was then silently reaped by the final DELETE. SELL 1 @100 opens a short of
+    1; BUY 5 @90 closes that short (1) and opens a long of 4 on the very same
+    fill. Verified to fail against the two-pass code from fix round 1 (see
+    task-10-report.md "Fix round 2" for the captured failure)."""
+    acc = await create_account(conn, name="ZeroCross", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"),
+    )
+    sell = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0,
+        side=Side.SELL,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="s1",
+        is_estimated=False,
+    )
+    buy = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0 + timedelta(minutes=10),
+        side=Side.BUY,
+        quantity=Decimal("5"),
+        price=Decimal("90"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="b1",
+        is_estimated=False,
+    )
+    await insert_fills(conn, [sell, buy])
+    await regroup_account(conn, acc)
+
+    trades = await list_trades(conn, acc)
+    assert len(trades) == 2
+    closed = next(t for t in trades if t["status"] == "closed")
+    opened = next(t for t in trades if t["status"] == "open")
+    assert opened["qty_opened"] == Decimal("4")
+
+    # Protect the closed trade: give it notes, then delete ITS opening fill
+    # (the SELL). The BUY fill — shared between both trades — stays live.
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", closed["id"])
+    await conn.execute("DELETE FROM fill WHERE id = $1", closed["opening_fill_id"])
+
+    await regroup_account(conn, acc)
+
+    rows = await conn.fetch(
+        """
+        SELECT f.id, f.quantity AS fill_qty, COALESCE(SUM(tf.quantity), 0) AS allocated
+          FROM fill f
+          LEFT JOIN trade_fill tf ON tf.fill_id = f.id
+         WHERE f.account_id = $1
+         GROUP BY f.id, f.quantity
+        """,
+        acc,
+    )
+    for r in rows:
+        assert r["allocated"] == r["fill_qty"], (
+            f"fill {r['id']} fill_qty={r['fill_qty']} allocated={r['allocated']} INVARIANT VIOLATED"
+        )
+    # The full net position from the one remaining fill (BUY 5) must still be
+    # accounted for somewhere — not silently reduced to the stale 1 the closed
+    # trade used to hold.
+    assert sum(r["allocated"] for r in rows) == Decimal("5")
+
+
+async def test_protected_trade_contributes_no_pnl(conn):
+    """A protected trade owns zero fills after protection; leaving stale P&L on
+    it would double-count against whatever trade its fills now belong to. Its
+    own derived columns must all be NULL, and the account-wide sum of
+    realized_pnl must reflect only the live trades."""
+    acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
+    await regroup_account(conn, acc)
+    trade = (await list_trades(conn, acc))[0]
+    assert trade["realized_pnl"] == Decimal("20")
+
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
+    await conn.execute("DELETE FROM fill WHERE id = $1", trade["opening_fill_id"])
+    await regroup_account(conn, acc)
+
+    trades = await list_trades(conn, acc)
+    protected = next(t for t in trades if t["id"] == trade["id"])
+    assert protected["grouping_mode"] == "manual"
+    assert protected["realized_pnl"] is None
+    assert protected["gross_realized_pnl"] is None
+    assert protected["qty_opened"] is None
+    assert protected["qty_closed"] is None
+    assert protected["avg_entry"] is None
+    assert protected["avg_exit"] is None
+    assert protected["fees_total"] is None
+    assert protected["r_multiple"] is None
+
+    # The surviving fill (the SELL) forms a brand-new open short with no
+    # realized P&L yet, so the account-wide total must be exactly zero — not
+    # the stale 20 the protected row used to hold.
+    live_total = sum(
+        (t["realized_pnl"] for t in trades if t["realized_pnl"] is not None), Decimal("0")
+    )
+    assert live_total == Decimal("0")
+
+
+async def test_protected_trades_opening_fill_id_is_released(conn):
+    """opening_fill_id must be freed on protection so a later regroup that
+    happens to re-derive the same fill as an opening allocation creates a
+    fresh trade rather than colliding with, and silently mutating, the
+    protected manual row via ON CONFLICT."""
+    acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
+    await regroup_account(conn, acc)
+    trade = (await list_trades(conn, acc))[0]
+    opening = trade["opening_fill_id"]
+    inst = await conn.fetchval("SELECT instrument_id FROM fill WHERE id = $1", opening)
+
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
+
+    # A backdated fill changes the grouping: opening_fill_id stays live but no
+    # longer opens anything, so the trade gets protected via the "no longer
+    # matches any group's opening" branch.
+    earlier = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0 - timedelta(minutes=30),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("80"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="earlier",
+        is_estimated=False,
+    )
+    await insert_fills(conn, [earlier])
+    await regroup_account(conn, acc)
+
+    protected = next(t for t in await list_trades(conn, acc) if t["id"] == trade["id"])
+    assert protected["grouping_mode"] == "manual"
+    assert protected["opening_fill_id"] is None
+
+    # Remove the backdated fill so the original opening fill would, on its
+    # own, re-derive the exact same opening allocation as before.
+    await conn.execute("DELETE FROM fill WHERE id = $1", earlier.id)
+    await regroup_account(conn, acc)
+
+    still_protected = next(t for t in await list_trades(conn, acc) if t["id"] == trade["id"])
+    assert still_protected["grouping_mode"] == "manual"
+    assert still_protected["notes"] == "keep me"
+    assert still_protected["opening_fill_id"] is None
+    assert still_protected["realized_pnl"] is None
+
+    # A brand-new trade formed instead, entirely separate from the protected one.
+    new_trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == opening)
+    assert new_trade["id"] != trade["id"]
