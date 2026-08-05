@@ -5,7 +5,14 @@ from decimal import Decimal
 from importers.coinbase import CoinbaseImporter
 from ledger.types import AssetClass, Side
 
-FIXTURE = pathlib.Path("tests/fixtures/coinbase/transactions.csv").read_text()
+# Anchored to this test file's own location, not the process cwd — the same
+# hazard test_purity.py's discovery had. A path relative to "tests/fixtures/..."
+# only resolves when pytest happens to be invoked from the repo root; from any
+# other directory this raises FileNotFoundError instead of quietly finding
+# nothing, but it still makes the suite's ability to run depend on cwd, which
+# it must not.
+_FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
+FIXTURE = (_FIXTURES_DIR / "coinbase" / "transactions.csv").read_text()
 
 
 def batch():
@@ -202,6 +209,55 @@ def test_non_finite_price_is_rejected():
     assert result.fills == ()
     assert len(result.unmapped_rows) == 1
     assert any("non-finite" in w for w in result.warnings)
+
+
+# --- CRITICAL 1: a literal NaN quantity used to abort the whole file. -------
+# --- `Decimal("NaN") <= 0` raises InvalidOperation (NaN is unordered), which
+# --- escaped the parse loop's own try/except (that one only wraps the parse
+# --- call above, not the ordering comparison below it) and took every row in
+# --- the batch down with it, not just the poisoned one. Verified upstream:
+# --- `NaN <= 0` raises InvalidOperation. Fixed by moving the is_finite()
+# --- check above the `quantity <= 0` comparison. -----------------------------
+
+
+def test_literal_nan_quantity_does_not_crash_the_whole_import():
+    """Fails if the finiteness check is ever moved back below the `quantity <=
+    0` comparison: a literal NaN would then raise InvalidOperation out of the
+    parse loop (uncaught — that try/except only wraps the parse call above),
+    aborting the whole file, so this test would error out instead of
+    returning a result with the two good rows intact."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,61200.00,30600.00,30753.00,153.00,ok",
+            "2026-01-16T09:05:00Z,Buy,BTC,NaN,USD,60800.00,0,0,0,poison",
+            "2026-02-03T11:20:00Z,Sell,BTC,0.25000000,USD,68000.00,17000.00,16915.00,85.00,ok",
+        ]
+    )
+    result = CoinbaseImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+    assert [f.side for f in result.fills] == [Side.BUY, Side.SELL]
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
+# --- Item 4: cash amount sign convention. amount is always positive; --------
+# --- direction lives in `kind` alone (see importers.base.OUTFLOW_KINDS). ----
+
+
+def test_withdrawal_amount_is_positive_even_if_the_export_encodes_it_negatively():
+    """Fails if the abs() normalization in the cash branch is removed: a
+    withdrawal whose raw Quantity Transacted is negative would then produce a
+    negative CanonicalCash.amount, disagreeing with Fidelity's twin (which
+    always emits a positive amount for the same kind), and anything summing
+    cash_movement.amount across accounts would get garbage."""
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-04-01T00:00:00Z,Withdrawal,USD,-2000.00,USD,1.00,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    withdrawals = [c for c in result.cash if c.kind == "withdrawal"]
+    assert len(withdrawals) == 1
+    assert withdrawals[0].amount == Decimal("2000.00")
 
 
 def test_zero_price_on_non_fiat_cash_is_warned_about():

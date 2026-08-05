@@ -5,7 +5,12 @@ from decimal import Decimal
 from importers.fidelity import FidelityImporter, parse_option_symbol
 from ledger.types import AssetClass, Side
 
-FIXTURE = pathlib.Path("tests/fixtures/fidelity/activity.csv").read_text()
+# Anchored to this test file's own location, not the process cwd — same
+# hazard as test_purity.py's discovery bug (item 2) and test_coinbase.py's
+# fixture path (item 6's other half): a path relative to "tests/fixtures/..."
+# only resolves when pytest happens to be invoked from the repo root.
+_FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
+FIXTURE = (_FIXTURES_DIR / "fidelity" / "activity.csv").read_text()
 
 
 def batch():
@@ -268,6 +273,46 @@ def test_non_finite_cash_amount_is_rejected():
     assert result.cash == ()
     assert len(result.unmapped_rows) == 1
     assert any("non-finite" in w for w in result.warnings)
+
+
+# --- Item 3: a preamble line that merely mentions "run date" in prose must --
+# --- not be mistaken for the actual header row. ------------------------------
+
+
+def test_preamble_line_containing_run_date_as_prose_is_not_mistaken_for_the_header():
+    """A real preamble line like "Report run date: 08/04/2026" contains the
+    phrase "run date" too, so a first-match-wins scan for that phrase alone
+    would pick it as the header — csv.DictReader would then take its field
+    names from that sentence and every data row would fail to parse (a "bad
+    date" warning per row, zero usable rows). Fails if _locate_header ever
+    goes back to matching on "run date" alone: this preamble line does NOT
+    also contain "action" or "amount", so it must be skipped in favor of the
+    real header further down."""
+    preamble = "Fidelity Investments\nReport run date: 08/04/2026\nAccount Activity Export\n"
+    result = FidelityImporter().parse(preamble + FIXTURE)
+    baseline = batch()
+    assert len(result.fills) == len(baseline.fills) == 5
+    assert len(result.cash) == len(baseline.cash) == 2
+    assert result.fills[0].price == baseline.fills[0].price
+
+
+# --- Item 4: cash amount sign convention. amount is always positive; --------
+# --- direction lives in `kind` alone (see importers.base.OUTFLOW_KINDS). ----
+
+
+def test_withdrawal_amount_is_positive_not_the_raw_negative_export_sign():
+    """Fidelity's Amount column is signed (negative for an outflow like
+    "ELECTRONIC FUNDS TRANSFER PAID"). Fails if the abs() normalization is
+    removed: amount would then be Decimal("-2000.00"), disagreeing with
+    Coinbase's twin (which always emits a positive amount for the same
+    kind), and anything summing cash_movement.amount across accounts would
+    get garbage."""
+    header = FIXTURE.splitlines()[0]
+    bad_row = header + "\n06/01/2026,X1,ELECTRONIC FUNDS TRANSFER PAID,,,,,,,-2000.00\n"
+    result = FidelityImporter().parse(bad_row)
+    withdrawals = [c for c in result.cash if c.kind == "withdrawal"]
+    assert len(withdrawals) == 1
+    assert withdrawals[0].amount == Decimal("2000.00")
 
 
 def test_lowercase_header_is_parsed_the_same_as_the_standard_header():

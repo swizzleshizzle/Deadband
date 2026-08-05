@@ -63,13 +63,23 @@ def _locate_header(text: str) -> tuple[list[str], int]:
     header. Assuming line 1 is the header would fail such an export wholesale,
     so scan for the first line that names "Run Date" instead.
 
+    "Run Date" alone is not enough, though: a real preamble line like
+    "Report run date: 08/04/2026" also contains the phrase, and would be
+    accepted as the header if that were the only test — csv.DictReader would
+    then take its field names from that prose, and every data row would fail
+    to parse (a "bad date" warning per row, zero usable rows) instead of the
+    file parsing normally. Require a second expected column name on the same
+    line too, so a preamble sentence that merely mentions "run date" is never
+    mistaken for the actual header row.
+
     Returns (lines_from_header_onward, preamble_line_count) so callers can
     report warnings against the real file line number rather than an offset
     one.
     """
     lines = text.splitlines()
     for idx, line in enumerate(lines):
-        if "run date" in line.lower():
+        lowered = line.lower()
+        if "run date" in lowered and ("action" in lowered or "amount" in lowered):
             return lines[idx:], idx
     return lines, 0
 
@@ -133,6 +143,13 @@ class FidelityImporter:
                     warnings.append(f"line {line_no}: non-finite amount, skipped")
                     unmapped.append(str(raw_row))
                     continue
+                # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
+                # always positive, direction lives in `kind` alone. Fidelity's raw
+                # Amount column is signed (negative for a withdrawal/purchase-style
+                # outflow, e.g. "ELECTRONIC FUNDS TRANSFER PAID" exports -2000.00),
+                # so this abs() is load-bearing here, unlike Coinbase's twin where
+                # the raw export is already positive.
+                amount = abs(amount)
                 cash.append(
                     CanonicalCash(
                         occurred_at=when,

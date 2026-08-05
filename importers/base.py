@@ -15,6 +15,18 @@ from uuid import UUID
 
 from ledger.types import Instrument, Side
 
+# Canonical sign convention for CanonicalCash.amount: amount is ALWAYS positive;
+# direction is carried entirely by `kind`, never by the sign of `amount`. A
+# negative deposit or a negative withdrawal is not representable — a negative
+# `amount` is always a bug, in an importer or in a consumer, not a legitimate
+# outflow. Every importer must normalize with abs() at the point `amount` is
+# built (see importers/coinbase.py and importers/fidelity.py), rather than
+# leaving each venue's raw export sign to leak through. `OUTFLOW_KINDS` is
+# defined ONCE here so a consumer that needs to net cash movements (e.g. sum
+# deposits minus withdrawals/fees) has a single shared source for "which kinds
+# subtract" instead of every caller inventing its own sign map.
+OUTFLOW_KINDS = frozenset({"withdrawal", "fee"})
+
 
 def _escape(part: str) -> str:
     """Make a component free of the '|' delimiter, injectively.
@@ -100,7 +112,7 @@ class CanonicalFill:
 class CanonicalCash:
     occurred_at: datetime
     kind: str
-    amount: Decimal
+    amount: Decimal  # always positive — see OUTFLOW_KINDS docstring above
     currency: str
     symbol: str | None = None
     venue_ref: str | None = None

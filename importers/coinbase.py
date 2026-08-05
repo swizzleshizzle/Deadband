@@ -65,6 +65,24 @@ class CoinbaseImporter:
                 continue
 
             if kind in _FILL_TYPES:
+                # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they
+                # are not caught by the `except InvalidOperation` above. This check
+                # MUST run before any ordering comparison (`<=`, `<`, `>`, `>=`)
+                # touches quantity/price/fee: `Decimal("NaN") <= 0` itself raises
+                # InvalidOperation (NaN is unordered, per IEEE 754), which would
+                # escape this loop's own try/except (that one only wraps the parse
+                # above) and abort the entire file instead of costing one row. Left
+                # unchecked otherwise, Infinity survives Fill.__post_init__'s
+                # `quantity > 0` check and the DB's `quantity > 0` CHECK, becoming a
+                # live allocation. fee is included here too: Fill.__post_init__ never
+                # validates fee at all, and Postgres NUMERIC (PG14+) happily stores
+                # Infinity, so a non-finite fee has no other guard anywhere on its
+                # way to the DB.
+                if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
+                    warnings.append(f"line {line_no}: non-finite number, skipped")
+                    unmapped.append(str(row))
+                    continue
+
                 # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
                 # would otherwise become a CanonicalFill that survives preview, then
                 # raises inside Fill.__post_init__ during commit — taking the whole
@@ -73,21 +91,10 @@ class CoinbaseImporter:
                 # only exactly-zero rows reach it; Coinbase's Quantity Transacted is
                 # used as-is (never abs()'d), so a negative value here reaches
                 # Fill.__post_init__'s `quantity <= 0` check unguarded too — hence
-                # `<= 0`, not `== 0`.
+                # `<= 0`, not `== 0`. This ordering comparison is now safe because
+                # the finiteness check above already ran and skipped any NaN.
                 if quantity <= 0:
                     warnings.append(f"line {line_no}: non-positive quantity, skipped")
-                    unmapped.append(str(row))
-                    continue
-
-                # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they
-                # are not caught by the `except InvalidOperation` above. Left
-                # unchecked, Infinity survives Fill.__post_init__'s `quantity > 0`
-                # check and the DB's `quantity > 0` CHECK, becoming a live allocation.
-                # fee is included here too: Fill.__post_init__ never validates fee at
-                # all, and Postgres NUMERIC (PG14+) happily stores Infinity, so a
-                # non-finite fee has no other guard anywhere on its way to the DB.
-                if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
-                    warnings.append(f"line {line_no}: non-finite number, skipped")
                     unmapped.append(str(row))
                     continue
 
@@ -108,7 +115,13 @@ class CoinbaseImporter:
                     )
                 )
             elif kind in _CASH_TYPES:
-                amount = quantity if asset == currency else quantity * price
+                # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
+                # always positive, direction lives in `kind` alone. Coinbase's raw
+                # Quantity Transacted is already positive for every cash type this
+                # importer maps, but abs() here pins that as an invariant rather
+                # than an accident, so this importer can never drift from Fidelity's
+                # twin (which must abs() a genuinely negative export amount).
+                amount = abs(quantity if asset == currency else quantity * price)
                 # Same non-finite hazard as the fill branch above: a poison
                 # Quantity Transacted or Spot Price reaches `amount` (directly, or
                 # via multiplication) with nothing downstream to catch it —
