@@ -456,7 +456,7 @@ def test_spinoff_does_not_apply_to_sell_fills():
     assert adjusted[0] == sell_fill
 
 
-def test_spinoff_on_fully_closed_position_leaves_buy_unreduced():
+def test_spinoff_on_fully_closed_position_still_reduces_buy_basis():
     """I4: A fully-closed pre-ex_date position still has BUY basis reduced.
     This is a known limitation — we cannot tell if it was held at ex_date."""
     fid_buy = uuid4()

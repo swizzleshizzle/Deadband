@@ -145,8 +145,8 @@ def test_normalize_decimal_avoids_scientific_notation():
 
 
 def test_non_utc_timestamp_is_normalized_to_utc():
-    """A timestamp with -05:00 offset is stored as the equivalent UTC instant."""
-    # Create a fill with UTC+10:00 (Adelaide)
+    """A timestamp with a +10:00 offset is stored as the equivalent UTC instant."""
+    # Create a fill with UTC+10:00 (e.g. Brisbane, which does not observe DST)
     utc_plus_10 = timezone(timedelta(hours=10))
     local_time = datetime(2026, 8, 1, 22, 0, tzinfo=utc_plus_10)  # 22:00 in +10:00
     # This is 12:00 UTC
