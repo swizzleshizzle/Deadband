@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from db.accounts import create_account
+from db.accounts import UnknownAccountError, create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.trades import list_trades, regroup_account
@@ -113,7 +113,14 @@ async def test_appending_a_later_fill_updates_the_same_trade(conn):
     await regroup_account(conn, acc)
     original = (await list_trades(conn, acc))[0]["id"]
 
-    inst = await conn.fetchval("SELECT id FROM instrument LIMIT 1")
+    # `instrument` has no account_id and no cascade path, so a prior manual CLI
+    # run (or an earlier test that left rows behind) can leave it holding rows
+    # this test never created. An unscoped "SELECT id FROM instrument LIMIT 1"
+    # can silently bind to the wrong instrument instead of the SPY one this
+    # account actually trades. Scope through `fill`, which does carry
+    # account_id, the same rule tests/db/test_importing.py already documents
+    # and follows.
+    inst = await conn.fetchval("SELECT instrument_id FROM fill WHERE account_id = $1 LIMIT 1", acc)
     await insert_fills(
         conn,
         [
@@ -768,3 +775,17 @@ async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
 
     with pytest.raises(NotImplementedError, match=str(buy.id)):
         await regroup_account(conn, acc)
+
+
+# --- Item 7: an unknown account_id used to reach TradeIntent(None) ----------
+
+
+async def test_regroup_account_names_the_unknown_account_id(conn):
+    """Fails if regroup_account still feeds a no-match fetchval's None straight
+    into TradeIntent(None): that raises `ValueError: None is not a valid
+    TradeIntent`, which names no account at all — the opposite of a clean
+    error. cmd_import already handles this properly via get_account; this is
+    the same treatment for regroup_account (and, through it, cmd_regroup)."""
+    bogus = uuid4()
+    with pytest.raises(UnknownAccountError, match=str(bogus)):
+        await regroup_account(conn, bogus)

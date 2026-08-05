@@ -4,7 +4,7 @@ itself, not a hand-rolled re-implementation of its transaction pattern."""
 from __future__ import annotations
 
 import argparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -268,3 +268,32 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     rc = await cli.cmd_import(args)
     assert rc == 0
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+
+
+# --- Item 7: cmd_regroup must surface an unknown account the same clean way
+# --- cmd_import already does, not as a raw ValueError('None is not a valid
+# --- TradeIntent') traceback that never names the account. -----------------
+
+
+async def test_regroup_unknown_account_prints_a_clean_error_not_a_traceback(
+    conn, monkeypatch, capsys
+):
+    """Fails if cmd_regroup lets UnknownAccountError propagate uncaught: this
+    test would then error out with an unhandled exception instead of reaching
+    `assert rc == 2`, and nothing would be printed to stderr naming the
+    account id."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    bogus = uuid4()
+    args = argparse.Namespace(account=str(bogus))
+    rc = await cli.cmd_regroup(args)
+    assert rc == 2
+
+    err = capsys.readouterr().err
+    assert "error:" in err.lower()
+    assert str(bogus) in err
+    assert "Traceback" not in err

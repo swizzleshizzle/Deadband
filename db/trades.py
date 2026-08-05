@@ -7,6 +7,7 @@ from uuid import UUID
 
 import asyncpg
 
+from db.accounts import UnknownAccountError, get_account
 from db.fills import fetch_fills
 from db.instruments import get_multipliers
 from ledger.grouping import group_fills
@@ -17,9 +18,17 @@ from ledger.types import TradeIntent
 async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     """Recompute auto-grouped trades for an account. Manual groupings are permanent
     and are never touched (spec §5)."""
-    default_intent = await conn.fetchval(
-        "SELECT default_intent FROM account WHERE id = $1", account_id
-    )
+    # An account_id with no matching row used to reach TradeIntent(None) below
+    # (fetchval returns None on no match, and None != "mixed"), raising
+    # `ValueError: None is not a valid TradeIntent` — a message that never
+    # names the offending account id and looks like a corrupt enum rather than
+    # a plain "you gave me an id that doesn't exist." cmd_import already
+    # handles this properly via get_account + a clean CLI error; this makes
+    # regroup_account (and therefore cmd_regroup) do the same.
+    account = await get_account(conn, account_id)
+    if account is None:
+        raise UnknownAccountError(account_id)
+    default_intent = account["default_intent"]
     intent = (
         TradeIntent.UNASSIGNED.value
         if default_intent == "mixed"

@@ -8,7 +8,7 @@ import pathlib
 import sys
 from uuid import UUID
 
-from db.accounts import create_account, get_account, list_accounts
+from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.importing import commit_batch
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
@@ -136,10 +136,22 @@ async def cmd_import(args) -> int:
 
 async def cmd_regroup(args) -> int:
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            written = await regroup_account(conn, UUID(args.account))
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                written = await regroup_account(conn, UUID(args.account))
+    except UnknownAccountError as exc:
+        # Same clean-error treatment cmd_import gives an unknown --account,
+        # rather than the ValueError('None is not a valid TradeIntent')
+        # traceback this used to produce with no account id in it anywhere.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited (including via the
+        # early return above), never from inside it, or close() deadlocks
+        # waiting for a release that will never come.
+        await pool.close()
     print(f"{written} trades")
     return 0
 

@@ -7,6 +7,20 @@ from uuid import UUID
 import asyncpg
 
 
+class UnknownAccountError(LookupError):
+    """Raised when an operation is given an account id with no matching row.
+
+    Distinguished from a bare ValueError/LookupError so a caller (the CLI) can
+    catch this one specifically and print a clean, account-naming message,
+    while every other domain invariant violation still surfaces as a full
+    traceback.
+    """
+
+    def __init__(self, account_id: UUID):
+        super().__init__(f"no account with id {account_id}")
+        self.account_id = account_id
+
+
 async def create_account(
     conn: asyncpg.Connection,
     *,
