@@ -2,6 +2,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, getcontext
 from uuid import UUID, uuid4
 
+import pytest
+
 from ledger.grouping import group_fills
 from ledger.pnl import compute_pnl, r_multiple, unrealized_pnl
 from ledger.types import Direction, Fill, FillSource, Side
@@ -146,13 +148,17 @@ def test_compute_pnl_is_independent_of_ambient_decimal_precision():
     """Compute P&L under different context precisions and verify identical results.
 
     The compute_pnl function wraps its logic in a localcontext with prec=50,
-    so the ambient precision should not affect the results. This test verifies
-    that results are identical when computed under prec=3, prec=10, and prec=28.
+    so the ambient precision should not affect the results. Uses a fixture
+    with non-terminating average cost (1@100, 2@200, 3@250 => avg 166.666...)
+    to ensure precision differences would be detected.
     """
+    # BUY 1@100, BUY 2@200 => avg cost 166.666...
+    # SELL 3@250 => gross 249.999...
+    # These do not terminate in base 10, so precision matters.
     test_fills = [
         fill(Side.BUY, "1", "100", 0),
-        fill(Side.BUY, "1", "200", 10),
-        fill(Side.SELL, "1", "200", 20),
+        fill(Side.BUY, "2", "200", 10),
+        fill(Side.SELL, "3", "250", 20),
     ]
 
     # Save the current precision to restore later.
@@ -220,3 +226,101 @@ def test_compute_pnl_is_independent_of_ambient_decimal_precision():
     finally:
         # Restore the original precision.
         getcontext().prec = original_prec
+
+
+def test_exact_pnl_on_full_close():
+    """Full close returns exact value: 100@100 + 100@200 + 100@300 sold at 250."""
+    result = pnl_for(
+        [
+            fill(Side.BUY, "100", "100", 0),
+            fill(Side.BUY, "100", "200", 10),
+            fill(Side.BUY, "100", "300", 20),
+            fill(Side.SELL, "300", "250", 30),
+        ]
+    )
+    # avg entry = (10000 + 20000 + 30000) / 300 = 200
+    # gross = (250 - 200) * 300 = 15000
+    assert result.gross_realized_pnl == Decimal("15000")
+    assert result.open_quantity == Decimal("0")
+
+
+def test_realized_pnl_identity_with_non_terminating_average():
+    """realized_pnl = gross_realized_pnl - fees_total must hold exactly."""
+    result = pnl_for(
+        [
+            fill(Side.BUY, "1", "100", 0, fee="0.50"),
+            fill(Side.BUY, "2", "200", 10, fee="1.00"),
+            fill(Side.SELL, "3", "250", 20, fee="1.50"),
+        ]
+    )
+    assert result.realized_pnl == result.gross_realized_pnl - result.fees_total
+
+
+def test_avg_exit_is_none_on_open_only_trade():
+    """A trade that never closes should have avg_exit = None."""
+    result = pnl_for([fill(Side.BUY, "1", "100", 0), fill(Side.BUY, "1", "200", 10)])
+    assert result.avg_exit is None
+
+
+def test_open_cost_basis_with_multiple_open_quantity():
+    """open_cost_basis should be per-unit, not total, when open_quantity > 1."""
+    result = pnl_for(
+        [
+            fill(Side.BUY, "3", "100", 0),
+            fill(Side.SELL, "1", "130", 10),
+        ]
+    )
+    assert result.open_quantity == Decimal("2")
+    assert result.open_cost_basis == Decimal("100")
+
+
+def test_avg_entry_on_trade_opened_by_split_crossing_fill():
+    """The short trade opened by a crossing fill should have the correct avg_entry."""
+    crossing = fill(Side.SELL, "3", "110", 10)
+    fills = [fill(Side.BUY, "2", "100", 0), crossing]
+    groups = group_fills(fills)
+    by_id = {f.id: f for f in fills}
+    # groups[1] should be the new short trade opened by the crossing fill
+    opened = compute_pnl(groups[1].allocations, by_id, ONE, groups[1].direction)
+    assert opened.avg_entry == Decimal("110")
+
+
+def test_unrealized_pnl_with_contract_multiplier():
+    """unrealized_pnl must apply the multiplier."""
+    result = unrealized_pnl(
+        open_quantity=Decimal("1"),
+        open_cost_basis=Decimal("1.00"),
+        mark_price=Decimal("2.50"),
+        multiplier=Decimal("100"),
+        direction=Direction.LONG,
+    )
+    assert result == Decimal("150")
+
+
+def test_missing_multiplier_raises_key_error():
+    """compute_pnl should raise KeyError if a multiplier is not supplied."""
+    inst2 = UUID("00000000-0000-0000-0000-0000000000c1")
+    fills = [fill(Side.BUY, "1", "100", 0, instrument=inst2)]
+    groups = group_fills(fills)
+    by_id = {f.id: f for f in fills}
+
+    with pytest.raises(KeyError, match="no contract multiplier supplied"):
+        compute_pnl(groups[0].allocations, by_id, ONE, groups[0].direction)
+
+
+def test_spread_direction_raises_not_implemented():
+    """compute_pnl should reject SPREAD direction."""
+    with pytest.raises(NotImplementedError, match="multi-leg SPREAD trades"):
+        compute_pnl([], {}, ONE, Direction.SPREAD)
+
+
+def test_unrealized_pnl_spread_direction_raises_not_implemented():
+    """unrealized_pnl should reject SPREAD direction."""
+    with pytest.raises(NotImplementedError, match="multi-leg SPREAD trades"):
+        unrealized_pnl(
+            open_quantity=Decimal("1"),
+            open_cost_basis=Decimal("100"),
+            mark_price=Decimal("110"),
+            multiplier=Decimal("1"),
+            direction=Direction.SPREAD,
+        )
