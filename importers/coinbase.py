@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 from importers.base import CanonicalCash, CanonicalFill, ImportBatch
@@ -40,6 +40,9 @@ class CoinbaseImporter:
         warnings: list[str] = []
         unmapped: list[str] = []
 
+        # Strip UTF-8 BOM if present (common in Coinbase exports)
+        text = text.lstrip("﻿")
+
         if not text.strip():
             return ImportBatch()
 
@@ -50,7 +53,9 @@ class CoinbaseImporter:
             currency = (row.get("Spot Price Currency") or "USD").strip().upper()
 
             try:
-                when = datetime.fromisoformat((row.get("Timestamp") or "").replace("Z", "+00:00"))
+                when = datetime.fromisoformat(
+                    (row.get("Timestamp") or "").replace("Z", "+00:00")
+                ).astimezone(UTC)
                 quantity = _decimal(row.get("Quantity Transacted", ""))
                 price = _decimal(row.get("Spot Price at Transaction", ""))
                 fee = _decimal(row.get("Fees and/or Spread", ""))
@@ -77,6 +82,12 @@ class CoinbaseImporter:
                     )
                 )
             elif kind in _CASH_TYPES:
+                # For non-fiat cash (e.g., rewards in ETH), warn if price is missing
+                if asset != currency and price == 0:
+                    warnings.append(
+                        f"line {line_no}: {row.get('Transaction Type')!r} in {asset} has no "
+                        "spot price; amount recorded as 0 and needs manual valuation"
+                    )
                 cash.append(
                     CanonicalCash(
                         occurred_at=when,
