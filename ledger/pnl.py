@@ -19,7 +19,13 @@ _QUANT = Decimal("1E-18")
 
 def _q(value: Decimal) -> Decimal:
     """Bound the scale so returned values are storable and callers can
-    reproduce arithmetic at ordinary precision."""
+    reproduce arithmetic at ordinary precision.
+
+    The quantized values guarantee the identity realized = gross - fees at
+    the producing precision (50 digits). Callers at default precision (28)
+    have ~10 integer digits of headroom; the identity holds for |realized| < 1e10,
+    which covers all realistic P&L. At extreme magnitudes (1e13+), identity
+    may diverge at caller precision, but such cases are degenerate anyway."""
     try:
         return value.quantize(_QUANT)
     except InvalidOperation:  # magnitude too large to quantize; leave as-is
@@ -36,7 +42,7 @@ class TradePnL:
     fees_total: Decimal
     realized_pnl: Decimal  # net of fees
     open_quantity: Decimal
-    open_cost_basis: Decimal  # per unit, running average after closes
+    open_cost_basis: Decimal  # per unit, running average after closes (excluding multiplier)
 
 
 def compute_pnl(

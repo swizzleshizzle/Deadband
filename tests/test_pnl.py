@@ -275,14 +275,27 @@ def test_open_cost_basis_with_multiple_open_quantity():
 
 
 def test_avg_entry_on_trade_opened_by_split_crossing_fill():
-    """The short trade opened by a crossing fill should have the correct avg_entry."""
+    """The short trade opened by a crossing fill must be computed correctly.
+
+    Mutant detection: asserts both qty_opened and gross_realized_pnl, not just
+    avg_entry (which is a ratio and could survive a mutant that allocates the
+    whole fill quantity instead of just the allocated portion).
+    """
     crossing = fill(Side.SELL, "3", "110", 10)
-    fills = [fill(Side.BUY, "2", "100", 0), crossing]
+    fills = [
+        fill(Side.BUY, "2", "100", 0),
+        crossing,
+        fill(Side.BUY, "1", "105", 20),  # close the short
+    ]
     groups = group_fills(fills)
     by_id = {f.id: f for f in fills}
     # groups[1] should be the new short trade opened by the crossing fill
     opened = compute_pnl(groups[1].allocations, by_id, ONE, groups[1].direction)
+    # avg_entry=110 alone does not catch the mutant (it's a ratio), so also check qty
+    assert opened.qty_opened == Decimal("1")
     assert opened.avg_entry == Decimal("110")
+    # Close the short to verify gross P&L: (110 - 105) * 1 = 5
+    assert opened.gross_realized_pnl == Decimal("5")
 
 
 def test_unrealized_pnl_with_contract_multiplier():
@@ -306,6 +319,43 @@ def test_missing_multiplier_raises_key_error():
 
     with pytest.raises(KeyError, match="no contract multiplier supplied"):
         compute_pnl(groups[0].allocations, by_id, ONE, groups[0].direction)
+
+
+def test_allocations_sorted_chronologically():
+    """compute_pnl must process allocations in chronological order.
+
+    SQL queries may return rows in any order, so this test shuffles allocations
+    from a multi-fill trade into non-chronological order and verifies that
+    compute_pnl still produces results identical to the chronological case.
+    The sort is the only guard against database result ordering.
+    """
+    original_fills = [
+        fill(Side.BUY, "1", "100", 0),
+        fill(Side.BUY, "1", "200", 10),
+        fill(Side.SELL, "1", "250", 20),
+    ]
+    groups = group_fills(original_fills)
+    by_id = {f.id: f for f in original_fills}
+
+    # Compute with chronological order (as returned by group_fills)
+    result_chrono = compute_pnl(groups[0].allocations, by_id, ONE, groups[0].direction)
+
+    # Shuffle allocations into reverse chronological order
+    shuffled_allocs = list(reversed(groups[0].allocations))
+
+    # Compute with shuffled allocations
+    result_shuffled = compute_pnl(shuffled_allocs, by_id, ONE, groups[0].direction)
+
+    # Results must be identical
+    assert result_chrono.qty_opened == result_shuffled.qty_opened
+    assert result_chrono.qty_closed == result_shuffled.qty_closed
+    assert result_chrono.avg_entry == result_shuffled.avg_entry
+    assert result_chrono.avg_exit == result_shuffled.avg_exit
+    assert result_chrono.gross_realized_pnl == result_shuffled.gross_realized_pnl
+    assert result_chrono.fees_total == result_shuffled.fees_total
+    assert result_chrono.realized_pnl == result_shuffled.realized_pnl
+    assert result_chrono.open_quantity == result_shuffled.open_quantity
+    assert result_chrono.open_cost_basis == result_shuffled.open_cost_basis
 
 
 def test_spread_direction_raises_not_implemented():
