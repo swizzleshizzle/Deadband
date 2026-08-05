@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from uuid import UUID, uuid4
+
+import pytest
 
 from ledger.grouping import group_fills
 from ledger.types import Direction, Fill, FillSource, Side, TradeStatus
@@ -142,3 +144,117 @@ def test_input_order_does_not_matter():
 
 def test_empty_input_returns_empty_list():
     assert group_fills([]) == []
+
+
+def test_rejects_fills_with_none_id():
+    """Fills without persisted IDs cannot be grouped."""
+    from dataclasses import replace
+
+    f = fill(Side.BUY, "1", "100")
+    f_no_id = replace(f, id=None)
+    with pytest.raises(ValueError, match="group_fills requires persisted fills"):
+        group_fills([f_no_id])
+
+
+def test_large_magnitude_counterexample_1e28():
+    """Buy 1e28, buy 1, sell 1e28, sell 1 should be exactly one closed long trade."""
+    fills = [
+        fill(Side.BUY, "1e28", "1", 0),
+        fill(Side.BUY, "1", "1", 10),
+        fill(Side.SELL, "1e28", "1", 20),
+        fill(Side.SELL, "1", "1", 30),
+    ]
+    groups = group_fills(fills)
+
+    # Should be exactly one closed LONG trade
+    assert len(groups) == 1
+    assert groups[0].direction is Direction.LONG
+    assert groups[0].status is TradeStatus.CLOSED
+
+    # All four fills should be allocated exactly to their quantities
+    # Allocations sum is the sum of all fill quantities
+    total_allocated = total(groups[0])
+    total_fills = Decimal("1e28") + Decimal("1") + Decimal("1e28") + Decimal("1")
+    assert total_allocated == total_fills
+
+
+def test_dust_allocation_precision():
+    """Allocations of a tiny fill always sum exactly to its quantity."""
+    # Sell 0.000000000000000001, buy 1000000000000
+    tiny_sell = fill(Side.SELL, "0.000000000000000001", "100", 0)
+    large_buy = fill(Side.BUY, "1000000000000", "100", 10)
+    fills = [large_buy, tiny_sell]
+    groups = group_fills(fills)
+
+    # The tiny_sell should be allocated exactly to its quantity across all trades
+    allocated = sum(
+        (a.quantity for g in groups for a in g.allocations if a.fill_id == tiny_sell.id),
+        Decimal(0),
+    )
+    assert allocated == tiny_sell.quantity
+
+
+def test_ambient_context_independence():
+    """Results are independent of the ambient Decimal context precision."""
+    a = fill(Side.BUY, "1", "100", 0)
+    b = fill(Side.SELL, "1", "120", 10)
+
+    # Save original context
+    original_prec = getcontext().prec
+
+    try:
+        # Run with very low precision
+        getcontext().prec = 3
+        result_low = group_fills([a, b])
+
+        # Reset to default and run again
+        getcontext().prec = 28
+        result_high = group_fills([a, b])
+
+        # Results should be identical
+        assert result_low == result_high
+    finally:
+        # Restore original precision
+        getcontext().prec = original_prec
+
+
+def test_multi_bucket_order_independence():
+    """Grouping is invariant to input order even across multiple (account, instrument) buckets."""
+    acc2 = UUID("00000000-0000-0000-0000-0000000000a2")
+
+    # Fills from two different accounts
+    a1 = fill(Side.BUY, "1", "100", 0, account=ACC)
+    a1_sell = fill(Side.SELL, "1", "110", 10, account=ACC)
+    a2 = fill(Side.BUY, "1", "100", 0, account=acc2)
+    a2_sell = fill(Side.SELL, "1", "110", 10, account=acc2)
+
+    # Forward order
+    result_forward = group_fills([a1, a1_sell, a2, a2_sell])
+
+    # Reversed order
+    result_reversed = group_fills([a2_sell, a2, a1_sell, a1])
+
+    assert result_forward == result_reversed
+
+
+def test_simultaneous_fills_deterministic_by_id():
+    """Fills with identical timestamps are sorted by str(id) for determinism."""
+    id_a = UUID("00000000-0000-0000-0000-000000000001")
+    id_b = UUID("00000000-0000-0000-0000-000000000002")
+
+    # Create fills with known IDs
+    from dataclasses import replace
+
+    buy_a = replace(fill(Side.BUY, "1", "100", 0), id=id_a)
+    sell_b = replace(fill(Side.SELL, "1", "110", 0), id=id_b)
+
+    # Forward order
+    result_forward = group_fills([buy_a, sell_b])
+
+    # Reversed order
+    result_reversed = group_fills([sell_b, buy_a])
+
+    # Results should be identical because buy_a's id sorts before sell_b's id
+    assert result_forward == result_reversed
+    assert len(result_forward) == 1
+    assert result_forward[0].status is TradeStatus.CLOSED
