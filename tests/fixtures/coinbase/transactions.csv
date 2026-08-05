@@ -1,0 +1,7 @@
+Timestamp,Transaction Type,Asset,Quantity Transacted,Spot Price Currency,Spot Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),Fees and/or Spread,Notes
+2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,61200.00,30600.00,30753.00,153.00,Bought 0.5 BTC
+2026-01-16T09:05:00Z,Buy,BTC,0.50000000,USD,60800.00,30400.00,30552.00,152.00,Bought 0.5 BTC
+2026-02-03T11:20:00Z,Sell,BTC,0.25000000,USD,68000.00,17000.00,16915.00,85.00,Sold 0.25 BTC
+2026-02-10T00:00:00Z,Deposit,USD,5000.00,USD,1.00,5000.00,5000.00,0.00,Deposited from bank
+2026-03-01T00:00:00Z,Rewards Income,ETH,0.01000000,USD,3200.00,32.00,32.00,0.00,Staking reward
+2026-03-15T16:45:00Z,Convert,BTC,0.10000000,USD,70000.00,7000.00,7000.00,0.00,Converted to ETH
