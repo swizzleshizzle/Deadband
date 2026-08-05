@@ -173,7 +173,7 @@ never be inserted twice.
 | `source` | `manual` / `csv` / `api` / `opening_balance` |
 | `venue_order_id`, `venue_fill_id` | nullable; `(account_id, venue_fill_id)` unique where not null |
 | `content_hash` | dedupe fallback when a venue export carries no fill id |
-| `trade_id` | nullable fk |
+| — | *no `trade_id`.* Fill-to-trade association lives in `trade_fill` (below), because one fill can belong to two trades. |
 | `is_estimated` | true for reconstructed or opening-balance rows |
 | `created_at`, `updated_at` | |
 
@@ -213,6 +213,20 @@ spread is one trade across four instruments.
 correctly under the position rule but must never share a metrics denominator. Every
 metric filters on it. Mixed accounts are exactly why it lives on the trade rather than
 only on the account.
+
+### `trade_fill`
+
+`trade_id`, `fill_id`, `quantity`. The association between fills and trades, as an
+allocation rather than a foreign key on `fill`.
+
+A single fill can belong to **two** trades. Holding 2 long and selling 3 closes the long
+with 2 units and opens a short with 1 — one fill, two trades, split by quantity. A
+`fill.trade_id` column cannot express that without either losing information or splitting
+the fill row, and splitting the row would mean altering ground truth to satisfy a
+derived concept.
+
+Invariant: for every fill, the sum of its allocations equals its quantity. Fees are
+pro-rated across allocations by quantity share.
 
 ### `cash_movement`
 

@@ -82,4 +82,11 @@ regexes = [
   '''EXAMPLE''',
   '''REDACTED''',
   '''<[A-Za-z_ -]+>''',
+  # Universally-recognized placeholder markers. A real credential is never
+  # literally one of these, so allowlisting them costs nothing and keeps
+  # .env.example templates from tripping the DSN rule.
+  '''CHANGEME''',
+  '''changeme''',
+  '''YOUR_[A-Z_]+''',
+  '''xxxxx''',
 ]
