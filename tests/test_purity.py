@@ -35,6 +35,4 @@ def test_pure_packages_do_not_read_the_clock():
             for needle in ("datetime.now(", "datetime.utcnow(", "time.time("):
                 if needle in src:
                     offenders.append(f"{path}: {needle}")
-    assert not offenders, (
-        "Pure code must take time as a parameter:\n" + "\n".join(offenders)
-    )
+    assert not offenders, "Pure code must take time as a parameter:\n" + "\n".join(offenders)
