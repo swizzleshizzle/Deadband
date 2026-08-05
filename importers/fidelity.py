@@ -99,52 +99,62 @@ class FidelityImporter:
             return ImportBatch()
 
         reader = csv.DictReader(io.StringIO("\n".join(data_lines)))
-        for line_no, row in enumerate(reader, start=preamble_offset + 2):
-            action = (row.get("Action") or "").strip().upper()
-            symbol = (row.get("Symbol") or "").strip()
-            account = (row.get("Account") or "").strip() or None
+        for line_no, raw_row in enumerate(reader, start=preamble_offset + 2):
+            # Normalize header casing once — a real export's header is found
+            # case-insensitively (above), so the fields must be read the same
+            # way or a differently-cased header parses to zero usable rows.
+            row = {(k or "").strip().lower(): v for k, v in raw_row.items()}
+            action = (row.get("action") or "").strip().upper()
+            symbol = (row.get("symbol") or "").strip()
+            account = (row.get("account") or "").strip() or None
 
             try:
-                when = datetime.strptime((row.get("Run Date") or "").strip(), "%m/%d/%Y").replace(
+                when = datetime.strptime((row.get("run date") or "").strip(), "%m/%d/%Y").replace(
                     tzinfo=UTC
                 )
             except ValueError as exc:
                 warnings.append(f"line {line_no}: bad date ({exc})")
-                unmapped.append(str(row))
+                unmapped.append(str(raw_row))
                 continue
 
             cash_kind = next((v for k, v in _CASH_ACTIONS.items() if action.startswith(k)), None)
             if cash_kind:
+                try:
+                    amount = _decimal(row.get("amount"))
+                except InvalidOperation as exc:
+                    warnings.append(f"line {line_no}: bad amount ({exc})")
+                    unmapped.append(str(raw_row))
+                    continue
                 cash.append(
                     CanonicalCash(
                         occurred_at=when,
                         kind=cash_kind,
-                        amount=_decimal(row.get("Amount")),
+                        amount=amount,
                         currency="USD",
                         symbol=symbol or None,
                         external_ref=account,
-                        note=(row.get("Description") or "").strip() or None,
+                        note=(row.get("description") or "").strip() or None,
                     )
                 )
                 continue
 
             if "BOUGHT" not in action and "SOLD" not in action:
                 warnings.append(f"line {line_no}: unhandled action {action!r}")
-                unmapped.append(str(row))
+                unmapped.append(str(raw_row))
                 continue
 
             try:
-                raw_qty = _decimal(row.get("Quantity"))
-                price = _decimal(row.get("Price"))
-                fee = _decimal(row.get("Commission")) + _decimal(row.get("Fees"))
+                raw_qty = _decimal(row.get("quantity"))
+                price = _decimal(row.get("price"))
+                fee = _decimal(row.get("commission")) + _decimal(row.get("fees"))
             except InvalidOperation as exc:
                 warnings.append(f"line {line_no}: bad number ({exc})")
-                unmapped.append(str(row))
+                unmapped.append(str(raw_row))
                 continue
 
             if raw_qty == 0:
                 warnings.append(f"line {line_no}: zero quantity, skipped")
-                unmapped.append(str(row))
+                unmapped.append(str(raw_row))
                 continue
 
             instrument = parse_option_symbol(symbol) or Instrument(

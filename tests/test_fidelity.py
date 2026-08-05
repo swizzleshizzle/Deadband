@@ -160,3 +160,73 @@ def test_trailing_disclaimer_line_is_reported_as_unmapped_not_dropped():
     assert len(result.cash) == len(baseline.cash)
     assert len(result.unmapped_rows) == len(baseline.unmapped_rows) + 1
     assert any("purposes only" in w for w in result.warnings)
+
+
+# --- Fix round 1, item 1: a malformed cash Amount must cost one row, ------
+# --- never abort the whole file. -------------------------------------------
+
+
+def test_malformed_cash_amount_is_reported_not_fatal():
+    """A bad Amount on a cash row (dividend/transfer/interest) must not raise
+    and must not take down the rest of the file with it — same defensive
+    pattern already applied to the fill branch's Quantity/Price/Commission/Fees."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "01/15/2026,X1,YOU BOUGHT,SPY,SPDR,10,500.00,0.00,0.00,-5000.00",
+            "04/01/2026,X1,DIVIDEND RECEIVED,SPY,SPDR,,,,,N/A",
+            "02/20/2026,X1,YOU SOLD,SPY,SPDR,10,520.00,0.00,0.03,5199.97",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+    assert len(result.cash) == 0
+    assert len(result.unmapped_rows) == 1
+    assert len(result.warnings) == 1
+    assert "bad amount" in result.warnings[0]
+
+
+# --- Fix round 1, item 2: direction comes from the action, not the sign, ---
+# --- proven with rows where the two disagree. -------------------------------
+
+
+def test_direction_comes_from_action_even_when_sign_disagrees():
+    """A file where sign and action disagree must still resolve direction
+    from the action. Every row in the brief's fixture has sign and action in
+    agreement, so a sign-based implementation would pass all of those tests
+    while being wrong — this is the case that actually distinguishes them."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            # SOLD with a POSITIVE quantity — sign says buy, action says sell.
+            "07/01/2026,X1,YOU SOLD,SPY,SPDR,10,500.00,0.00,0.00,5000.00",
+            # BOUGHT with a NEGATIVE quantity — sign says sell, action says buy.
+            "07/02/2026,X1,YOU BOUGHT,SPY,SPDR,-10,500.00,0.00,0.00,-5000.00",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+    sold_positive_sign, bought_negative_sign = result.fills
+    assert sold_positive_sign.side is Side.SELL
+    assert sold_positive_sign.quantity == Decimal("10")
+    assert bought_negative_sign.side is Side.BUY
+    assert bought_negative_sign.quantity == Decimal("10")
+
+
+# --- Fix round 1, item 3: header columns are read case-insensitively too ---
+
+
+def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
+    """The header row is located case-insensitively ("run date" in line.lower()),
+    so a differently-cased real export must not then read zero usable fields —
+    columns must be read the same way the header was found."""
+    lines = FIXTURE.splitlines()
+    lowercase_fixture = "\n".join([lines[0].lower(), *lines[1:]]) + "\n"
+    result = FidelityImporter().parse(lowercase_fixture)
+    baseline = batch()
+    assert len(result.fills) == len(baseline.fills) == 5
+    assert len(result.cash) == len(baseline.cash) == 2
+    assert result.fills[0].price == baseline.fills[0].price
+    assert result.fills[0].quantity == baseline.fills[0].quantity
