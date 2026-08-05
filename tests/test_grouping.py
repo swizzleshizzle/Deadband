@@ -172,11 +172,20 @@ def test_large_magnitude_counterexample_1e28():
     assert groups[0].direction is Direction.LONG
     assert groups[0].status is TradeStatus.CLOSED
 
-    # All four fills should be allocated exactly to their quantities
-    # Allocations sum is the sum of all fill quantities
-    total_allocated = total(groups[0])
-    total_fills = Decimal("1e28") + Decimal("1") + Decimal("1e28") + Decimal("1")
+    # All four fills should be allocated exactly to their quantities.
+    #
+    # Summed with Fraction, NOT Decimal: at ambient precision (28 digits),
+    # Decimal("1e28") + Decimal("1") rounds the "1" away identically on BOTH
+    # sides of a Decimal-summed comparison (`total_allocated == total_fills`),
+    # so the old assertion held even if the grouper silently dropped both unit
+    # fills — it could never fail. test_dust_allocation_precision nearby
+    # already uses Fraction for exact arithmetic for the same reason; this
+    # test now does too, so the two 1e28-magnitude unit fills are actually
+    # checked rather than rounded into invisibility on both sides at once.
+    total_allocated = sum((Fraction(a.quantity) for a in groups[0].allocations), Fraction(0))
+    total_fills = sum((Fraction(f.quantity) for f in fills), Fraction(0))
     assert total_allocated == total_fills
+    assert total_fills == Fraction(2 * 10**28 + 2)  # sanity: not a tautological 0 == 0
 
 
 def test_dust_allocation_precision():
