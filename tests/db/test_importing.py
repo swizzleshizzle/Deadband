@@ -312,3 +312,109 @@ async def test_three_identical_rows_after_two_already_committed_inserts_one(conn
     assert result.fills_inserted == 1
     assert result.fills_skipped == 2
     assert await _fill_count(conn, acc) == 3
+
+
+# --- Fix round 2 -------------------------------------------------------------
+
+
+async def test_cash_occurrence_counter_is_independent_of_the_fill_counter(conn):
+    """The cash and fill occurrence counters must never share state. A mutant
+    that seeds (or shifts) the cash counter using how many fills were already
+    processed in the same call would compute occurrence 1 for the dividend in
+    a 1-fill batch but occurrence 2 for the SAME dividend in a 2-fill batch —
+    different hashes, so the second commit would insert a phantom duplicate
+    cash_movement row instead of recognizing it as already present. Fails
+    (cash_inserted == 1, cash row count == 2 on the second commit) if the
+    counters are coupled."""
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    dividend = CanonicalCash(
+        occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+        kind="dividend",
+        amount=Decimal("10"),
+        currency="USD",
+    )
+
+    one_fill_batch = ImportBatch(fills=(batch_of(1).fills[0],), cash=(dividend,))
+    two_fill_batch = ImportBatch(fills=batch_of(2).fills, cash=(dividend,))
+
+    first = await commit_batch(conn, acc, one_fill_batch, source="csv")
+    second = await commit_batch(conn, acc, two_fill_batch, source="csv")
+
+    assert first.cash_inserted == 1
+    assert second.cash_inserted == 0
+    assert await _cash_count(conn, acc) == 1
+
+
+async def test_occurrence_key_normalizes_symbol_case_like_content_hash(conn):
+    """The occurrence key must use the same normalization content_hash applies
+    internally (symbol upper-cased, side lower-cased) or two rows differing
+    only in symbol casing get different occurrence keys (each starting fresh
+    at occurrence 0) while content_hash's own internal upper-casing makes their
+    final hashes identical anyway — colliding the two rows onto one hash and
+    silently dropping one. Fails (fills_inserted == 1, one row in the table)
+    if the occurrence key is built from the raw, un-normalized symbol."""
+    same_shape = dict(
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("500"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+    )
+    upper = CanonicalFill(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+        ),
+        **same_shape,
+    )
+    mixed_case = CanonicalFill(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.EQUITY, symbol="Spy", quote_currency="USD"
+        ),
+        **same_shape,
+    )
+
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+    result = await commit_batch(conn, acc, ImportBatch(fills=(upper, mixed_case)), source="csv")
+
+    assert result.fills_inserted == 2
+    assert await _fill_count(conn, acc) == 2
+
+
+async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
+    """A row carrying its own venue_fill_id dedupes on that id alone and must
+    not also consume an occurrence slot in the shared counter — if it did, a
+    hash-carrying row sharing its shape would get a different occurrence index
+    (and therefore a different hash) depending on where the id-carrying row
+    sits relative to it. Reproduced with the minimal case: one id-carrying and
+    one hash-carrying fill, identical in every other respect, re-imported in
+    the opposite order. Fails (second commit inserts 1, three rows exist
+    instead of two) if the occurrence counter increments for every row instead
+    of only the ones that actually consume a slot."""
+    instrument = Instrument(
+        id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+    )
+    same_shape = dict(
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("500"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+    )
+    with_id = CanonicalFill(instrument=instrument, venue_fill_id="v1", **same_shape)
+    without_id = CanonicalFill(instrument=instrument, **same_shape)
+
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    first = await commit_batch(conn, acc, ImportBatch(fills=(with_id, without_id)), source="csv")
+    assert first.fills_inserted == 2
+
+    # Same two rows, reordered — a genuine re-import can arrive in any order;
+    # nothing in ImportBatch promises row order is preserved across exports.
+    second = await commit_batch(conn, acc, ImportBatch(fills=(without_id, with_id)), source="csv")
+
+    assert second.fills_inserted == 0
+    assert second.fills_skipped == 2
+    assert await _fill_count(conn, acc) == 2

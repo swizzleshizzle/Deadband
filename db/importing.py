@@ -66,6 +66,21 @@ async def commit_batch(
     batch: ImportBatch,
     source: str = "csv",
 ) -> CommitResult:
+    """Residual limitation, written down rather than left to be discovered: the
+    occurrence index (see below) only disambiguates repeats that appear
+    together in the SAME call to commit_batch. Two genuinely distinct same-day
+    identical trades split across two separate exports that are never both
+    present in one batch — e.g. one arrives today, its identical twin arrives
+    in next month's export — will still collapse onto the same hash and one
+    will be deduped away. Fixing that needs a venue-supplied ordinal (an
+    intra-day sequence number), which no importer here has; there is no way to
+    distinguish "the same trade, re-exported" from "a different trade that
+    happens to look identical" once the rows are in different batches. This is
+    far narrower than the same-batch collision round 1 fixed — most exports of
+    the same account naturally overlap enough that a repeat and its earlier
+    occurrence end up together — but it is not zero, so it is recorded here
+    rather than left implicit.
+    """
     fills: list[Fill] = []
 
     # Fidelity (and some other venues) export a date with no time component, so
@@ -75,13 +90,52 @@ async def commit_batch(
     # occurrence counter below breaks that tie while staying stable across
     # re-imports: the same batch, walked in the same order, always assigns the
     # same indices, so a genuine re-import still dedupes to zero.
+    #
+    # The key is built from the SAME normalized fields content_hash itself
+    # hashes (symbol upper-cased, side lower-cased) rather than the raw
+    # CanonicalFill values. content_hash normalizes internally, so two rows
+    # differing only in symbol casing ("SPY" vs "Spy") already hash to the same
+    # payload; if the occurrence key used raw casing instead, those two rows
+    # would each get occurrence 0 (distinct keys, "SPY" != "Spy") and therefore
+    # the same final hash by coincidence for anything else that also matched —
+    # or worse, diverge from what content_hash considers "the same shape" in
+    # the opposite direction. Keeping the two normalizations identical is what
+    # makes "same occurrence key" and "same hash inputs" the same statement.
     fill_occurrence: dict[tuple, int] = defaultdict(int)
 
     for cf in batch.fills:
         instrument_id = await upsert_instrument(conn, cf.instrument)
-        key = (cf.executed_at, cf.instrument.symbol, cf.side.value, cf.quantity, cf.price)
-        occurrence = fill_occurrence[key]
-        fill_occurrence[key] += 1
+
+        # A fill lacking a venue_fill_id has nothing else to dedupe on —
+        # without a content_hash here, insert_fills' ON CONFLICT can never
+        # match it and re-importing the same export duplicates every row. Only
+        # these rows draw an occurrence index: a row that already dedupes on
+        # its own venue_fill_id must not also consume a slot, or its presence
+        # (and its position in the batch) would shift the index assigned to an
+        # unrelated hash-carrying row with the same shape, changing that row's
+        # hash on a reordered re-import and producing a phantom duplicate.
+        if cf.venue_fill_id:
+            fill_hash = None
+        else:
+            key = (
+                cf.executed_at,
+                cf.instrument.symbol.upper(),
+                cf.side.value.lower(),
+                cf.quantity,
+                cf.price,
+            )
+            occurrence = fill_occurrence[key]
+            fill_occurrence[key] += 1
+            fill_hash = content_hash(
+                account_id,
+                cf.executed_at,
+                cf.instrument.symbol,
+                cf.side.value,
+                cf.quantity,
+                cf.price,
+                occurrence,
+            )
+
         fills.append(
             Fill(
                 id=uuid4(),
@@ -96,22 +150,7 @@ async def commit_batch(
                 source=FillSource(source),
                 venue_order_id=cf.venue_order_id,
                 venue_fill_id=cf.venue_fill_id,
-                # A fill lacking a venue_fill_id has nothing else to dedupe on —
-                # without a content_hash here, insert_fills' ON CONFLICT can never
-                # match it and re-importing the same export duplicates every row.
-                content_hash=(
-                    None
-                    if cf.venue_fill_id
-                    else content_hash(
-                        account_id,
-                        cf.executed_at,
-                        cf.instrument.symbol,
-                        cf.side.value,
-                        cf.quantity,
-                        cf.price,
-                        occurrence,
-                    )
-                ),
+                content_hash=fill_hash,
                 is_estimated=False,
             )
         )
