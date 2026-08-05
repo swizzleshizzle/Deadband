@@ -65,6 +65,25 @@ class CoinbaseImporter:
                 continue
 
             if kind in _FILL_TYPES:
+                # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
+                # would otherwise become a CanonicalFill that survives preview, then
+                # raises inside Fill.__post_init__ during commit — taking the whole
+                # batch down with it, not just this row. Same guard as Fidelity's
+                # twin (importers/fidelity.py).
+                if quantity == 0:
+                    warnings.append(f"line {line_no}: zero quantity, skipped")
+                    unmapped.append(str(row))
+                    continue
+
+                # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they
+                # are not caught by the `except InvalidOperation` above. Left
+                # unchecked, Infinity survives Fill.__post_init__'s `quantity > 0`
+                # check and the DB's `quantity > 0` CHECK, becoming a live allocation.
+                if not quantity.is_finite() or not price.is_finite():
+                    warnings.append(f"line {line_no}: non-finite number, skipped")
+                    unmapped.append(str(row))
+                    continue
+
                 fills.append(
                     CanonicalFill(
                         instrument=Instrument(

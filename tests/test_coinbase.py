@@ -96,6 +96,58 @@ def test_non_z_offset_timestamps_are_normalized_to_utc():
     assert ts.minute == 30
 
 
+# --- Final fix wave, item 1: Coinbase lacked the zero-quantity guard its ----
+# --- Fidelity twin has. A blank/zero Quantity Transacted survived parse() and
+# --- preview, then raised inside Fill.__post_init__ during commit and took
+# --- the whole batch down with it (the two good rows lost along with it). ---
+
+
+def test_zero_quantity_buy_row_is_skipped_not_fatal():
+    """Fails if the guard is missing: the blank-quantity row would show up in
+    fills with quantity 0 (a Fill that raises in __post_init__ downstream)
+    instead of being warned about, marked unmapped, and skipped — leaving the
+    two good rows to commit successfully."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,61200.00,30600.00,30753.00,153.00,ok",
+            "2026-01-16T09:05:00Z,Buy,BTC,,USD,60800.00,0,0,0,blank quantity",
+            "2026-02-03T11:20:00Z,Sell,BTC,0.25000000,USD,68000.00,17000.00,16915.00,85.00,ok",
+        ]
+    )
+    result = CoinbaseImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+    assert [f.side for f in result.fills] == [Side.BUY, Side.SELL]
+    assert len(result.unmapped_rows) == 1
+    assert any("zero quantity" in w for w in result.warnings)
+
+
+# --- Final fix wave, item 2: poison Decimal values (NaN/Infinity) pass the --
+# --- existing `except InvalidOperation` guard, since both are valid Decimal
+# --- constructions. Verified upstream: Infinity survives Fill.__post_init__'s
+# --- `quantity > 0` check, the DB's `quantity > 0` CHECK, and becomes a live
+# --- allocation in group_fills. ----------------------------------------------
+
+
+def test_non_finite_quantity_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-01-15T14:30:00Z,Buy,BTC,Infinity,USD,61200.00,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
+def test_non_finite_price_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,Infinity,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
 def test_zero_price_on_non_fiat_cash_is_warned_about():
     """A reward in non-fiat currency (e.g., ETH) with no spot price should warn."""
     csv_with_zero_price = (

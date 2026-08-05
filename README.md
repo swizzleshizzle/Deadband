@@ -8,7 +8,47 @@ and thesis across crypto, equities, options, and futures, from inception to conc
 
 ## Status
 
-Design phase complete. Implementation not started.
+Subsystem **A-1 (trade & position ledger core)** is implemented: pure domain logic for
+fill grouping, P&L, and corporate actions; a Postgres schema; CSV importers for Fidelity
+and Coinbase; idempotent import (parse → preview → commit); and a CLI to drive all of it.
+Subsystems B–E are still design phase, spec only.
+
+### Requirements
+
+- Python 3.11+, [uv](https://docs.astral.sh/uv/)
+- **PostgreSQL 15 or later.** `db/schema.sql`'s `trade_opening_fill_fk` constraint uses
+  the column-scoped `ON DELETE SET NULL (opening_fill_id)` form on a composite foreign
+  key — that syntax does not exist before PG15. A plain `ON DELETE SET NULL` on an older
+  Postgres would null every column in the constraint, including `account_id`, which
+  violates `account_id`'s own `NOT NULL`.
+
+### Quickstart
+
+```bash
+uv sync --extra dev
+
+cp .env.example .env   # fill in PG_DSN (and TEST_PG_DSN if you'll run the DB test suite)
+set -a && . ./.env && set +a
+
+python cli.py migrate                                                    # bootstrap the schema
+python cli.py accounts add --name "Fidelity Brokerage" --venue fidelity \
+    --account-type cash                                                  # prints the account UUID
+python cli.py accounts                                                   # list accounts
+
+python cli.py import fidelity path/to/activity.csv --account <uuid>              # preview only
+python cli.py import fidelity path/to/activity.csv --account <uuid> --commit     # write + regroup
+
+python cli.py trades --account <uuid>
+```
+
+`import` without `--commit` never opens a database connection — it only parses the file
+and reports what it would do. `--commit` refuses to run if `--account`'s venue doesn't
+match the importer's (e.g. committing a Coinbase export to a Fidelity account), and
+wraps the fill insert and trade regroup in one transaction, so a crash between the two
+can never leave fills without their trades.
+
+Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
+tests; set it to run them too).
 
 ## Subsystems
 

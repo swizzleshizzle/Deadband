@@ -157,6 +157,15 @@ class FidelityImporter:
                 unmapped.append(str(raw_row))
                 continue
 
+            # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they are
+            # not caught by the `except InvalidOperation` above. Left unchecked,
+            # Infinity survives Fill.__post_init__'s `quantity > 0` check and the
+            # DB's `quantity > 0` CHECK, becoming a live allocation in group_fills.
+            if not raw_qty.is_finite() or not price.is_finite():
+                warnings.append(f"line {line_no}: non-finite number, skipped")
+                unmapped.append(str(raw_row))
+                continue
+
             instrument = parse_option_symbol(symbol) or Instrument(
                 id=None,
                 asset_class=AssetClass.EQUITY,

@@ -8,11 +8,26 @@ import pathlib
 import sys
 from uuid import UUID
 
-from db.accounts import list_accounts
+from db.accounts import create_account, get_account, list_accounts
 from db.importing import commit_batch
+from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.trades import list_trades, regroup_account
 from importers.registry import get_importer, list_importers
+
+
+async def cmd_migrate(_args) -> int:
+    pool = await create_pool()
+    async with pool.acquire() as conn:
+        applied = await apply_migrations(conn)
+    await pool.close()
+    if applied:
+        print(f"applied {len(applied)} migration(s):")
+        for name in applied:
+            print(f"  {name}")
+    else:
+        print("already up to date")
+    return 0
 
 
 async def cmd_accounts(_args) -> int:
@@ -21,6 +36,22 @@ async def cmd_accounts(_args) -> int:
         for a in await list_accounts(conn):
             print(f"{a['id']}  {a['venue']:<10} {a['name']:<24} {a['external_ref'] or '-'}")
     await pool.close()
+    return 0
+
+
+async def cmd_accounts_add(args) -> int:
+    pool = await create_pool()
+    async with pool.acquire() as conn:
+        account_id = await create_account(
+            conn,
+            name=args.name,
+            venue=args.venue,
+            account_type=args.account_type,
+            default_intent=args.default_intent,
+            external_ref=args.external_ref,
+        )
+    await pool.close()
+    print(account_id)
     return 0
 
 
@@ -57,8 +88,25 @@ async def cmd_import(args) -> int:
 
     pool = await create_pool()
     async with pool.acquire() as conn:
+        account_id = UUID(args.account)
+        account = await get_account(conn, account_id)
+        if account is None:
+            print(f"error: no account with id {account_id}", file=sys.stderr)
+            await pool.close()
+            return 2
+        # A file parsed by one venue's importer must never be committed to an
+        # account belonging to a different venue — that would permanently
+        # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
+        # path to undo it.
+        if account["venue"] != importer.venue:
+            print(
+                f"error: account {account_id} is a {account['venue']!r} account; "
+                f"refusing to commit a {importer.venue!r} import to it",
+                file=sys.stderr,
+            )
+            await pool.close()
+            return 2
         async with conn.transaction():
-            account_id = UUID(args.account)
             result = await commit_batch(conn, account_id, batch)
             written = await regroup_account(conn, account_id)
     await pool.close()
@@ -99,7 +147,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("accounts").set_defaults(fn=cmd_accounts)
+    sub.add_parser("migrate", help="apply pending database migrations").set_defaults(fn=cmd_migrate)
+
+    p_accounts = sub.add_parser("accounts")
+    p_accounts.set_defaults(fn=cmd_accounts)
+    accounts_sub = p_accounts.add_subparsers(dest="accounts_command")
+    p_accounts_add = accounts_sub.add_parser("add", help="create a new account")
+    p_accounts_add.add_argument("--name", required=True)
+    p_accounts_add.add_argument("--venue", required=True)
+    p_accounts_add.add_argument("--account-type", required=True)
+    p_accounts_add.add_argument("--external-ref", default=None)
+    p_accounts_add.add_argument("--default-intent", default="trade")
+    p_accounts_add.set_defaults(fn=cmd_accounts_add)
 
     p_import = sub.add_parser("import", help="parse a venue export")
     p_import.add_argument("venue", choices=list_importers())
@@ -120,14 +179,30 @@ def main() -> int:
     if getattr(args, "commit", False) and not args.account:
         parser.error("--commit requires --account")
 
-    # A typo'd file path or a malformed --account UUID are the most likely first
-    # mistakes a user makes; a raw traceback for either is unfriendly and (for
-    # OSError especially) can leak a full local path. Anything from the database
-    # layer is deliberately left unwrapped — a bad account id that passes UUID
-    # parsing but doesn't exist is a real error worth seeing in full.
+    # A malformed --account UUID is a genuine user-input mistake, same class as
+    # a typo'd file path below — but it must be told apart from a domain
+    # invariant violation (Fill.__post_init__, group_fills' id=None rejection,
+    # instrument_natural_key, CorporateAction.__post_init__) that also happens
+    # to raise ValueError. Parsing it here, before the try/except, means the
+    # broad `except ValueError` below is never needed (and never added back) to
+    # catch it.
+    if getattr(args, "account", None):
+        try:
+            UUID(args.account)
+        except ValueError as exc:
+            print(f"error: --account is not a valid UUID: {exc}", file=sys.stderr)
+            return 2
+
+    # A typo'd file path is the most likely first mistake a user makes; a raw
+    # traceback for it is unfriendly and can leak a full local path, so
+    # OSError (FileNotFoundError et al.) gets a clean one-line message.
+    # Everything else — including every domain invariant violation above, and
+    # anything from the database layer — is deliberately left unwrapped, so a
+    # real bug surfaces as a full traceback (with line numbers and the
+    # offending row) instead of being disguised as a clean user error.
     try:
         return asyncio.run(args.fn(args))
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

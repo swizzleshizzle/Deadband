@@ -218,6 +218,31 @@ def test_direction_comes_from_action_even_when_sign_disagrees():
 # --- Fix round 1, item 3: header columns are read case-insensitively too ---
 
 
+# --- Final fix wave, item 2: poison Decimal values (NaN/Infinity) pass the --
+# --- existing `except InvalidOperation` guard, since both are valid Decimal
+# --- constructions. Verified upstream: Infinity survives Fill.__post_init__'s
+# --- `quantity > 0` check, the DB's `quantity > 0` CHECK, and becomes a live
+# --- allocation in group_fills. ----------------------------------------------
+
+
+def test_non_finite_quantity_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad_row = header + "\n06/01/2026,X1,YOU BOUGHT,SPY,SPDR,Infinity,500.00,0.00,0.00,-5000.00\n"
+    result = FidelityImporter().parse(bad_row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
+def test_non_finite_price_is_rejected():
+    header = FIXTURE.splitlines()[0]
+    bad_row = header + "\n06/01/2026,X1,YOU BOUGHT,SPY,SPDR,10,Infinity,0.00,0.00,-5000.00\n"
+    result = FidelityImporter().parse(bad_row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("non-finite" in w for w in result.warnings)
+
+
 def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
     """The header row is located case-insensitively ("run date" in line.lower()),
     so a differently-cased real export must not then read zero usable fields —
