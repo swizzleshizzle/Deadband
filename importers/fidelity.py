@@ -17,6 +17,21 @@ _OPTION_RE = re.compile(
     r"(?P<right>[CP])(?P<strike>\d+(?:\.\d+)?)$"
 )
 
+# "Price ($)" -> "price". Real Fidelity exports suffix every money column with a
+# currency parenthetical; the fixtures did not, so every price, commission, fee
+# and cash amount resolved to a missing key and _decimal(None)'s Decimal("0")
+# silently replaced it — no warning, quantities and dates intact, the result
+# plausible and financially meaningless. Strip the parenthetical structurally
+# rather than aliasing the observed spellings: the export's own disclaimer text
+# writes "Fees($)" without the space its header row uses, so an alias table
+# would be one Fidelity inconsistency away from silently zeroing a column again.
+_FIELD_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _normalize_field(name: str | None) -> str:
+    return _FIELD_QUALIFIER_RE.sub("", (name or "").strip().lower()).strip()
+
+
 _CASH_ACTIONS = {
     "DIVIDEND RECEIVED": "dividend",
     "ELECTRONIC FUNDS TRANSFER RECEIVED": "deposit",
@@ -113,7 +128,7 @@ class FidelityImporter:
             # Normalize header casing once — a real export's header is found
             # case-insensitively (above), so the fields must be read the same
             # way or a differently-cased header parses to zero usable rows.
-            row = {(k or "").strip().lower(): v for k, v in raw_row.items()}
+            row = {_normalize_field(k): v for k, v in raw_row.items()}
             action = (row.get("action") or "").strip().upper()
             symbol = (row.get("symbol") or "").strip()
             account = (row.get("account") or "").strip() or None

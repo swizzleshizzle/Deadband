@@ -315,6 +315,49 @@ def test_withdrawal_amount_is_positive_not_the_raw_negative_export_sign():
     assert withdrawals[0].amount == Decimal("2000.00")
 
 
+def _with_currency_suffixed_headers(text: str, suffix: str) -> str:
+    """Rewrite the fixture's money column names into the form a real Fidelity
+    export uses, preserving column order so the data rows still align."""
+    lines = text.splitlines()
+    header = lines[0]
+    for col in ("Price", "Commission", "Fees", "Amount"):
+        header = header.replace(col, f"{col}{suffix}")
+    return "\n".join([header, *lines[1:]]) + "\n"
+
+
+def test_currency_suffixed_money_headers_are_parsed_not_silently_zeroed():
+    """A real Fidelity export names its money columns "Price ($)", not "Price".
+
+    row.get("price") then misses, _decimal(None) returns Decimal("0"), and every
+    price, commission, fee and cash amount imports as zero with NO warning —
+    quantities and dates survive, so the result looks plausible while being
+    financially meaningless. Assert on the values themselves rather than on a
+    row count: the row count is identical either way, so only the amounts can
+    distinguish the bug from correct behaviour.
+    """
+    result = FidelityImporter().parse(_with_currency_suffixed_headers(FIXTURE, " ($)"))
+    baseline = batch()
+
+    assert [f.price for f in result.fills] == [f.price for f in baseline.fills]
+    assert [f.fee for f in result.fills] == [f.fee for f in baseline.fills]
+    assert [c.amount for c in result.cash] == [c.amount for c in baseline.cash]
+    # Guard the guard: if the baseline were all zeros the comparison above would
+    # hold vacuously and could not fail.
+    assert result.fills[0].price == Decimal("500.00")
+    assert any(f.fee > 0 for f in result.fills)
+    assert all(c.amount > 0 for c in result.cash)
+
+
+def test_money_headers_without_a_space_before_the_paren_are_also_parsed():
+    """Fidelity is inconsistent with itself: the export's own trailing disclaimer
+    refers to the "Fees($)" column with no space, while the header row writes
+    "Fees ($)". Normalisation must therefore be structural, not a lookup table of
+    the two spellings that happen to have been observed."""
+    result = FidelityImporter().parse(_with_currency_suffixed_headers(FIXTURE, "($)"))
+    assert result.fills[0].price == Decimal("500.00")
+    assert [c.amount for c in result.cash] == [c.amount for c in batch().cash]
+
+
 def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
     """The header row is located case-insensitively ("run date" in line.lower()),
     so a differently-cased real export must not then read zero usable fields —
