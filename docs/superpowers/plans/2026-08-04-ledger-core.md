@@ -1832,6 +1832,9 @@ CREATE TABLE IF NOT EXISTS trade (
                         CHECK (intent IN ('trade','investment','unassigned')),
     grouping_mode       TEXT NOT NULL DEFAULT 'auto'
                         CHECK (grouping_mode IN ('auto','manual')),
+    -- Stable identity for auto trades. Regroup upserts on this instead of
+    -- deleting and rebuilding, so user-authored fields survive re-imports.
+    opening_fill_id     UUID REFERENCES fill(id) ON DELETE CASCADE,
     opened_at           TIMESTAMPTZ NOT NULL,
     closed_at           TIMESTAMPTZ,
     qty_opened          NUMERIC,
@@ -1852,6 +1855,8 @@ CREATE TABLE IF NOT EXISTS trade (
 
 CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
 CREATE INDEX IF NOT EXISTS trade_opened_at_idx ON trade (opened_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_fill_uniq
+    ON trade (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS fill (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2491,6 +2496,74 @@ async def test_regroup_is_idempotent(conn):
     assert len(await list_trades(conn, acc)) == 1
 
 
+async def test_regroup_preserves_user_authored_fields(conn):
+    """The whole point of upserting instead of rebuilding. A routine re-import
+    must never silently destroy hand-entered judgment."""
+    acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
+    await regroup_account(conn, acc)
+
+    await conn.execute(
+        """
+        UPDATE trade SET notes = 'thesis: CPI hot', planned_risk = 50,
+                         strategy_tag = 'orb', intent = 'trade'
+         WHERE account_id = $1
+        """,
+        acc,
+    )
+
+    await regroup_account(conn, acc)
+
+    t = (await list_trades(conn, acc))[0]
+    assert t["notes"] == "thesis: CPI hot"
+    assert t["planned_risk"] == Decimal("50")
+    assert t["strategy_tag"] == "orb"
+    assert t["realized_pnl"] == Decimal("20")          # derived value still refreshed
+    assert t["r_multiple"] == Decimal("0.4")           # recomputed from planned_risk
+
+
+async def test_regroup_keeps_the_same_trade_id_across_runs(conn):
+    """A stable id is what lets subsystem B attach a thesis to a trade."""
+    acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
+    await regroup_account(conn, acc)
+    first = (await list_trades(conn, acc))[0]["id"]
+    await regroup_account(conn, acc)
+    assert (await list_trades(conn, acc))[0]["id"] == first
+
+
+async def test_appending_a_later_fill_updates_the_same_trade(conn):
+    """Scaling into an open position must not create a second trade."""
+    acc = await seed(conn, [(Side.BUY, "1", "100")])
+    await regroup_account(conn, acc)
+    original = (await list_trades(conn, acc))[0]["id"]
+
+    inst = await conn.fetchval("SELECT id FROM instrument LIMIT 1")
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(hours=2),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("110"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="later",
+                is_estimated=False,
+            )
+        ],
+    )
+    await regroup_account(conn, acc)
+
+    trades = await list_trades(conn, acc)
+    assert len(trades) == 1
+    assert trades[0]["id"] == original
+    assert trades[0]["avg_entry"] == Decimal("105")
+
+
 async def test_regroup_does_not_touch_manual_trades(conn):
     acc = await seed(conn, [(Side.BUY, "1", "100"), (Side.SELL, "1", "120")])
     await regroup_account(conn, acc)
@@ -2674,7 +2747,7 @@ import asyncpg
 from db.fills import fetch_fills
 from db.instruments import get_multipliers
 from ledger.grouping import group_fills
-from ledger.pnl import compute_pnl, r_multiple
+from ledger.pnl import compute_pnl
 from ledger.types import TradeIntent
 
 
@@ -2702,10 +2775,6 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         )
     }
 
-    await conn.execute(
-        "DELETE FROM trade WHERE account_id = $1 AND grouping_mode = 'auto'", account_id
-    )
-
     fills = [f for f in await fetch_fills(conn, account_id) if f.id not in manual_fill_ids]
     if not fills:
         return 0
@@ -2720,20 +2789,46 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         )
     }
 
+    groups = group_fills(fills)
+    seen_openings: list[UUID] = []
     written = 0
-    for g in group_fills(fills):
+
+    for g in groups:
         pnl = compute_pnl(g.allocations, by_id, multipliers, g.direction)
+        # The opening allocation is this trade's stable identity across regroups.
+        opening_fill_id = min(
+            g.allocations, key=lambda a: (by_id[a.fill_id].executed_at, str(a.fill_id))
+        ).fill_id
+        seen_openings.append(opening_fill_id)
+
+        # UPSERT, never delete-and-rebuild: derived columns are overwritten,
+        # user-authored ones (intent override, planned_risk, strategy_tag, notes,
+        # and B's thesis link) are left exactly as the user set them.
         trade_id = await conn.fetchval(
             """
             INSERT INTO trade (
-                account_id, primary_underlying, direction, status, intent,
-                grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
-                avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
-                r_multiple
-            ) VALUES ($1,$2,$3,$4,$5,'auto',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                account_id, opening_fill_id, primary_underlying, direction, status,
+                intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
+                avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total
+            ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            ON CONFLICT (account_id, opening_fill_id) DO UPDATE SET
+                primary_underlying = EXCLUDED.primary_underlying,
+                direction          = EXCLUDED.direction,
+                status             = EXCLUDED.status,
+                opened_at          = EXCLUDED.opened_at,
+                closed_at          = EXCLUDED.closed_at,
+                qty_opened         = EXCLUDED.qty_opened,
+                qty_closed         = EXCLUDED.qty_closed,
+                avg_entry          = EXCLUDED.avg_entry,
+                avg_exit           = EXCLUDED.avg_exit,
+                realized_pnl       = EXCLUDED.realized_pnl,
+                gross_realized_pnl = EXCLUDED.gross_realized_pnl,
+                fees_total         = EXCLUDED.fees_total,
+                updated_at         = now()
             RETURNING id
             """,
             account_id,
+            opening_fill_id,
             symbols.get(g.instrument_ids[0]),
             g.direction.value,
             g.status.value,
@@ -2747,13 +2842,40 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             pnl.realized_pnl,
             pnl.gross_realized_pnl,
             pnl.fees_total,
-            r_multiple(pnl.realized_pnl, None),
         )
+
+        # r_multiple depends on planned_risk, which is user-authored — recompute it
+        # from whatever risk the user has recorded rather than overwriting with NULL.
+        await conn.execute(
+            """
+            UPDATE trade
+               SET r_multiple = CASE
+                     WHEN planned_risk IS NULL OR planned_risk = 0 THEN NULL
+                     ELSE realized_pnl / planned_risk
+                   END
+             WHERE id = $1
+            """,
+            trade_id,
+        )
+
+        await conn.execute("DELETE FROM trade_fill WHERE trade_id = $1", trade_id)
         await conn.executemany(
             "INSERT INTO trade_fill (trade_id, fill_id, quantity) VALUES ($1,$2,$3)",
             [(trade_id, a.fill_id, a.quantity) for a in g.allocations],
         )
         written += 1
+
+    # An auto trade whose opening fill no longer opens anything (a backdated fill
+    # changed the grouping) is genuinely stale and is removed.
+    await conn.execute(
+        """
+        DELETE FROM trade
+         WHERE account_id = $1 AND grouping_mode = 'auto'
+           AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))
+        """,
+        account_id,
+        seen_openings,
+    )
 
     return written
 

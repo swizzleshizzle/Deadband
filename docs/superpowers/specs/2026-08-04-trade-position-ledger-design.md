@@ -200,6 +200,7 @@ spread is one trade across four instruments.
 | `status` | `open` / `closed` |
 | `intent` | `trade` / `investment` — defaults from `account.default_intent`, overridable per trade. Where the account is `mixed` there is no default: entry and import require an explicit choice, and imported rows land as `unassigned` for triage rather than being guessed. |
 | `grouping_mode` | `auto` / `manual` |
+| `opening_fill_id` | Stable identity for an auto trade, unique per account. Regroup **upserts** on this key rather than deleting and rebuilding, so user-authored fields survive re-imports. See "Regroup must never destroy judgment" below. |
 | `opened_at`, `closed_at` | |
 | `qty_opened`, `qty_closed`, `avg_entry`, `avg_exit` | derived |
 | `realized_pnl`, `fees_total` | derived |
@@ -282,6 +283,27 @@ pass only ever touches `auto` trades; a manual grouping is permanent. The option
 form creates a multi-leg trade explicitly in one action, writing N fills bound to one
 manually-grouped trade. A roll is "close trade, open new trade, linked by
 `rolled_from_id`".
+
+### Regroup must never destroy judgment
+
+Regrouping runs after every import, so it runs often. It must be **non-destructive**.
+
+`trade` columns divide into two kinds:
+
+- **Derived** — status, opened/closed timestamps, avg entry/exit, quantities, realized P&L,
+  fees, allocations. Regroup owns these and overwrites them freely.
+- **User-authored** — `intent` (where the account is `mixed`), `planned_risk`,
+  `strategy_tag` / setup, `notes`, and, once subsystem B exists, the thesis link.
+  Regroup must never write these.
+
+The naive implementation — delete all `auto` trades and rebuild — silently destroys every
+user-authored field on the next CSV import. The failure is quiet and the loss is
+unrecoverable, which is the worst combination.
+
+So an auto trade carries a stable identity: `opening_fill_id`, unique per account.
+Regroup upserts on it, updating derived columns only. A backdated fill that changes which
+fill opens a trade does change its identity — that is correct, because the trade genuinely
+changed.
 
 The grouper is a **pure function** — fills in, groupings out, no I/O. This is the piece
 where a subtle error silently corrupts every metric that will ever be computed, so it is
