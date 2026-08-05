@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, getcontext
+from fractions import Fraction
 from uuid import UUID, uuid4
 
 import pytest
@@ -179,40 +180,58 @@ def test_large_magnitude_counterexample_1e28():
 
 
 def test_dust_allocation_precision():
-    """Allocations of a tiny fill always sum exactly to its quantity."""
+    """Large buy after dust sell does not over-allocate under Decimal rounding."""
     # Sell 0.000000000000000001, buy 1000000000000
+    # Pre-fix bug: large_buy over-allocated to 1000000000000.000000000000000001
     tiny_sell = fill(Side.SELL, "0.000000000000000001", "100", 0)
     large_buy = fill(Side.BUY, "1000000000000", "100", 10)
     fills = [large_buy, tiny_sell]
     groups = group_fills(fills)
 
-    # The tiny_sell should be allocated exactly to its quantity across all trades
+    # The large_buy must be allocated exactly to its quantity across all trades
+    # Use Fraction for exact arithmetic (Decimal could still round)
     allocated = sum(
-        (a.quantity for g in groups for a in g.allocations if a.fill_id == tiny_sell.id),
-        Decimal(0),
+        (Fraction(a.quantity) for g in groups for a in g.allocations if a.fill_id == large_buy.id),
+        Fraction(0),
     )
-    assert allocated == tiny_sell.quantity
+    assert allocated == Fraction(large_buy.quantity)
 
 
 def test_ambient_context_independence():
-    """Results are independent of the ambient Decimal context precision."""
-    a = fill(Side.BUY, "1", "100", 0)
-    b = fill(Side.SELL, "1", "120", 10)
+    """Computation is independent of ambient Decimal precision via high-prec context."""
+    # Pre-fix bug: at prec 3, this diverged to 2 trades + spurious 0.005 short
+    # at prec 10/28, one closed long trade
+    a = fill(Side.BUY, "1.005", "100", 0)
+    b = fill(Side.SELL, "0.001", "100", 10)
+    c = fill(Side.SELL, "1.004", "100", 20)
 
     # Save original context
     original_prec = getcontext().prec
 
     try:
-        # Run with very low precision
-        getcontext().prec = 3
-        result_low = group_fills([a, b])
+        results_by_prec = {}
+        for prec in [3, 10, 28]:
+            getcontext().prec = prec
+            result = group_fills([a, b, c])
+            results_by_prec[prec] = result
 
-        # Reset to default and run again
-        getcontext().prec = 28
-        result_high = group_fills([a, b])
+        # All three should produce identical results (1 closed long trade)
+        # Compare by allocations structure as strings, not Decimal values
+        def allocations_to_strs(trade_groups):
+            strs = []
+            for g in trade_groups:
+                for alloc in g.allocations:
+                    strs.append((str(alloc.fill_id), str(alloc.quantity)))
+            return sorted(strs)
 
-        # Results should be identical
-        assert result_low == result_high
+        expected_strs = allocations_to_strs(results_by_prec[28])
+        for prec in [3, 10]:
+            result = results_by_prec[prec]
+            assert len(result) == 1, f"prec {prec}: expected 1 trade, got {len(result)}"
+            actual_strs = allocations_to_strs(result)
+            assert actual_strs == expected_strs, (
+                f"prec {prec} diverged: {actual_strs} != {expected_strs}"
+            )
     finally:
         # Restore original precision
         getcontext().prec = original_prec

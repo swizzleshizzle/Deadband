@@ -103,6 +103,8 @@ def group_fills(fills: list[Fill]) -> list[TradeGroup]:
                         # Opposite direction — reducing, possibly through zero.
                         reducible = min(remaining, abs(position))
                         allocations.append(FillAllocation(f.id, reducible))
+                        # ctx.prec=200 prevents rounding; exact-zero assignment is belt-and-braces
+                        # to ensure the exhausted side is exactly zero regardless.
                         if reducible == abs(position):
                             position = Decimal(0)
                         else:
