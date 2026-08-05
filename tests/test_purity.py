@@ -8,6 +8,17 @@ assignment, or otherwise dodging a substring scan.
 import ast
 import pathlib
 
+# Anchored to the repository root via __file__, NOT the process's current
+# working directory. pathlib.Path("ledger").rglob("*.py") resolves relative to
+# whatever directory pytest happens to be invoked from — from the repo root
+# that finds 6 files, but from anywhere else (e.g. /tmp, or a CI step that cds
+# first) the directory doesn't exist, rglob() on a missing directory raises
+# nothing and just yields zero files, and both purity tests below pass having
+# inspected exactly nothing. Proven: run from /tmp, "0 files, tests still
+# pass"; run from the repo root, "6 files". __file__-relative discovery makes
+# the guard's behavior independent of the caller's cwd.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
 PURE_PACKAGES = ["ledger", "importers"]
 
 # Importing any of these top-level modules is I/O by definition. Matched on
@@ -94,10 +105,31 @@ def purity_violations(source: str, filename: str = "<string>") -> list[str]:
     return violations
 
 
+def _python_files(pkg: str) -> list[pathlib.Path]:
+    """List every .py file under a package, anchored to the repo root.
+
+    A checker that silently scans zero files is worse than no checker at all —
+    it reports green while checking nothing. Fail loudly here instead: if a
+    package directory yields zero .py files, that is itself a bug in the
+    guard (wrong path, missing package, cwd-relative discovery) and must
+    never be allowed to look identical to "scanned everything, found nothing
+    wrong."
+    """
+    pkg_path = _REPO_ROOT / pkg
+    files = list(pkg_path.rglob("*.py"))
+    assert files, (
+        f"purity guard found zero .py files under {pkg_path} — it is scanning "
+        "nothing, which is exactly how the cwd-relative version of this "
+        "check shipped silently blind. This is a bug in the guard itself, "
+        "not a clean package."
+    )
+    return files
+
+
 def _violations_for_packages(packages: list[str], kinds: set[str]) -> list[str]:
     offenders = []
     for pkg in packages:
-        for path in pathlib.Path(pkg).rglob("*.py"):
+        for path in _python_files(pkg):
             for v in purity_violations(path.read_text(), str(path)):
                 if v.split(":", 1)[0] in kinds:
                     offenders.append(v)
@@ -180,3 +212,23 @@ def test_checker_catches_dynamic_import():
 
 def test_checker_is_quiet_on_clean_source():
     assert purity_violations(_CLEAN_SAMPLE) == []
+
+
+# --- Guard self-test: discovery must actually find files --------------------
+#
+# This is the direct regression test for the cwd-relative bug: it calls the
+# same discovery helper the two purity tests above use and asserts it finds a
+# non-zero count for both packages. Fails if _python_files ever goes back to
+# resolving against the process cwd instead of _REPO_ROOT (run this suite
+# from any directory other than the repo root and a cwd-relative version
+# reports 0 for both).
+
+
+def test_discovery_finds_files_in_ledger():
+    files = _python_files("ledger")
+    assert len(files) > 0
+
+
+def test_discovery_finds_files_in_importers():
+    files = _python_files("importers")
+    assert len(files) > 0
