@@ -7,6 +7,7 @@ so a wrong adjustment is fixable and ground truth stays intact.
 from __future__ import annotations
 
 import dataclasses
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -76,6 +77,41 @@ _ACTION_PRECEDENCE = {
 }
 
 
+def _ordered_actions(actions: Sequence[CorporateAction]) -> list[CorporateAction]:
+    """Within an ex_date, a remap must run before any action targeting the
+    instrument it produces. Economic precedence breaks remaining ties."""
+    by_date: dict[date, list[CorporateAction]] = defaultdict(list)
+    for a in actions:
+        by_date[a.ex_date].append(a)
+
+    ordered: list[CorporateAction] = []
+    for ex_date in sorted(by_date):
+        group = sorted(
+            by_date[ex_date],
+            key=lambda a: (_ACTION_PRECEDENCE[a.action_type], str(a.instrument_id)),
+        )
+        produced: dict[UUID | None, list[int]] = defaultdict(list)
+        for i, a in enumerate(group):
+            if a.resulting_instrument_id is not None:
+                produced[a.resulting_instrument_id].append(i)
+
+        deps = {
+            j: {i for i in produced.get(b.instrument_id, []) if i != j} for j, b in enumerate(group)
+        }
+
+        emitted: list[int] = []
+        remaining = list(range(len(group)))
+        while remaining:
+            ready = [i for i in remaining if not (deps[i] - set(emitted))]
+            if not ready:
+                raise ValueError(f"circular corporate-action dependency on {ex_date.isoformat()}")
+            nxt = ready[0]  # group is pre-sorted, so this applies the tie-break
+            emitted.append(nxt)
+            remaining.remove(nxt)
+        ordered.extend(group[i] for i in emitted)
+    return ordered
+
+
 def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> list[Fill]:
     """Return adjusted copies of `fills`, applying `actions` in ex-date order.
 
@@ -96,10 +132,7 @@ def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> l
     with localcontext() as ctx:
         ctx.prec = 50
 
-        for action in sorted(
-            actions,
-            key=lambda a: (a.ex_date, _ACTION_PRECEDENCE[a.action_type], str(a.instrument_id)),
-        ):
+        for action in _ordered_actions(actions):
             next_result: list[Fill] = []
 
             for f in result:
@@ -152,7 +185,12 @@ def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> l
                     spun_qty = f.quantity * action.ratio_numerator / action.ratio_denominator
                     total_basis = f.quantity * f.price
                     next_result.append(
-                        dataclasses.replace(f, price=f.price * (Decimal(1) - fraction))
+                        dataclasses.replace(
+                            f,
+                            price=f.price * (Decimal(1) - fraction),
+                            venue_fill_id=None,
+                            content_hash=None,
+                        )
                     )
                     next_result.append(
                         dataclasses.replace(

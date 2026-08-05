@@ -12,7 +12,16 @@ OLD = UUID("00000000-0000-0000-0000-0000000000b1")
 NEW = UUID("00000000-0000-0000-0000-0000000000b2")
 
 
-def fill(qty, price, day, instrument=OLD, side=Side.BUY, fill_id=None) -> Fill:
+def fill(
+    qty,
+    price,
+    day,
+    instrument=OLD,
+    side=Side.BUY,
+    fill_id=None,
+    venue_fill_id=None,
+    content_hash=None,
+) -> Fill:
     return Fill(
         id=fill_id or uuid4(),
         account_id=ACC,
@@ -24,8 +33,9 @@ def fill(qty, price, day, instrument=OLD, side=Side.BUY, fill_id=None) -> Fill:
         fee=Decimal("0"),
         fee_currency="USD",
         source=FillSource.CSV,
-        venue_fill_id=None,
+        venue_fill_id=venue_fill_id,
         is_estimated=False,
+        content_hash=content_hash,
     )
 
 
@@ -159,10 +169,23 @@ def test_zero_ratio_is_rejected():
         )
 
 
+def test_precision_pinning_produces_exact_value():
+    """I5: At ctx.prec=50, 100/3 must equal '33.' + 48 threes exactly.
+    Without precision pinning, this value depends on ambient precision."""
+    before = fill("30", "100", 1)
+    action = split(15, 3, 1)
+
+    adjusted = adjust_fills([before], [action])
+    price_str = str(adjusted[0].price)
+
+    # Assert the exact value: 33.333...333 (48 threes after decimal)
+    expected = "33." + "3" * 48
+    assert price_str == expected, f"Expected price {expected}, got {price_str}"
+
+
 def test_precision_pinning_produces_identical_results_across_ambient_precisions():
-    """C1-related: ensure precision pinning produces identical output regardless
-    of ambient precision. Compare full result sets using str() across three
-    different ambient precisions."""
+    """Precision pinning ensures identical output regardless of ambient precision.
+    Compares full result sets using str() across three different ambient precisions."""
     before = fill("30", "100", 1)
     action = split(15, 3, 1)
 
@@ -290,8 +313,9 @@ def test_fill_at_exactly_ex_date_is_untouched():
     assert adjusted[0].price == Decimal("100")
 
 
-def test_fill_one_microsecond_before_ex_date_is_adjusted():
-    """I1: Fill executed 1 microsecond before ex_date IS adjusted (< check)."""
+def test_fill_on_day_before_ex_date_is_adjusted():
+    """I1: Fill executed on the day before ex_date IS adjusted (< check).
+    (Comparison is at day granularity, so any time on the day before is adjusted.)"""
     f = Fill(
         id=uuid4(),
         account_id=ACC,
@@ -549,3 +573,161 @@ def test_symbol_change_ignores_non_unit_ratio():
     assert adjusted[0].instrument_id == NEW
     assert adjusted[0].quantity == Decimal("10")
     assert adjusted[0].price == Decimal("50")
+
+
+# ============================================================================
+# M1: Clear dedupe keys (venue_fill_id, content_hash) on adjusted fills
+# ============================================================================
+
+
+def test_split_clears_dedupe_keys():
+    """M1: Split must clear venue_fill_id and content_hash since qty/price changed."""
+    before = fill(
+        "10",
+        "500",
+        1,
+        venue_fill_id="V-123",
+        content_hash="deadbeef",
+    )
+    adjusted = adjust_fills([before], [split(15, 4, 1)])
+    assert adjusted[0].venue_fill_id is None
+    assert adjusted[0].content_hash is None
+
+
+def test_merger_clears_dedupe_keys():
+    """M1: Merger must clear dedupe keys (qty/price/instrument changed)."""
+    before = fill(
+        "10",
+        "50",
+        1,
+        venue_fill_id="V-123",
+        content_hash="deadbeef",
+    )
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(2),
+        resulting_instrument_id=NEW,
+    )
+    adjusted = adjust_fills([before], [action])
+    assert adjusted[0].venue_fill_id is None
+    assert adjusted[0].content_hash is None
+
+
+def test_symbol_change_clears_dedupe_keys():
+    """M1: Symbol-change must clear dedupe keys (instrument changed)."""
+    before = fill(
+        "10",
+        "50",
+        1,
+        venue_fill_id="V-123",
+        content_hash="deadbeef",
+    )
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SYMBOL_CHANGE,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=NEW,
+    )
+    adjusted = adjust_fills([before], [action])
+    assert adjusted[0].venue_fill_id is None
+    assert adjusted[0].content_hash is None
+
+
+def test_spinoff_parent_clears_dedupe_keys():
+    """M1: Spinoff parent must clear dedupe keys (price changed)."""
+    before = fill(
+        "10",
+        "100",
+        1,
+        venue_fill_id="V-123",
+        content_hash="deadbeef",
+    )
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.20"),
+    )
+    adjusted = adjust_fills([before], [action])
+    parent = [f for f in adjusted if f.instrument_id == OLD][0]
+    assert parent.venue_fill_id is None
+    assert parent.content_hash is None
+
+
+# ============================================================================
+# Remap chain dependency: actions targeting produced instruments
+# ============================================================================
+
+
+def test_merger_then_split_on_produced_instrument():
+    """NEW: Merger OLD→MID then split on MID must apply both, not drop split.
+    MID is the result of the merger, so split depends on merger completing."""
+    MID = UUID("00000000-0000-0000-0000-0000000000c1")
+
+    before = fill("10", "100", 1)
+
+    # Merger: OLD→MID at 1:1
+    merger = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=MID,
+    )
+
+    # Split on MID: 2:1
+    split_mid = CorporateAction(
+        instrument_id=MID,
+        action_type=ActionType.SPLIT,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(2),
+        ratio_denominator=Decimal(1),
+    )
+
+    adjusted = adjust_fills([before], [merger, split_mid])
+
+    # After merger: MID, 10 qty @ 100
+    # After split: MID, 20 qty @ 50
+    mid_fills = [f for f in adjusted if f.instrument_id == MID]
+    assert len(mid_fills) == 1
+    assert mid_fills[0].quantity == Decimal("20")
+    assert mid_fills[0].price == Decimal("50")
+
+
+def test_circular_remap_dependency_raises():
+    """NEW: A→B merger and B→A merger on same day is circular and must raise."""
+    B = UUID("00000000-0000-0000-0000-0000000000c1")
+
+    before = fill("10", "100", 1)
+
+    # Merger: OLD→B
+    merger1 = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=B,
+    )
+
+    # Merger: B→OLD (circular!)
+    merger2 = CorporateAction(
+        instrument_id=B,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=OLD,
+    )
+
+    with pytest.raises(ValueError, match="circular"):
+        adjust_fills([before], [merger1, merger2])
