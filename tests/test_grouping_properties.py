@@ -9,7 +9,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from ledger.grouping import group_fills
-from ledger.types import Fill, FillSource, Side, TradeStatus
+from ledger.types import Direction, Fill, FillSource, Side, TradeStatus
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 INST = UUID("00000000-0000-0000-0000-0000000000b1")
@@ -173,3 +173,60 @@ def test_closed_trades_net_to_flat_wide_magnitude(fills):
             Fraction(0),
         )
         assert net == Fraction(0)
+
+
+def _sort_key(f: Fill) -> tuple[datetime, str]:
+    """Match the grouper's own sort key for determining opening fills."""
+    return (f.executed_at, str(f.id))
+
+
+@given(fill_lists())
+@settings(max_examples=200, deadline=None)
+def test_direction_matches_opening_fill(fills):
+    """Direction must match the side of the fill that opened the trade."""
+    by_id = {f.id: f for f in fills}
+    groups = group_fills(fills)
+
+    # Direction.SPREAD must never be produced by the auto-grouper
+    for g in groups:
+        assert g.direction is not Direction.SPREAD
+
+    # For each group, find the opening fill (earliest by sort key)
+    for g in groups:
+        # All allocations must reference valid fills
+        allocation_fills = [by_id[a.fill_id] for a in g.allocations]
+
+        # Find the earliest fill by the grouper's own ordering
+        opening_fill = min(allocation_fills, key=_sort_key)
+
+        # Assert direction matches opening fill's side
+        if opening_fill.side is Side.BUY:
+            assert g.direction is Direction.LONG
+        else:  # Side.SELL
+            assert g.direction is Direction.SHORT
+
+
+@given(wide_magnitude_fill_lists())
+@settings(max_examples=200, deadline=None)
+def test_direction_matches_opening_fill_wide_magnitude(fills):
+    """Direction must match the side of the fill that opened the trade (wide magnitude test)."""
+    by_id = {f.id: f for f in fills}
+    groups = group_fills(fills)
+
+    # Direction.SPREAD must never be produced by the auto-grouper
+    for g in groups:
+        assert g.direction is not Direction.SPREAD
+
+    # For each group, find the opening fill (earliest by sort key)
+    for g in groups:
+        # All allocations must reference valid fills
+        allocation_fills = [by_id[a.fill_id] for a in g.allocations]
+
+        # Find the earliest fill by the grouper's own ordering
+        opening_fill = min(allocation_fills, key=_sort_key)
+
+        # Assert direction matches opening fill's side
+        if opening_fill.side is Side.BUY:
+            assert g.direction is Direction.LONG
+        else:  # Side.SELL
+            assert g.direction is Direction.SHORT
