@@ -623,9 +623,7 @@ def test_fill_crossing_zero_splits_across_two_trades():
 
     assert opened.direction is Direction.SHORT
     assert opened.status is TradeStatus.OPEN
-    assert opened.allocations == tuple(
-        a for a in opened.allocations if a.fill_id == crossing.id
-    )
+    assert {a.fill_id for a in opened.allocations} == {crossing.id}
     assert total(opened) == Decimal("1")
 
 
