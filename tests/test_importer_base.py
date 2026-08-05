@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 
 from importers.base import content_hash
+from importers.registry import get_importer, list_importers
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 T = datetime(2026, 8, 1, 14, 30, tzinfo=UTC)
@@ -107,3 +108,15 @@ def test_hash_rejects_naive_datetime():
     naive_time = datetime(2026, 8, 1, 14, 30)
     with pytest.raises(ValueError, match="timezone-aware"):
         content_hash(ACC, naive_time, "SPY", "buy", Decimal("10"), Decimal("500"))
+
+
+# --- Registry (deferred from Task 11 — needed both importers to exist) -----
+
+
+def test_registry_rejects_unknown_venue():
+    with pytest.raises(KeyError, match="unknown importer"):
+        get_importer("etrade")
+
+
+def test_registry_lists_available_importers():
+    assert set(list_importers()) >= {"coinbase", "fidelity"}
