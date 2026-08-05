@@ -51,6 +51,34 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         )
     }
 
+    # A manual trade holding only PART of a fill would make the auto pass exclude
+    # that fill whole via manual_fill_ids above, stranding the rest of its
+    # quantity — the same failure shape as round 2's Pass A bug, reached through a
+    # hand-marked manual trade instead of the protection step. Nothing in db/,
+    # ledger/, or importers/ creates that state today (the only writer of
+    # grouping_mode='manual' is the protection step, which drops its allocations
+    # first), but a future manual-grouping UI could. Fail loudly rather than
+    # silently losing an open position.
+    partial = await conn.fetch(
+        """
+        SELECT tf.fill_id, f.quantity AS fill_quantity, SUM(tf.quantity) AS held
+          FROM trade_fill tf
+          JOIN trade t ON t.id = tf.trade_id
+          JOIN fill  f ON f.id = tf.fill_id
+         WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
+         GROUP BY tf.fill_id, f.quantity
+        HAVING SUM(tf.quantity) < f.quantity
+        """,
+        account_id,
+    )
+    if partial:
+        raise NotImplementedError(
+            "a manual trade holds a partial allocation of "
+            f"fill {partial[0]['fill_id']} ({partial[0]['held']} of "
+            f"{partial[0]['fill_quantity']}); regrouping would strand the remainder. "
+            "Partial manual allocations need quantity-aware exclusion in group_fills."
+        )
+
     fills = [f for f in await fetch_fills(conn, account_id) if f.id not in manual_fill_ids]
 
     seen_openings: list[UUID] = []

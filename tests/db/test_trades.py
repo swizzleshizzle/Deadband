@@ -2,6 +2,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from db.accounts import create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
@@ -701,3 +703,68 @@ async def test_protected_trades_opening_fill_id_is_released(conn):
     # A brand-new trade formed instead, entirely separate from the protected one.
     new_trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == opening)
     assert new_trade["id"] != trade["id"]
+
+
+# --- Fix round 3 addition ---------------------------------------------------
+
+
+async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
+    """The same bug shape as round 2's Pass A failure, reached via a different
+    path: a manual trade holding only PART of a fill (not the whole thing) would
+    make manual_fill_ids exclude that fill WHOLE from the auto pass, stranding
+    the rest of its quantity. Nothing in db/, ledger/, or importers/ creates this
+    state today — the only writer of grouping_mode='manual' is the protection
+    step, which drops its allocations first — but a hand-marked manual trade
+    (exactly what a future "group these fills manually" UI would do, and exactly
+    what test_regroup_does_not_touch_manual_trades does via a plain UPDATE)
+    could. regroup_account must fail loudly instead of silently losing an open
+    position.
+
+    SELL 1 @100 opens a short of 1; BUY 5 @90 closes that short (quantity 1,
+    partial) and opens a long of 4 on the same fill. Hand-marking the closed
+    trade manual leaves it holding only 1 of the BUY fill's 5 units."""
+    acc = await create_account(conn, name="PartialManual", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"),
+    )
+    sell = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0,
+        side=Side.SELL,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="s1",
+        is_estimated=False,
+    )
+    buy = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0 + timedelta(minutes=10),
+        side=Side.BUY,
+        quantity=Decimal("5"),
+        price=Decimal("90"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="b1",
+        is_estimated=False,
+    )
+    await insert_fills(conn, [sell, buy])
+    await regroup_account(conn, acc)
+
+    closed = next(t for t in await list_trades(conn, acc) if t["status"] == "closed")
+    # Hand-mark it manual with a plain UPDATE, exactly as
+    # test_regroup_does_not_touch_manual_trades does — this is what a future
+    # manual-grouping UI would do, and it leaves the trade holding only 1 of the
+    # BUY fill's 5 units.
+    await conn.execute("UPDATE trade SET grouping_mode = 'manual' WHERE id = $1", closed["id"])
+
+    with pytest.raises(NotImplementedError, match=str(buy.id)):
+        await regroup_account(conn, acc)
