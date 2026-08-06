@@ -141,9 +141,14 @@ def compute_pnl(
 
         # The remainder rides with the open units. open_cost_basis is per-unit and
         # excludes the multiplier, so convert the currency fee into price terms.
+        # For a LONG, basis_total is purchase cost, so the fee adds to it. For a
+        # SHORT, basis_total is sale proceeds, so the fee (which reduces net
+        # proceeds) must be subtracted -- otherwise unrealized_pnl's
+        # (open_cost_basis - mark_price) for SHORT doubles the sign error.
         entry_fee_per_unit = Decimal(0)
         if qty_opened and position and entry_mult:
-            entry_fee_per_unit = (fees_entry / qty_opened) / entry_mult
+            sign = Decimal(-1) if direction is Direction.SHORT else Decimal(1)
+            entry_fee_per_unit = sign * (fees_entry / qty_opened) / entry_mult
         open_cost_basis_val = _q(
             ((basis_total / position) + entry_fee_per_unit) if position else Decimal(0)
         )

@@ -182,6 +182,83 @@ def test_option_entry_fee_capitalizes_per_contract_not_per_share():
     assert result.open_cost_basis == Decimal("0.4066")
 
 
+def test_short_entry_fee_reduces_open_cost_basis_not_increases():
+    """A SHORT's open_cost_basis is average SALE proceeds per unit, so an
+    entry (opening SELL) fee reduces net proceeds and must be SUBTRACTED --
+    not added, as is correct for a LONG's average purchase cost.
+
+    Adding it (the LONG rule applied blindly) is wrong in two ways at once:
+    open_cost_basis comes out too high, and unrealized_pnl for a SHORT is
+    (open_cost_basis - mark_price), so the sign error doubles into the
+    reported unrealized P&L. fees_realized and realized_pnl do not involve
+    this sign at all and must be unaffected -- only open_cost_basis moves.
+    """
+    entry = fill(side=Side.SELL, qty="10", price="0.40", minutes=0, fee="6.60")
+    exit_ = fill(side=Side.BUY, qty="2", price="0.30", minutes=10, fee="0")
+    result = compute_pnl(
+        _allocs(entry, "10", exit_, "2"),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: Decimal(100)},
+        Direction.SHORT,
+    )
+    assert result.open_quantity == Decimal("8")
+    # 0.40 - 6.60/(10*100) = 0.40 - 0.0066 = 0.3934
+    assert result.open_cost_basis == Decimal("0.3934")
+    assert result.fees_realized == Decimal("1.32")
+    assert result.realized_pnl == Decimal("18.68")
+
+
+@pytest.mark.parametrize(
+    "direction,mult,exit_qty",
+    [
+        (Direction.LONG, Decimal(1), "1"),
+        (Direction.LONG, Decimal(100), "1"),
+        (Direction.LONG, Decimal(1), "4"),
+        (Direction.SHORT, Decimal(1), "1"),
+        (Direction.SHORT, Decimal(100), "1"),
+        (Direction.SHORT, Decimal(1), "4"),
+    ],
+)
+def test_realized_plus_unrealized_conserves_gross_minus_fees(direction, mult, exit_qty):
+    """realized_pnl + unrealized_pnl(mark) must equal gross-at-mark minus fees_total.
+
+    Nothing is created or destroyed by splitting a fee between the realized
+    and still-open portions of a trade: whatever amortization does to
+    open_cost_basis, the two halves must still sum to the same total economic
+    result as if fees were never split at all. "gross-at-mark" is computed
+    independently of open_cost_basis (from avg_entry, which is pure price with
+    no fee folded in) so this test cannot be fooled by a self-consistent sign
+    error in open_cost_basis alone -- it is the check that would have caught
+    the SHORT sign inversion this file's earlier version had.
+
+    Deterministic fixtures, parametrized over LONG/SHORT, a contract
+    multiplier, and full vs. partial close.
+    """
+    if direction is Direction.LONG:
+        entry = fill(side=Side.BUY, qty="4", price="60000", minutes=0, fee="300")
+        exit_ = fill(side=Side.SELL, qty=exit_qty, price="76000", minutes=10, fee="85")
+    else:
+        entry = fill(side=Side.SELL, qty="4", price="60000", minutes=0, fee="300")
+        exit_ = fill(side=Side.BUY, qty=exit_qty, price="44000", minutes=10, fee="85")
+
+    result = compute_pnl(
+        _allocs(entry, "4", exit_, exit_qty),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: mult},
+        direction,
+    )
+
+    mark = Decimal("50000")
+    unreal = unrealized_pnl(result.open_quantity, result.open_cost_basis, mark, mult, direction)
+    if direction is Direction.SHORT:
+        unreal_gross = (result.avg_entry - mark) * result.open_quantity * mult
+    else:
+        unreal_gross = (mark - result.avg_entry) * result.open_quantity * mult
+    gross_at_mark = result.gross_realized_pnl + unreal_gross
+
+    assert result.realized_pnl + unreal == gross_at_mark - result.fees_total
+
+
 def test_unrealized_long():
     assert unrealized_pnl(
         open_quantity=Decimal("2"),
