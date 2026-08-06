@@ -203,10 +203,25 @@ this file is the project's memory.
 
 ## Accepted permanently
 
-- **Cross-batch same-day identical trades still collapse.** Two genuinely distinct
-  identical trades on one day, split across exports that never both contain the pair,
-  dedupe into one. Unfixable without a venue-supplied intra-day ordinal. Documented in
-  `commit_batch`'s docstring.
+- **Cross-batch same-day identical trades still collapse** — *for CSV sources only; see
+  below.* Two genuinely distinct identical trades on one day, split across exports that
+  never both contain the pair, dedupe into one. Unfixable without a venue-supplied
+  intra-day ordinal. Documented in `commit_batch`'s docstring.
+
+  > [!note] No longer permanent for Coinbase (2026-08-06)
+  > This was recorded as unfixable because no *export* carries an intra-day ordinal. The
+  > Coinbase Advanced Trade API does: `GET /orders/historical/fills` returns a venue trade
+  > id. The schema already has `fill_venue_id_uniq` and the import path already prefers
+  > `(account_id, venue_fill_id)` over `content_hash` where the venue supplies an id —
+  > that path exists and is unused for Coinbase only because the CSV omits one. Adopting
+  > the API (spec A2-16) retires this gap for Coinbase entirely.
+  >
+  > It remains permanent for **Fidelity**, whose exports carry no fill id and for which no
+  > viable API transport exists (spec A2-15).
+  >
+  > Worth noting how this was found: the gap was accepted as unfixable given the *inputs
+  > then in hand*. It was never re-tested against a different input. "Unfixable" is a
+  > claim about a data source, not about the problem.
 - **The purity checker is evadable** via `getattr(datetime, 'now')()` or `builtins.open`.
   It guards accidental I/O by implementers, not a motivated adversary.
 - **`localcontext()` inherits `Emax` / `traps` / `rounding`** from the caller; only `prec`
