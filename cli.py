@@ -20,11 +20,13 @@ async def cmd_migrate(_args) -> int:
     pool = await create_pool()
     async with pool.acquire() as conn:
         # apply() unconditionally (re-)executes schema.sql, and db/migrations/
-        # is currently empty, so `applied` is [] both when nothing was pending
-        # AND on a virgin database that just had its entire schema created —
-        # those are different outcomes and must not share one message. Check
-        # for a table schema.sql creates before calling apply(), while it's
-        # still meaningful to ask "did this exist already?".
+        # holds real migrations (starting with 001_a2_ledger_completion.sql),
+        # so `applied` can be non-empty for two different reasons: pending
+        # migrations on a database that already existed, or the entire schema
+        # having just been created on a virgin one. Those are different
+        # outcomes and must not share one message. Check for a table
+        # schema.sql creates before calling apply(), while it's still
+        # meaningful to ask "did this exist already?".
         existed_before = await conn.fetchval("SELECT to_regclass('public.account') IS NOT NULL")
         applied = await apply_migrations(conn)
     await pool.close()
@@ -32,6 +34,19 @@ async def cmd_migrate(_args) -> int:
         print(f"applied {len(applied)} migration(s):")
         for name in applied:
             print(f"  {name}")
+        if existed_before:
+            # A migration can add columns but cannot recompute existing rows —
+            # migration 001 changes how realized_pnl is derived, so rows written
+            # before it keep the old convention until regrouped. A virgin
+            # database has no pre-existing rows to be stale, so this warning is
+            # scoped to `existed_before` rather than printed unconditionally;
+            # doing otherwise on every fresh install would train the operator
+            # to ignore it.
+            print(
+                "\nDerived columns are stale: migration 001 changes how realized_pnl\n"
+                "is computed. Run `regroup --account <uuid>` for every account before\n"
+                "trusting any P&L figure."
+            )
     elif not existed_before:
         print("schema applied; no pending migrations")
     else:
