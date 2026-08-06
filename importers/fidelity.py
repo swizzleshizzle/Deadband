@@ -233,6 +233,11 @@ class FidelityImporter:
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
+        # Every account ref seen in the raw rows, independent of whether the
+        # row went on to become a fill/cash movement or fell out as
+        # unmapped -- see ImportBatch.refs_seen's docstring for why this
+        # can't be derived from fills/cash after the fact.
+        refs_seen: set[str] = set()
 
         def build_fill(
             row: dict[str, str],
@@ -324,6 +329,8 @@ class FidelityImporter:
             # nickname column when the number is absent -- unroutable (None)
             # is the honest outcome, not a guess.
             account = (row.get("account number") or "").strip() or None
+            if account:
+                refs_seen.add(account)
 
             try:
                 when = datetime.strptime((row.get("run date") or "").strip(), "%m/%d/%Y").replace(
@@ -434,4 +441,5 @@ class FidelityImporter:
             cash=tuple(cash),
             warnings=tuple(warnings),
             unmapped_rows=tuple(unmapped),
+            refs_seen=tuple(sorted(refs_seen)),
         )

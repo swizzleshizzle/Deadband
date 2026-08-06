@@ -120,6 +120,34 @@ def test_external_ref_is_the_account_number_not_the_nickname():
     assert {f.external_ref for f in result.fills} == {"A0000001", "A0000002"}
 
 
+def test_refs_seen_includes_an_account_whose_rows_are_entirely_unmapped():
+    """The account contributing nothing but unrecognised actions is exactly
+    the one a fills/cash-derived report can never see -- refs_seen is derived
+    from the raw rows, independent of whether they classified. Fails if
+    refs_seen is built from fills/cash instead of from every row's account
+    number column."""
+    header = (
+        "Run Date,Account Number,Action,Symbol,Description,Quantity,"
+        "Price,Commission,Fees,Amount"
+    )
+    rows = "\n".join(
+        [
+            header,
+            "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+            "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,123.45",
+            "01/17/2026,A0000005,ANOTHER UNRECOGNISED ACTION,BBB,DESC,,,,,67.89",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+
+    assert set(result.refs_seen) == {"A0000001", "A0000005"}
+    # A0000005 contributed zero fills and zero cash -- refs_seen is the ONLY
+    # place it's visible. Guards the guard: if this were false, the assertion
+    # above could pass vacuously off a fills/cash-derived implementation too.
+    assert all(f.external_ref != "A0000005" for f in result.fills)
+    assert all(c.external_ref != "A0000005" for c in result.cash)
+
+
 def test_missing_account_number_column_falls_back_to_none_not_the_nickname():
     """An export without the Account Number column (e.g. an older export
     shape) must not silently fall back to the unreliable nickname -- routing

@@ -397,7 +397,8 @@ async def test_commit_refuses_and_writes_nothing_when_a_row_routes_to_an_unknown
     file_path = _write_routing_csv(
         tmp_path,
         "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
-        "01/16/2026,A0000009,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK MARKET ETF,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
     )
 
     async def fake_create_pool(*_a, **_kw):
@@ -436,7 +437,8 @@ async def test_ignored_account_is_skipped_while_its_siblings_import(
     file_path = _write_routing_csv(
         tmp_path,
         "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
-        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK MARKET ETF,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
     )
 
     async def fake_create_pool(*_a, **_kw):
@@ -454,3 +456,84 @@ async def test_ignored_account_is_skipped_while_its_siblings_import(
     assert (
         await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", plan_account) == 0
     )
+
+
+async def test_commit_state_report_names_an_account_whose_rows_are_entirely_unmapped(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Same defect as the preview-level test in tests/test_cli.py, on the
+    --commit path's own state report: route_batch only ever sees refs that
+    appear on a fill or cash movement, so an account contributing ONLY
+    unrecognised-action rows never reaches it -- absent from by_account,
+    unknown_refs and ignored_refs alike. It must still be named, from
+    batch.refs_seen, or the commit reports success while a real account is
+    silently missing. Not a refusal case -- there is nothing of this
+    account's to write, so the known account must still commit normally."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,123.45",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0
+    combined = "".join(capsys.readouterr())
+    assert "A0000005" in combined
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 1
+
+
+# --- Fix round 1: --ignore-on-import needs a CLI path, not just a DB column -
+
+
+async def test_cmd_accounts_add_ignore_on_import_flag_creates_a_skippable_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """--commit refuses on an unknown ref, which is exactly the trap
+    ignore_on_import exists to escape -- but the escape hatch was only
+    reachable from the test suite or hand-written SQL until `accounts add`
+    could set it. Proves the flag end to end: create the account with
+    --ignore-on-import, then import a file referencing it and confirm it
+    routes as skipped, not unknown, while a sibling account still commits."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    add_args = argparse.Namespace(
+        name="Retirement Plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        default_intent="investment",
+        ignore_on_import=True,
+    )
+    rc = await cli.cmd_accounts_add(add_args)
+    assert rc == 0
+    account_id = UUID(capsys.readouterr().out.strip())
+
+    row = await conn.fetchrow("SELECT ignore_on_import FROM account WHERE id = $1", account_id)
+    assert row["ignore_on_import"] is True
+
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+    import_args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(import_args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "skipped" in out.lower()
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id) == 0

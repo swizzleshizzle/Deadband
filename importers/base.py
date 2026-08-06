@@ -131,6 +131,14 @@ class ImportBatch:
     cash: tuple[CanonicalCash, ...] = ()
     warnings: tuple[str, ...] = ()
     unmapped_rows: tuple[str, ...] = ()
+    # Every distinct account ref seen in the RAW rows, whether or not the row
+    # went on to become a fill or cash movement. Deriving "which accounts are
+    # in this file" from fills/cash alone is blind to an account whose rows
+    # are entirely unmapped (e.g. every action is one the classifier doesn't
+    # know) -- that account then contributes nothing to fills or cash and is
+    # invisible to any report built from them. refs_seen exists so a caller
+    # can report on accounts, not just on successfully classified rows.
+    refs_seen: tuple[str, ...] = ()
 
 
 class Importer(Protocol):

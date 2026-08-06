@@ -91,6 +91,10 @@ async def cmd_accounts_add(args) -> int:
                 account_type=args.account_type,
                 default_intent=args.default_intent,
                 external_ref=args.external_ref,
+                # getattr, not args.ignore_on_import: a Namespace built by
+                # hand (rather than through argparse, which always supplies
+                # the store_true default) may omit the attribute entirely.
+                ignore_on_import=getattr(args, "ignore_on_import", False),
             )
     finally:
         # See cmd_import's identical comment: pool.close() must run after the
@@ -117,14 +121,23 @@ async def cmd_import(args) -> int:
         # each row to its own account automatically (see db.importing.route_batch);
         # this preview-only warning is the pure, DB-free heads-up for the same
         # situation, since preview deliberately never opens a connection.
-        external_refs = sorted(
-            {f.external_ref for f in batch.fills if f.external_ref}
-            | {c.external_ref for c in batch.cash if c.external_ref}
-        )
-        if len(external_refs) > 1:
+        #
+        # Derived from batch.refs_seen -- every account ref seen in the RAW
+        # rows -- rather than from batch.fills/batch.cash. An account whose
+        # rows are ENTIRELY unmapped (every action is one the classifier
+        # doesn't know) contributes nothing to fills or cash, so a report
+        # built from those would never name it -- exactly the account most in
+        # need of being flagged. Printing its row count (0, in that case) is
+        # itself the signal that something is wrong with that account.
+        if len(batch.refs_seen) > 1:
+            for ref in batch.refs_seen:
+                n = sum(1 for f in batch.fills if f.external_ref == ref) + sum(
+                    1 for c in batch.cash if c.external_ref == ref
+                )
+                print(f"    {ref}: {n} row(s)", file=sys.stderr)
             print(
                 "  warning: this file mixes multiple account refs "
-                f"({', '.join(external_refs)}); --commit routes each row to "
+                f"({', '.join(batch.refs_seen)}); --commit routes each row to "
                 "its own account automatically",
                 file=sys.stderr,
             )
@@ -185,6 +198,25 @@ async def cmd_import(args) -> int:
                 print(f"  {ref}: ignored (ignore_on_import), skipped")
             for ref in plan.unknown_refs:
                 print(f"  {ref}: no matching account", file=sys.stderr)
+
+            # route_batch only ever sees refs that appear on a fill or cash
+            # movement (it partitions batch.fills/batch.cash) -- an account
+            # whose rows are ENTIRELY unmapped never contributes one, so it
+            # never reaches route_batch at all and is absent from every list
+            # above. batch.refs_seen (every ref seen in the raw rows) is the
+            # only place such an account is visible; report it explicitly
+            # rather than let a real account silently vanish from the report
+            # while the commit still reports success.
+            covered_refs = (
+                {f.external_ref for f in batch.fills if f.external_ref}
+                | {c.external_ref for c in batch.cash if c.external_ref}
+            )
+            for ref in sorted(set(batch.refs_seen) - covered_refs):
+                print(
+                    f"  {ref}: 0 row(s) mapped -- every row for this account "
+                    "failed to classify; see warnings above",
+                    file=sys.stderr,
+                )
 
             # Partial commits are not acceptable -- a silently-skipped account
             # looks like a successful import. Refuse the WHOLE batch, and write
@@ -280,6 +312,15 @@ def main() -> int:
     p_accounts_add.add_argument("--external-ref", default=None)
     p_accounts_add.add_argument(
         "--default-intent", default="trade", choices=["trade", "investment", "mixed"]
+    )
+    p_accounts_add.add_argument(
+        "--ignore-on-import",
+        action="store_true",
+        help=(
+            "skip this account's rows on import instead of refusing the whole "
+            "commit for an account you don't intend to import (e.g. a "
+            "retirement plan with no instrument identity)"
+        ),
     )
     p_accounts_add.set_defaults(fn=cmd_accounts_add)
 
