@@ -55,6 +55,72 @@ async def test_negative_mark_price_is_rejected(conn):
         )
 
 
+async def test_nan_contract_multiplier_is_rejected(conn):
+    """NUMERIC accepts the literal 'NaN', and NaN compares greater than every
+    finite value in Postgres -- `> 0` alone lets it through."""
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            """INSERT INTO instrument (natural_key, asset_class, symbol,
+                                       quote_currency, contract_multiplier)
+               VALUES ('x:nanmult', 'option', 'NANMULT', 'USD', 'NaN')"""
+        )
+
+
+async def test_infinite_contract_multiplier_is_rejected(conn):
+    """NUMERIC also accepts the literal 'Infinity', which is also > 0."""
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            """INSERT INTO instrument (natural_key, asset_class, symbol,
+                                       quote_currency, contract_multiplier)
+               VALUES ('x:infmult', 'option', 'INFMULT', 'USD', 'Infinity')"""
+        )
+
+
+async def test_normal_contract_multiplier_is_accepted(conn):
+    """Proves the tightened constraint didn't also reject legitimate values."""
+    await conn.execute(
+        """INSERT INTO instrument (natural_key, asset_class, symbol,
+                                   quote_currency, contract_multiplier)
+           VALUES ('x:normalmult', 'option', 'NORMALMULT', 'USD', 100)"""
+    )
+
+
+async def test_nan_mark_price_is_rejected(conn):
+    inst = await conn.fetchval(
+        """INSERT INTO instrument (natural_key, asset_class, symbol, quote_currency)
+           VALUES ('x:nanmark', 'equity', 'NANMARK', 'USD') RETURNING id"""
+    )
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            "INSERT INTO mark (instrument_id, as_of, price) VALUES ($1, now(), 'NaN')",
+            inst,
+        )
+
+
+async def test_infinite_mark_price_is_rejected(conn):
+    inst = await conn.fetchval(
+        """INSERT INTO instrument (natural_key, asset_class, symbol, quote_currency)
+           VALUES ('x:infmark', 'equity', 'INFMARK', 'USD') RETURNING id"""
+    )
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            "INSERT INTO mark (instrument_id, as_of, price) VALUES ($1, now(), 'Infinity')",
+            inst,
+        )
+
+
+async def test_zero_mark_price_is_accepted(conn):
+    """Proves the tightened constraint didn't also reject a legitimate zero price."""
+    inst = await conn.fetchval(
+        """INSERT INTO instrument (natural_key, asset_class, symbol, quote_currency)
+           VALUES ('x:zeromark', 'equity', 'ZEROMARK', 'USD') RETURNING id"""
+    )
+    await conn.execute(
+        "INSERT INTO mark (instrument_id, as_of, price) VALUES ($1, now(), 0)",
+        inst,
+    )
+
+
 async def test_return_of_capital_is_an_accepted_cash_kind(conn):
     """Guards the CHECK expansion: without it this raises and Part 2's rule
     table cannot record a return of capital at all."""

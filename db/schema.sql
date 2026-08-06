@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS instrument (
     option_right        TEXT CHECK (option_right IN ('call','put')),
     root                TEXT,
     contract_multiplier NUMERIC NOT NULL DEFAULT 1
-                        CONSTRAINT instrument_multiplier_chk CHECK (contract_multiplier > 0),
+                        CONSTRAINT instrument_multiplier_chk
+                        CHECK (contract_multiplier > 0 AND contract_multiplier < 'Infinity'::numeric),
     chain               TEXT,
     contract_address    TEXT,
     active_from         DATE,
@@ -188,7 +189,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS cash_content_hash_uniq
 CREATE TABLE IF NOT EXISTS mark (
     instrument_id   UUID NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
     as_of           TIMESTAMPTZ NOT NULL,
-    price           NUMERIC NOT NULL CONSTRAINT mark_price_chk CHECK (price >= 0),
+    price           NUMERIC NOT NULL CONSTRAINT mark_price_chk
+                        CHECK (price >= 0 AND price < 'Infinity'::numeric),
     source          TEXT NOT NULL DEFAULT 'manual',
     PRIMARY KEY (instrument_id, as_of)
 );
