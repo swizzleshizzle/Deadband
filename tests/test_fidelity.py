@@ -3,7 +3,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from importers.base import OUTFLOW_KINDS
-from importers.fidelity import RULES, FidelityImporter, Outcome, classify, parse_option_symbol
+from importers.fidelity import (
+    RULES,
+    FidelityImporter,
+    Outcome,
+    classify,
+    is_sweep,
+    parse_option_symbol,
+)
 from ledger.types import AssetClass, Side
 
 # Anchored to this test file's own location, not the process cwd — same
@@ -530,3 +537,61 @@ def test_action_containing_sold_inside_a_security_name_is_not_hijacked_as_a_sell
     assert len(result.cash) == 1
     assert result.cash[0].kind == "dividend"
     assert result.cash[0].amount == Decimal("7.50")
+
+
+# --- Task 3: sweep membership is explicit, and the staleness guard makes the -
+# --- set's decay visible in both directions. -------------------------------
+
+
+def test_a_sweep_symbol_is_recognised():
+    assert is_sweep("SPAXX") is True
+    assert is_sweep("spaxx") is True   # case-insensitive
+
+
+def test_a_real_security_is_not_a_sweep():
+    assert is_sweep("AAA") is False
+    assert is_sweep("") is False
+    assert is_sweep(None) is False
+
+
+def test_price_is_not_used_to_infer_sweepness():
+    """A real security can trade at exactly 1.00. Inferring from price would
+    silently convert a genuine position into cash -- which is why the set is
+    explicit. This test pins the DESIGN, not just the behaviour."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,PENNY CO,100,1.00,0.00,0.00,-100.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].instrument.symbol == "AAA"
+
+
+def test_a_sweep_symbol_priced_far_from_par_warns():
+    """Sweep funds hold a 1.00 NAV by construction. A deviation means either the
+    set has acquired a non-sweep symbol or a sweep has broken the buck -- both
+    need a human, and neither should pass unremarked."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("sweep" in w.lower() and "SPAXX" in w for w in result.warnings)
+
+
+def test_an_unlisted_symbol_reinvesting_at_par_warns_the_set_may_be_stale():
+    """The direction that actually costs money. An unlisted sweep is treated as a
+    real security, so its reinvestment becomes a fill that spends the dividend --
+    net cash nets to zero and a phantom position appears, silently. The warning is
+    the only thing that surfaces a missing ticker."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (NEWSW) (CASH),NEWSW,MM,10,1.00,0.00,0.00,-10.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("NEWSW" in w for w in result.warnings)
+
+
+def test_a_real_security_at_a_dollar_is_still_imported_as_a_security():
+    """The warning must not become classification. A genuine security trading at
+    a dollar stays a security -- a spurious warning is cheap, silently converting
+    a position into cash is not."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,PENNY CO,100,1.00,0.00,0.00,-100.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].instrument.symbol == "AAA"

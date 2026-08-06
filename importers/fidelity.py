@@ -53,6 +53,56 @@ def is_sweep(symbol: str | None) -> bool:
     return (symbol or "").strip().upper() in SWEEP_SYMBOLS
 
 
+# Sweep funds hold a $1.00 NAV by construction. Used ONLY to WARN (see
+# _sweep_par_warning below), never to classify -- see SWEEP_SYMBOLS' docstring
+# for why price must never drive classification.
+_SWEEP_PAR = Decimal("1.00")
+_SWEEP_PAR_TOLERANCE = Decimal("0.01")
+
+
+def _sweep_par_warning(symbol: str, raw_price: str | None) -> str | None:
+    """Surface the two ways SWEEP_SYMBOLS can silently decay, on a
+    REINVESTMENT row (the only place a per-unit price is meaningfully
+    comparable to a sweep's $1.00 NAV).
+
+    1. A LISTED sweep priced away from par: the set has acquired a non-sweep
+       symbol, or a genuine sweep broke the buck.
+    2. An UNLISTED symbol reinvesting at par: sweep_only=False in the rule
+       table means "not one of these six," not "is a real security" -- an
+       unlisted sweep gets classified as a security, its reinvestment leg
+       becomes a fill that spends the dividend, and a phantom position
+       appears with nothing warning. This is the direction that costs money.
+
+    A spurious warning here (a genuine $1 security) is cheap -- a human
+    dismisses it in seconds. That asymmetry is exactly why this heuristic is
+    fine here and is NOT fine in `is_sweep`/`classify`.
+    """
+    try:
+        price = _decimal(raw_price)
+    except InvalidOperation:
+        return None
+    if not price.is_finite():
+        return None
+
+    sym = (symbol or "").strip().upper()
+    deviation = abs(price - _SWEEP_PAR)
+
+    if is_sweep(symbol):
+        if deviation > _SWEEP_PAR_TOLERANCE:
+            return (
+                f"{sym} is a listed sweep symbol but priced at {price}, "
+                f"{deviation} away from its ${_SWEEP_PAR} par -- SWEEP_SYMBOLS "
+                "may have acquired a non-sweep symbol, or the sweep broke the buck"
+            )
+    elif deviation <= _SWEEP_PAR_TOLERANCE:
+        return (
+            f"{sym} is not in SWEEP_SYMBOLS but reinvested at {price}, within "
+            f"${_SWEEP_PAR_TOLERANCE} of the ${_SWEEP_PAR} sweep par -- "
+            "SWEEP_SYMBOLS may be missing this ticker"
+        )
+    return None
+
+
 class Outcome(enum.Enum):
     FILL = "fill"
     CASH = "cash"
@@ -300,6 +350,15 @@ class FidelityImporter:
                     funding_source="external",
                 )
                 continue
+
+            # Staleness guard: a REINVESTMENT row is the only place a
+            # per-unit price is meaningfully comparable to a sweep's $1.00
+            # NAV. Runs independent of which rule matches below (or whether
+            # any does) -- never suppress the row, warn and continue.
+            if action.startswith("REINVESTMENT"):
+                par_warning = _sweep_par_warning(symbol, row.get("price"))
+                if par_warning is not None:
+                    warnings.append(par_warning)
 
             rule = classify(action, symbol)
             if rule is None:
