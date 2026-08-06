@@ -144,10 +144,17 @@ async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, ca
     assert "002_fake.sql" in out
 
 
-# --- Blocker pass, item 6: db/migrations/ is empty, so apply() returns []
-# --- both when nothing was pending AND on a virgin database that just had
-# --- its entire schema created by apply()'s own schema.sql call — those are
-# --- different outcomes and must not share the "already up to date" message.
+# --- Blocker pass, item 6: on a virgin database, apply()'s own schema.sql
+# --- call creates every table from nothing — that must never be reported as
+# --- "already up to date". Originally db/migrations/ was empty too, so
+# --- apply() returned [] on a virgin db and cmd_migrate needed a separate
+# --- "schema applied; no pending migrations" branch to distinguish that from
+# --- a truly up-to-date database. Migration 001 (A-2 ledger completion) is
+# --- now the first real migration, so on a virgin db it is pending
+# --- immediately after schema.sql creates the tables, and apply() returns it
+# --- as applied — exercising the `if applied:` branch instead. Either way,
+# --- the one thing that must never happen is "already up to date" on a
+# --- database that had zero tables a moment earlier.
 
 
 async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, monkeypatch, capsys):
@@ -168,7 +175,7 @@ async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, mon
     assert rc == 0
     out = capsys.readouterr().out
     assert "already up to date" not in out
-    assert "schema applied" in out
+    assert "001_a2_ledger_completion.sql" in out
 
 
 async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monkeypatch, capsys):

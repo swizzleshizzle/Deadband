@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS account (
     closed_at       TIMESTAMPTZ,
     metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ignore_on_import BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE (venue, external_ref)
 );
 
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS instrument (
     expiry              DATE,
     option_right        TEXT CHECK (option_right IN ('call','put')),
     root                TEXT,
-    contract_multiplier NUMERIC NOT NULL DEFAULT 1,
+    contract_multiplier NUMERIC NOT NULL DEFAULT 1
+                        CONSTRAINT instrument_multiplier_chk CHECK (contract_multiplier > 0),
     chain               TEXT,
     contract_address    TEXT,
     active_from         DATE,
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS fill (
     venue_fill_id   TEXT,
     content_hash    TEXT,
     is_estimated    BOOLEAN NOT NULL DEFAULT FALSE,
+    funding_source  TEXT NOT NULL DEFAULT 'external'
+                    CONSTRAINT fill_funding_source_chk CHECK (funding_source IN ('external','reinvestment')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Composite target for trade.opening_fill_id and trade_fill's cross-account
@@ -115,6 +119,10 @@ CREATE TABLE IF NOT EXISTS trade (
     realized_pnl        NUMERIC,
     gross_realized_pnl  NUMERIC,
     fees_total          NUMERIC,
+    fees_realized       NUMERIC,
+    open_quantity       NUMERIC,
+    open_cost_basis     NUMERIC,
+    is_estimated        BOOLEAN NOT NULL DEFAULT FALSE,
     planned_risk        NUMERIC,
     r_multiple          NUMERIC,
     strategy_tag        TEXT,
@@ -164,7 +172,7 @@ CREATE TABLE IF NOT EXISTS cash_movement (
     occurred_at     TIMESTAMPTZ NOT NULL,
     kind            TEXT NOT NULL CHECK (kind IN
                     ('deposit','withdrawal','fee','funding','interest',
-                     'dividend','payout','rebate')),
+                     'dividend','payout','rebate','tax','return_of_capital')),
     amount          NUMERIC NOT NULL,
     currency        TEXT NOT NULL DEFAULT 'USD',
     instrument_id   UUID REFERENCES instrument(id),
@@ -180,7 +188,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS cash_content_hash_uniq
 CREATE TABLE IF NOT EXISTS mark (
     instrument_id   UUID NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
     as_of           TIMESTAMPTZ NOT NULL,
-    price           NUMERIC NOT NULL,
+    price           NUMERIC NOT NULL CONSTRAINT mark_price_chk CHECK (price >= 0),
     source          TEXT NOT NULL DEFAULT 'manual',
     PRIMARY KEY (instrument_id, as_of)
 );
@@ -210,3 +218,15 @@ CREATE TABLE IF NOT EXISTS account_snapshot (
     note            TEXT,
     UNIQUE (account_id, as_of)
 );
+
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS fill_set_updated_at ON fill;
+CREATE TRIGGER fill_set_updated_at
+    BEFORE UPDATE ON fill
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
