@@ -9,10 +9,11 @@ import sys
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
-from db.importing import commit_batch
+from db.importing import commit_batch, route_batch
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.trades import list_trades, regroup_account
+from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
 
 
@@ -110,49 +111,100 @@ async def cmd_import(args) -> int:
     if batch.unmapped_rows:
         print(f"  {len(batch.unmapped_rows)} row(s) not mapped", file=sys.stderr)
 
-    # A single export can carry rows for more than one venue account (Fidelity's
-    # "Account" column, for instance). Full routing is out of scope here — every
-    # row still lands in the one --account given — but silently merging two
-    # accounts' history is exactly the kind of thing that must never happen
-    # without at least a loud warning.
-    external_refs = sorted(
-        {f.external_ref for f in batch.fills if f.external_ref}
-        | {c.external_ref for c in batch.cash if c.external_ref}
-    )
-    if len(external_refs) > 1:
-        print(
-            "  warning: this file mixes multiple account refs "
-            f"({', '.join(external_refs)}); all rows will be committed to the "
-            "single --account given",
-            file=sys.stderr,
-        )
-
     if not args.commit:
+        # A single export can carry rows for more than one venue account
+        # (Fidelity's account-number column, for instance). --commit routes
+        # each row to its own account automatically (see db.importing.route_batch);
+        # this preview-only warning is the pure, DB-free heads-up for the same
+        # situation, since preview deliberately never opens a connection.
+        external_refs = sorted(
+            {f.external_ref for f in batch.fills if f.external_ref}
+            | {c.external_ref for c in batch.cash if c.external_ref}
+        )
+        if len(external_refs) > 1:
+            print(
+                "  warning: this file mixes multiple account refs "
+                f"({', '.join(external_refs)}); --commit routes each row to "
+                "its own account automatically",
+                file=sys.stderr,
+            )
         print("\npreview only — rerun with --commit to write")
         return 0
+
+    # Rows with no external_ref at all (a venue with no per-row account
+    # identifier, e.g. Coinbase) are never routed by route_batch -- they need
+    # an explicit destination. Whether that's a problem depends only on the
+    # parsed file, not on the database, so this check runs before the pool is
+    # ever opened.
+    unrouted = ImportBatch(
+        fills=tuple(f for f in batch.fills if f.external_ref is None),
+        cash=tuple(c for c in batch.cash if c.external_ref is None),
+    )
+    if (unrouted.fills or unrouted.cash) and not args.account:
+        print(
+            "error: this file has row(s) with no account ref to route by "
+            "(e.g. this venue's export carries no per-row account number); "
+            "pass --account to say where they go",
+            file=sys.stderr,
+        )
+        return 2
 
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            account_id = UUID(args.account)
-            account = await get_account(conn, account_id)
-            if account is None:
-                print(f"error: no account with id {account_id}", file=sys.stderr)
-                return 2
-            # A file parsed by one venue's importer must never be committed to an
-            # account belonging to a different venue — that would permanently
-            # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
-            # path to undo it.
-            if account["venue"] != importer.venue:
+            plan = await route_batch(conn, importer.venue, batch)
+            targets: dict[UUID, ImportBatch] = dict(plan.by_account)
+
+            if unrouted.fills or unrouted.cash:
+                account_id = UUID(args.account)
+                account = await get_account(conn, account_id)
+                if account is None:
+                    print(f"error: no account with id {account_id}", file=sys.stderr)
+                    return 2
+                # A file parsed by one venue's importer must never be committed to an
+                # account belonging to a different venue — that would permanently
+                # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
+                # path to undo it.
+                if account["venue"] != importer.venue:
+                    print(
+                        f"error: account {account_id} is a {account['venue']!r} account; "
+                        f"refusing to commit a {importer.venue!r} import to it",
+                        file=sys.stderr,
+                    )
+                    return 2
+                existing = targets.get(account_id, ImportBatch())
+                targets[account_id] = ImportBatch(
+                    fills=existing.fills + unrouted.fills,
+                    cash=existing.cash + unrouted.cash,
+                )
+
+            for account_id, sub_batch in targets.items():
+                n = len(sub_batch.fills) + len(sub_batch.cash)
+                print(f"  {account_id}: mapped, {n} row(s)")
+            for ref in plan.ignored_refs:
+                print(f"  {ref}: ignored (ignore_on_import), skipped")
+            for ref in plan.unknown_refs:
+                print(f"  {ref}: no matching account", file=sys.stderr)
+
+            # Partial commits are not acceptable -- a silently-skipped account
+            # looks like a successful import. Refuse the WHOLE batch, and write
+            # nothing at all, if any row routes to an account that doesn't exist.
+            if plan.unknown_refs:
                 print(
-                    f"error: account {account_id} is a {account['venue']!r} account; "
-                    f"refusing to commit a {importer.venue!r} import to it",
+                    "error: refusing to commit -- unknown account ref(s): "
+                    f"{', '.join(plan.unknown_refs)}",
                     file=sys.stderr,
                 )
                 return 2
+
+            fills_inserted = fills_skipped = cash_inserted = trades_regrouped = 0
             async with conn.transaction():
-                result = await commit_batch(conn, account_id, batch)
-                written = await regroup_account(conn, account_id)
+                for account_id, sub_batch in targets.items():
+                    result = await commit_batch(conn, account_id, sub_batch)
+                    fills_inserted += result.fills_inserted
+                    fills_skipped += result.fills_skipped
+                    cash_inserted += result.cash_inserted
+                    trades_regrouped += await regroup_account(conn, account_id)
     finally:
         # pool.close() waits for every checked-out connection to be released.
         # It must run after the `async with pool.acquire()` block has exited
@@ -163,9 +215,8 @@ async def cmd_import(args) -> int:
         await pool.close()
 
     print(
-        f"inserted {result.fills_inserted} fills "
-        f"({result.fills_skipped} already present), "
-        f"{result.cash_inserted} cash movements, {written} trades regrouped"
+        f"inserted {fills_inserted} fills ({fills_skipped} already present), "
+        f"{cash_inserted} cash movements, {trades_regrouped} trades regrouped"
     )
     return 0
 
@@ -235,7 +286,14 @@ def main() -> int:
     p_import = sub.add_parser("import", help="parse a venue export")
     p_import.add_argument("venue", choices=list_importers())
     p_import.add_argument("file")
-    p_import.add_argument("--account", help="account UUID (required with --commit)")
+    p_import.add_argument(
+        "--account",
+        help=(
+            "account UUID for rows with no venue-supplied account ref "
+            "(e.g. Coinbase); a venue that carries its own per-row account "
+            "number (e.g. Fidelity) routes automatically and does not need this"
+        ),
+    )
     p_import.add_argument("--commit", action="store_true", help="write to the database")
     p_import.set_defaults(fn=cmd_import)
 
@@ -248,8 +306,11 @@ def main() -> int:
     p_trades.set_defaults(fn=cmd_trades)
 
     args = parser.parse_args()
-    if getattr(args, "commit", False) and not args.account:
-        parser.error("--commit requires --account")
+    # `import --commit` no longer requires --account at parse time: whether
+    # it's needed depends on whether the parsed file has any row with no
+    # account ref to route by, which isn't known until the file is read (see
+    # cmd_import). Enforced there instead, before any database connection is
+    # opened.
 
     # A malformed --account UUID is a genuine user-input mistake, same class as
     # a typo'd file path below — but it must be told apart from a domain

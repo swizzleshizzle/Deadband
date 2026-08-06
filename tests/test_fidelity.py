@@ -94,6 +94,44 @@ def test_account_number_is_carried_for_routing():
     assert refs == {"X12345678", "X87654321"}
 
 
+# --- Task 4: external_ref is the account NUMBER, never the nickname --------
+#
+# Real exports carry both an "Account" (nickname, e.g. "INDIVIDUAL - TOD") and
+# a separate "Account Number" column. The nickname is neither stable nor
+# unique (two accounts can share one), so routing must key on the number.
+
+MULTI_ACCOUNT_FIXTURE = (
+    "Run Date,Account,Account Number,Action,Symbol,Description,Quantity,"
+    "Price,Commission,Fees,Amount\n"
+    "01/15/2026,Individual,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,"
+    "1,100.00,0.00,0.00,-100.00\n"
+    # Same nickname as the row above, deliberately -- if external_ref were
+    # ever read from the nickname column, both rows would collapse onto the
+    # same ref instead of the two distinct account numbers.
+    "01/16/2026,Individual,A0000002,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+    "MARKET ETF,1,100.00,0.00,0.00,-100.00\n"
+)
+
+
+def test_external_ref_is_the_account_number_not_the_nickname():
+    """Real exports carry BOTH an account nickname and an account number. The
+    number is the identifier; the nickname is not stable and is not unique."""
+    result = FidelityImporter().parse(MULTI_ACCOUNT_FIXTURE)
+    assert {f.external_ref for f in result.fills} == {"A0000001", "A0000002"}
+
+
+def test_missing_account_number_column_falls_back_to_none_not_the_nickname():
+    """An export without the Account Number column (e.g. an older export
+    shape) must not silently fall back to the unreliable nickname -- routing
+    on a nickname is exactly the bug this task fixes. Unroutable is the
+    correct, honest outcome."""
+    header = "Run Date,Account,Action,Symbol,Description,Quantity,Price,Commission,Fees,Amount"
+    row = header + "\n06/01/2026,Individual,YOU BOUGHT,AAA,ACME CORP,1,10.00,0.00,0.00,-10.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].external_ref is None
+
+
 # --- "Never drop a row silently" -------------------------------------------
 
 

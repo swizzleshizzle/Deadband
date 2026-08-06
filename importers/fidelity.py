@@ -317,7 +317,13 @@ class FidelityImporter:
             row = {_normalize_field(k): v for k, v in raw_row.items()}
             action = (row.get("action") or "").strip().upper()
             symbol = (row.get("symbol") or "").strip()
-            account = (row.get("account") or "").strip() or None
+            # external_ref MUST be the account NUMBER, never the nickname
+            # ("Account" in a real export): the nickname is neither stable
+            # nor unique (two accounts can share one), so routing on it
+            # would silently merge or misroute rows. No fallback to the
+            # nickname column when the number is absent -- unroutable (None)
+            # is the honest outcome, not a guess.
+            account = (row.get("account number") or "").strip() or None
 
             try:
                 when = datetime.strptime((row.get("run date") or "").strip(), "%m/%d/%Y").replace(

@@ -31,6 +31,101 @@ class CommitResult:
     warnings: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RoutingPlan:
+    by_account: dict[UUID, ImportBatch]
+    unknown_refs: tuple[str, ...]
+    ignored_refs: tuple[str, ...]
+
+
+async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) -> RoutingPlan:
+    """Split a parsed batch by account, one export can span several.
+
+    Each row's external_ref (the venue's own account NUMBER -- see
+    importers/fidelity.py) is matched against account.external_ref within
+    the given venue:
+
+    - No matching account -> the ref goes into `unknown_refs`. Never silently
+      merged into another account.
+    - A matching account with `ignore_on_import` -> the ref goes into
+      `ignored_refs`; its rows are dropped from `by_account` entirely (they
+      route SUCCESSFULLY -- this is the deliberate escape hatch for an
+      account the user never intends to import, not a failure).
+    - Otherwise -> its rows land in `by_account[account.id]`.
+
+    A row whose external_ref is None is never routed at all -- not even to
+    an account whose own external_ref is NULL. `UNIQUE (venue, external_ref)`
+    does not constrain NULLs in Postgres, so several accounts can legitimately
+    have none; matching on NULL would make the first such account a silent
+    catch-all for every unroutable row. Comparing to NULL in SQL is always
+    UNKNOWN (never true), so this falls out of the ordinary `= ANY(...)`
+    lookup below without any special-casing -- the guard is in never handing
+    a None ref to that lookup in the first place, and never treating an
+    account row with a NULL external_ref as a match for one.
+    """
+    refs = sorted(
+        {f.external_ref for f in batch.fills if f.external_ref is not None}
+        | {c.external_ref for c in batch.cash if c.external_ref is not None}
+    )
+
+    unknown_refs: list[str] = []
+    ignored_refs: list[str] = []
+    # ref -> account id, only for refs that route successfully (known,
+    # not ignored). Refs with no entry here are unknown or ignored -- both
+    # already recorded above -- or simply have no rows (unreachable, since
+    # `refs` is built only from refs that actually appear in the batch).
+    routable: dict[str, UUID] = {}
+
+    if refs:
+        rows = await conn.fetch(
+            """
+            SELECT id, external_ref, ignore_on_import
+              FROM account
+             WHERE venue = $1 AND external_ref = ANY($2::text[])
+            """,
+            venue,
+            refs,
+        )
+        # UNIQUE (venue, external_ref) means at most one row per ref here.
+        by_ref = {r["external_ref"]: r for r in rows}
+
+        for ref in refs:
+            row = by_ref.get(ref)
+            if row is None:
+                unknown_refs.append(ref)
+            elif row["ignore_on_import"]:
+                ignored_refs.append(ref)
+            else:
+                routable[ref] = row["id"]
+
+    fills_by_account: dict[UUID, list] = defaultdict(list)
+    cash_by_account: dict[UUID, list] = defaultdict(list)
+
+    for f in batch.fills:
+        account_id = routable.get(f.external_ref) if f.external_ref is not None else None
+        if account_id is not None:
+            fills_by_account[account_id].append(f)
+
+    for c in batch.cash:
+        account_id = routable.get(c.external_ref) if c.external_ref is not None else None
+        if account_id is not None:
+            cash_by_account[account_id].append(c)
+
+    by_account = {
+        account_id: ImportBatch(
+            fills=tuple(fills_by_account.get(account_id, ())),
+            cash=tuple(cash_by_account.get(account_id, ())),
+        )
+        for account_id in routable.values()
+    }
+
+    return RoutingPlan(
+        by_account=by_account,
+        unknown_refs=tuple(unknown_refs),
+        ignored_refs=tuple(ignored_refs),
+    )
+
+
 async def _find_instrument_by_symbol(
     conn: asyncpg.Connection, account_id: UUID, symbol: str
 ) -> list[UUID]:

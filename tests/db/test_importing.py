@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from db.accounts import create_account
-from db.importing import commit_batch
+from db.importing import commit_batch, route_batch
 from importers.base import CanonicalCash, CanonicalFill, ImportBatch
 from importers.coinbase import CoinbaseImporter
 from importers.fidelity import FidelityImporter
@@ -542,3 +542,150 @@ async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
     assert second.fills_inserted == 0
     assert second.fills_skipped == 2
     assert await _fill_count(conn, acc) == 2
+
+
+# --- Task 4: route_batch splits a parsed batch by account -------------------
+#
+# One export can span several accounts. Routing matches each row's
+# external_ref (the venue's own account NUMBER, never the nickname -- see
+# tests/test_fidelity.py) against account.external_ref within the venue.
+
+
+def _batch_spanning(*refs: str) -> ImportBatch:
+    """One fill per ref, all otherwise identical -- only external_ref varies,
+    since that's the only thing route_batch looks at."""
+    return ImportBatch(
+        fills=tuple(
+            CanonicalFill(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+                ),
+                executed_at=datetime(2026, 1, 15, tzinfo=UTC),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("500"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                external_ref=ref,
+            )
+            for ref in refs
+        )
+    )
+
+
+async def test_routing_splits_a_batch_by_account(conn):
+    a1 = await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    a2 = await create_account(
+        conn, name="two", venue="fidelity", account_type="cash", external_ref="A0000002"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001", "A0000002"))
+    assert set(plan.by_account) == {a1, a2}
+    assert plan.unknown_refs == ()
+
+
+async def test_an_unknown_account_ref_is_reported_not_merged(conn):
+    await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001", "A0000009"))
+    assert plan.unknown_refs == ("A0000009",)
+
+
+async def test_an_ignored_account_routes_successfully_and_is_skipped(conn):
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000003"))
+    assert plan.ignored_refs == ("A0000003",)
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()  # ignored is NOT unknown
+
+
+async def test_a_null_external_ref_account_is_never_a_wildcard(conn):
+    """UNIQUE (venue, external_ref) does not constrain NULLs, so several accounts
+    may have none. Treating NULL as a match would make the first such account a
+    silent catch-all for every unroutable row."""
+    await create_account(conn, name="no-ref", venue="fidelity", account_type="cash")
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000009"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ("A0000009",)
+
+
+async def test_a_row_with_no_external_ref_is_never_routed(conn):
+    """A row whose external_ref is None (e.g. a venue with no per-row account
+    identifier) must never be routed to any account -- not even one that also
+    has no external_ref. Distinguishes routing on a NULL row-side ref from
+    routing on a NULL account-side ref (the sibling test above)."""
+    await create_account(conn, name="no-ref", venue="fidelity", account_type="cash")
+    batch = ImportBatch(
+        fills=(
+            CanonicalFill(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+                ),
+                executed_at=datetime(2026, 1, 15, tzinfo=UTC),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("500"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                external_ref=None,
+            ),
+        )
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()
+    assert plan.ignored_refs == ()
+
+
+async def test_routing_splits_cash_movements_too(conn):
+    """route_batch must partition cash, not only fills -- a cash-only batch
+    (e.g. a dividend-only export) must still route correctly."""
+    a1 = await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    a2 = await create_account(
+        conn, name="two", venue="fidelity", account_type="cash", external_ref="A0000002"
+    )
+    batch = ImportBatch(
+        cash=(
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("5"),
+                currency="USD",
+                external_ref="A0000001",
+            ),
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("7"),
+                currency="USD",
+                external_ref="A0000002",
+            ),
+        )
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert set(plan.by_account) == {a1, a2}
+    assert len(plan.by_account[a1].cash) == 1
+    assert len(plan.by_account[a2].cash) == 1
+
+
+async def test_routing_does_not_cross_venues(conn):
+    """An account with a matching external_ref at a DIFFERENT venue must not
+    be matched -- routing is scoped to (venue, external_ref), same as the
+    UNIQUE constraint."""
+    await create_account(
+        conn, name="other-venue", venue="coinbase", account_type="wallet", external_ref="A0000001"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ("A0000001",)

@@ -4,6 +4,7 @@ itself, not a hand-rolled re-implementation of its transaction pattern."""
 from __future__ import annotations
 
 import argparse
+import pathlib
 from uuid import UUID, uuid4
 
 import pytest
@@ -76,8 +77,20 @@ async def test_a_crash_during_regroup_leaves_no_fills_through_the_real_cli(conn,
     line (so commit_batch and regroup_account run unwrapped) and re-running:
     the assertion below saw 5 instead of 0, i.e. it failed as expected, before
     the wrapper was restored.
+
+    Task 4 amendment: the fixture spans two accounts (X12345678, X87654321),
+    now routed automatically by db.importing.route_batch rather than by a
+    single --account -- both must exist as real accounts (matching the
+    fixture's account-number column) or the whole commit would instead be
+    refused for an unrelated reason (an unknown account ref), never reaching
+    regroup_account at all.
     """
-    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+    acc1 = await create_account(
+        conn, name="T1", venue="fidelity", account_type="cash", external_ref="X12345678"
+    )
+    acc2 = await create_account(
+        conn, name="T2", venue="fidelity", account_type="cash", external_ref="X87654321"
+    )
 
     async def fake_create_pool(*_args, **_kwargs):
         return _FakePool(conn)
@@ -91,14 +104,15 @@ async def test_a_crash_during_regroup_leaves_no_fills_through_the_real_cli(conn,
     args = argparse.Namespace(
         venue="fidelity",
         file="tests/fixtures/fidelity/activity.csv",
-        account=str(acc),
+        account=None,
         commit=True,
     )
 
     with pytest.raises(RuntimeError, match="simulated regroup crash"):
         await cli.cmd_import(args)
 
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc1) == 0
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc2) == 0
 
 
 # --- Final fix wave, item 3: the CLI must be able to bootstrap a database and
@@ -355,3 +369,88 @@ async def test_regroup_unknown_account_prints_a_clean_error_not_a_traceback(
     assert "error:" in err.lower()
     assert str(bogus) in err
     assert "Traceback" not in err
+
+
+# --- Task 4: --commit routes rows by account through the real CLI -----------
+
+_ROUTING_HEADER = (
+    "Run Date,Account Number,Action,Symbol,Description,Quantity,Price,Commission,Fees,Amount"
+)
+
+
+def _write_routing_csv(tmp_path: pathlib.Path, *rows: str) -> str:
+    path = tmp_path / "routed.csv"
+    path.write_text("\n".join([_ROUTING_HEADER, *rows]) + "\n")
+    return str(path)
+
+
+async def test_commit_refuses_and_writes_nothing_when_a_row_routes_to_an_unknown_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Partial commits are not acceptable -- a silently-skipped account looks
+    like a successful import. One row routes to a known account, the other to
+    an account that doesn't exist; the whole commit must be refused and
+    NOTHING written, including the row that routed fine."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "A0000009" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
+async def test_ignored_account_is_skipped_while_its_siblings_import(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """An account with ignore_on_import=True must route SUCCESSFULLY and be
+    skipped -- reported as skipped, not unknown -- while its siblings in the
+    same file still commit normally. Without this, a deliberately-excluded
+    account (e.g. a retirement plan with no instrument identity) would make
+    every import of the file fail permanently."""
+    active = await create_account(
+        conn, name="active", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    plan_account = await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "skipped" in out.lower()
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", active) == 1
+    assert (
+        await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", plan_account) == 0
+    )

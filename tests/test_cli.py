@@ -190,16 +190,22 @@ async def test_preview_import_never_opens_a_database_connection(monkeypatch, cap
     assert "preview only" in out
 
 
-def test_commit_without_account_is_rejected(monkeypatch):
-    """main() must refuse --commit without --account before ever touching asyncio
-    or the database. Fails if that guard is removed or weakened."""
+def test_commit_without_account_is_rejected(monkeypatch, capsys):
+    """Task 4 amendment: whether --account is required depends on whether the
+    parsed file has any row with no account ref to route by (a venue like
+    Fidelity that carries its own per-row account number needs no --account
+    at all) -- that can't be known until the file is read, so it's no longer
+    an argparse-time guard (SystemExit before cmd_import even runs). Coinbase
+    carries no per-row account ref, so it still needs --account; this is now
+    enforced inside cmd_import, returning a non-zero code, still strictly
+    before any database connection is opened (see the next test)."""
     monkeypatch.setattr(
         "sys.argv",
         ["deadband", "import", "coinbase", "tests/fixtures/coinbase/transactions.csv", "--commit"],
     )
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main()
-    assert exc_info.value.code != 0
+    rc = cli.main()
+    assert rc != 0
+    assert "account" in capsys.readouterr().err.lower()
 
 
 async def test_import_warns_when_a_file_mixes_multiple_account_refs(capsys):
