@@ -25,7 +25,7 @@ from ledger.types import Instrument, Side
 # defined ONCE here so a consumer that needs to net cash movements (e.g. sum
 # deposits minus withdrawals/fees) has a single shared source for "which kinds
 # subtract" instead of every caller inventing its own sign map.
-OUTFLOW_KINDS = frozenset({"withdrawal", "fee"})
+OUTFLOW_KINDS = frozenset({"withdrawal", "fee", "tax"})
 
 
 def _escape(part: str) -> str:

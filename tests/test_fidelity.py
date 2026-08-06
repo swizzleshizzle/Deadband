@@ -2,7 +2,8 @@ import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from importers.fidelity import FidelityImporter, parse_option_symbol
+from importers.base import OUTFLOW_KINDS
+from importers.fidelity import RULES, FidelityImporter, Outcome, classify, parse_option_symbol
 from ledger.types import AssetClass, Side
 
 # Anchored to this test file's own location, not the process cwd — same
@@ -373,3 +374,89 @@ def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
     assert len(result.cash) == len(baseline.cash) == 2
     assert result.fills[0].price == baseline.fills[0].price
     assert result.fills[0].quantity == baseline.fills[0].quantity
+
+
+# --- Task 2: the declarative action rule table ------------------------------
+#
+# _CASH_ACTIONS was a dict of four exact prefixes. Real Fidelity action text
+# is compound (action, security name, ticker, settlement type, all
+# concatenated), and the reinvestment decision cannot be made from the action
+# alone: REINVESTMENT means cash when the symbol is a money-market sweep and
+# a fill when it's a real security. classify() is keyed on action AND symbol.
+
+
+def test_reinvestment_of_a_real_security_is_a_fill():
+    """A DRIP purchase is a genuine acquisition with real basis, tagged so that
+    contributed_capital can exclude it."""
+    rule = classify("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA")
+    assert rule is not None
+    assert rule.outcome is Outcome.FILL
+    assert rule.funding_source == "reinvestment"
+    assert rule.side is Side.BUY
+
+
+def test_reinvestment_of_a_sweep_fund_is_internal_not_cash():
+    """The sweep IS cash under A2-9, so the dividend leg already recorded this
+    money. Recording the reinvestment leg too would count it twice."""
+    rule = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
+    assert rule is not None
+    assert rule.outcome is Outcome.INTERNAL
+
+
+def test_the_same_action_verb_resolves_differently_by_symbol():
+    """The whole reason the table is keyed on action AND symbol. An action-only
+    table cannot express this, so this test fails against any such design."""
+    security = classify("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA")
+    sweep = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
+    assert security.outcome is not sweep.outcome
+
+
+def test_return_of_capital_is_not_aliased_to_dividend():
+    """A return of capital reduces basis rather than being income. Recording it
+    as a dividend overstates income and leaves basis high."""
+    rule = classify("RETURN OF CAPITAL ACME PFD (AAA) (CASH)", "AAA")
+    assert rule.outcome is Outcome.CASH
+    assert rule.cash_kind == "return_of_capital"
+
+
+def test_foreign_tax_paid_is_an_outflow():
+    rule = classify("FOREIGN TAX PAID ACME ADR (AAA) (CASH)", "AAA")
+    assert rule.outcome is Outcome.CASH
+    assert rule.cash_kind == "tax"
+    assert "tax" in OUTFLOW_KINDS
+
+
+def test_an_unrecognised_action_classifies_as_none():
+    assert classify("SOME BRAND NEW ACTION NOBODY MAPPED", "AAA") is None
+
+
+# One (action, symbol) sample per rule in RULES, using synthetic tickers only,
+# each engineered to be the FIRST matching rule for its sample so the
+# reachability test below can prove no rule is shadowed by an earlier one.
+RULE_COVERAGE_SAMPLES = [
+    ("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX"),  # reinvest_sweep
+    ("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA"),  # reinvest_security
+    ("EXCHANGED TO MONEY MARKET (SPAXX)", "SPAXX"),  # exchange_sweep
+    ("DIVIDEND RECEIVED ACME CORP (AAA) (CASH)", "AAA"),  # dividend_received
+    ("DIVIDENDS ACME CORP (AAA) (CASH)", "AAA"),  # dividends
+    ("INTEREST EARNED ON CASH (AAA)", "AAA"),  # interest
+    ("RETURN OF CAPITAL ACME PFD (AAA) (CASH)", "AAA"),  # return_of_capital
+    ("FOREIGN TAX PAID ACME ADR (AAA) (CASH)", "AAA"),  # foreign_tax
+    ("FEE CHARGED ACCOUNT MAINTENANCE FEE", ""),  # fee_charged
+    ("RECORDKEEPING FEE Q1 2026", ""),  # recordkeeping_fee
+    ("REVENUE CREDIT ACME CORP (AAA)", "AAA"),  # revenue_credit
+    ("ELECTRONIC FUNDS TRANSFER RECEIVED", ""),  # eft_in
+    ("ELECTRONIC FUNDS TRANSFER PAID", ""),  # eft_out
+    ("CASH CONTRIBUTION IRA 2026", ""),  # cash_contribution
+    ("CO CONTR 2026 Q1", ""),  # employer_contribution
+    ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
+    ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+]
+
+
+def test_every_rule_is_reachable():
+    """A rule shadowed by an earlier one is dead code that looks like coverage.
+    Each rule must be the FIRST match for at least one sample, or the table has
+    an ordering bug."""
+    matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
+    assert matched == {r.name for r in RULES}

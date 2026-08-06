@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import enum
 import io
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -32,12 +34,86 @@ def _normalize_field(name: str | None) -> str:
     return _FIELD_QUALIFIER_RE.sub("", (name or "").strip().lower()).strip()
 
 
-_CASH_ACTIONS = {
-    "DIVIDEND RECEIVED": "dividend",
-    "ELECTRONIC FUNDS TRANSFER RECEIVED": "deposit",
-    "ELECTRONIC FUNDS TRANSFER PAID": "withdrawal",
-    "INTEREST EARNED": "interest",
-}
+# Membership is DATA, not logic, so it can be reviewed at a glance. Identified
+# explicitly rather than by `price == 1.00`: a real security can trade at
+# exactly a dollar, and that heuristic would silently convert a genuine
+# position into cash.
+#
+# Use the venue's PUBLISHED sweep vehicles -- the full documented list, not
+# only the ones this user happens to hold. A sweep ticker is product
+# infrastructure attached to essentially every account at the venue, so the
+# complete list discloses nothing about anyone's holdings, and completeness is
+# what keeps a sweep from being misclassified as a position.
+SWEEP_SYMBOLS: frozenset[str] = frozenset({
+    "SPAXX", "FDRXX", "FZFXX", "SPRXX", "FDLXX", "QPIHQ",
+})
+
+
+def is_sweep(symbol: str | None) -> bool:
+    return (symbol or "").strip().upper() in SWEEP_SYMBOLS
+
+
+class Outcome(enum.Enum):
+    FILL = "fill"
+    CASH = "cash"
+    # Recognised and deliberately produces nothing. Exists to prevent
+    # double-counting: a sweep dividend appears as BOTH a dividend row and a
+    # reinvestment of that dividend back into the sweep. Since the sweep IS
+    # cash (A2-9), those are two legs of one event; recording both counts the
+    # money twice. The dividend leg records, this leg does not.
+    INTERNAL = "internal"
+
+
+@dataclass(frozen=True, slots=True)
+class Rule:
+    name: str
+    verb: str                       # matched against the action's leading text
+    outcome: Outcome
+    cash_kind: str | None = None
+    side: Side | None = None
+    funding_source: str = "external"
+    sweep_only: bool | None = None  # None = symbol irrelevant to this rule
+
+
+RULES: tuple[Rule, ...] = (
+    # Ordered: more specific verbs first. `test_every_rule_is_reachable`
+    # fails if any rule is shadowed by an earlier one.
+    Rule("reinvest_sweep", "REINVESTMENT", Outcome.INTERNAL, sweep_only=True),
+    Rule("reinvest_security", "REINVESTMENT", Outcome.FILL,
+         side=Side.BUY, funding_source="reinvestment", sweep_only=False),
+    Rule("exchange_sweep", "EXCHANGED TO", Outcome.INTERNAL, sweep_only=True),
+    Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
+    Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
+    Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),
+    Rule("return_of_capital", "RETURN OF CAPITAL", Outcome.CASH,
+         cash_kind="return_of_capital"),
+    Rule("foreign_tax", "FOREIGN TAX PAID", Outcome.CASH, cash_kind="tax"),
+    Rule("fee_charged", "FEE CHARGED", Outcome.CASH, cash_kind="fee"),
+    Rule("recordkeeping_fee", "RECORDKEEPING FEE", Outcome.CASH, cash_kind="fee"),
+    Rule("revenue_credit", "REVENUE CREDIT", Outcome.CASH, cash_kind="rebate"),
+    Rule("eft_in", "ELECTRONIC FUNDS TRANSFER RECEIVED", Outcome.CASH,
+         cash_kind="deposit"),
+    Rule("eft_out", "ELECTRONIC FUNDS TRANSFER PAID", Outcome.CASH,
+         cash_kind="withdrawal"),
+    Rule("cash_contribution", "CASH CONTRIBUTION", Outcome.CASH, cash_kind="deposit"),
+    Rule("employer_contribution", "CO CONTR", Outcome.CASH, cash_kind="deposit"),
+    Rule("participant_contribution", "PARTIC CONTR", Outcome.CASH, cash_kind="deposit"),
+    Rule("contributions", "CONTRIBUTIONS", Outcome.CASH, cash_kind="deposit"),
+)
+
+
+def classify(action: str, symbol: str) -> Rule | None:
+    """First match wins. Keyed on action AND symbol, because the reinvestment
+    rule resolves differently for a sweep fund than for a real security and
+    cannot be expressed by the action alone."""
+    a = (action or "").strip().upper()
+    for rule in RULES:
+        if not a.startswith(rule.verb):
+            continue
+        if rule.sweep_only is not None and rule.sweep_only != is_sweep(symbol):
+            continue
+        return rule
+    return None
 
 
 def parse_option_symbol(symbol: str) -> Instrument | None:
@@ -108,6 +184,66 @@ class FidelityImporter:
         warnings: list[str] = []
         unmapped: list[str] = []
 
+        def build_fill(
+            row: dict[str, str],
+            raw_row: dict[str, str],
+            line_no: int,
+            symbol: str,
+            when: datetime,
+            account: str | None,
+            side: Side,
+            funding_source: str,
+        ) -> None:
+            """Shared by the dedicated YOU BOUGHT/YOU SOLD branch and the
+            reinvest_security rule — both produce a CanonicalFill from the
+            same quantity/price/fee columns, differing only in side and
+            funding_source."""
+            try:
+                raw_qty = _decimal(row.get("quantity"))
+                price = _decimal(row.get("price"))
+                fee = _decimal(row.get("commission")) + _decimal(row.get("fees"))
+            except InvalidOperation as exc:
+                warnings.append(f"line {line_no}: bad number ({exc})")
+                unmapped.append(str(raw_row))
+                return
+
+            if raw_qty == 0:
+                warnings.append(f"line {line_no}: zero quantity, skipped")
+                unmapped.append(str(raw_row))
+                return
+
+            # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they are
+            # not caught by the `except InvalidOperation` above. Left unchecked,
+            # Infinity survives Fill.__post_init__'s `quantity > 0` check and the
+            # DB's `quantity > 0` CHECK, becoming a live allocation in group_fills.
+            # fee is included too: Fill.__post_init__ never validates fee, and
+            # Postgres NUMERIC (PG14+) accepts Infinity, so nothing else catches it.
+            if not raw_qty.is_finite() or not price.is_finite() or not fee.is_finite():
+                warnings.append(f"line {line_no}: non-finite number, skipped")
+                unmapped.append(str(raw_row))
+                return
+
+            instrument = parse_option_symbol(symbol) or Instrument(
+                id=None,
+                asset_class=AssetClass.EQUITY,
+                symbol=symbol.upper(),
+                quote_currency="USD",
+            )
+
+            fills.append(
+                CanonicalFill(
+                    instrument=instrument,
+                    executed_at=when,
+                    side=side,
+                    quantity=abs(raw_qty),
+                    price=price,
+                    fee=fee,
+                    fee_currency="USD",
+                    external_ref=account,
+                    funding_source=funding_source,
+                )
+            )
+
         # Strip UTF-8 BOM if present — Fidelity exports carry them too, and a
         # BOM makes csv.DictReader name the first field "﻿Run Date"
         # instead of "Run Date", so every row would fail to parse.
@@ -142,91 +278,82 @@ class FidelityImporter:
                 unmapped.append(str(raw_row))
                 continue
 
-            cash_kind = next((v for k, v in _CASH_ACTIONS.items() if action.startswith(k)), None)
-            if cash_kind:
-                try:
-                    amount = _decimal(row.get("amount"))
-                except InvalidOperation as exc:
-                    warnings.append(f"line {line_no}: bad amount ({exc})")
-                    unmapped.append(str(raw_row))
-                    continue
-                # Decimal("Infinity")/Decimal("NaN") are valid constructions and slip
-                # past the `except InvalidOperation` above (same hazard as quantity/
-                # price below); cash_movement.amount has no CHECK constraint to catch
-                # one downstream.
-                if not amount.is_finite():
-                    warnings.append(f"line {line_no}: non-finite amount, skipped")
-                    unmapped.append(str(raw_row))
-                    continue
-                # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
-                # always positive, direction lives in `kind` alone. Fidelity's raw
-                # Amount column is signed (negative for a withdrawal/purchase-style
-                # outflow, e.g. "ELECTRONIC FUNDS TRANSFER PAID" exports -2000.00),
-                # so this abs() is load-bearing here, unlike Coinbase's twin where
-                # the raw export is already positive.
-                amount = abs(amount)
-                cash.append(
-                    CanonicalCash(
-                        occurred_at=when,
-                        kind=cash_kind,
-                        amount=amount,
-                        currency="USD",
-                        symbol=symbol or None,
-                        external_ref=account,
-                        note=(row.get("description") or "").strip() or None,
-                    )
+            # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction
+            # comes from the action text and the sign is corroboration, which
+            # the rule table below does not (and should not) model.
+            if "BOUGHT" in action or "SOLD" in action:
+                build_fill(
+                    row,
+                    raw_row,
+                    line_no,
+                    symbol,
+                    when,
+                    account,
+                    side=Side.SELL if "SOLD" in action else Side.BUY,
+                    funding_source="external",
                 )
                 continue
 
-            if "BOUGHT" not in action and "SOLD" not in action:
+            rule = classify(action, symbol)
+            if rule is None:
                 warnings.append(f"line {line_no}: unhandled action {action!r}")
                 unmapped.append(str(raw_row))
                 continue
 
+            if rule.outcome is Outcome.INTERNAL:
+                # The offsetting leg of an event already recorded elsewhere
+                # (e.g. a sweep-fund reinvestment of a dividend that was
+                # already counted as cash in). Recording it too would count
+                # the money twice — see Outcome.INTERNAL's docstring.
+                continue
+
+            if rule.outcome is Outcome.FILL:
+                # A DRIP into a real security: a genuine acquisition with
+                # real cost basis, funded by the position's own distribution
+                # rather than external capital.
+                build_fill(
+                    row,
+                    raw_row,
+                    line_no,
+                    symbol,
+                    when,
+                    account,
+                    side=rule.side,
+                    funding_source=rule.funding_source,
+                )
+                continue
+
+            # rule.outcome is Outcome.CASH
             try:
-                raw_qty = _decimal(row.get("quantity"))
-                price = _decimal(row.get("price"))
-                fee = _decimal(row.get("commission")) + _decimal(row.get("fees"))
+                amount = _decimal(row.get("amount"))
             except InvalidOperation as exc:
-                warnings.append(f"line {line_no}: bad number ({exc})")
+                warnings.append(f"line {line_no}: bad amount ({exc})")
                 unmapped.append(str(raw_row))
                 continue
-
-            if raw_qty == 0:
-                warnings.append(f"line {line_no}: zero quantity, skipped")
+            # Decimal("Infinity")/Decimal("NaN") are valid constructions and slip
+            # past the `except InvalidOperation` above (same hazard as quantity/
+            # price above); cash_movement.amount has no CHECK constraint to catch
+            # one downstream.
+            if not amount.is_finite():
+                warnings.append(f"line {line_no}: non-finite amount, skipped")
                 unmapped.append(str(raw_row))
                 continue
-
-            # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they are
-            # not caught by the `except InvalidOperation` above. Left unchecked,
-            # Infinity survives Fill.__post_init__'s `quantity > 0` check and the
-            # DB's `quantity > 0` CHECK, becoming a live allocation in group_fills.
-            # fee is included too: Fill.__post_init__ never validates fee, and
-            # Postgres NUMERIC (PG14+) accepts Infinity, so nothing else catches it.
-            if not raw_qty.is_finite() or not price.is_finite() or not fee.is_finite():
-                warnings.append(f"line {line_no}: non-finite number, skipped")
-                unmapped.append(str(raw_row))
-                continue
-
-            instrument = parse_option_symbol(symbol) or Instrument(
-                id=None,
-                asset_class=AssetClass.EQUITY,
-                symbol=symbol.upper(),
-                quote_currency="USD",
-            )
-
-            fills.append(
-                CanonicalFill(
-                    instrument=instrument,
-                    executed_at=when,
-                    # Direction comes from the action, not the sign — "SOLD" is
-                    # authoritative and the sign is corroboration.
-                    side=Side.SELL if "SOLD" in action else Side.BUY,
-                    quantity=abs(raw_qty),
-                    price=price,
-                    fee=fee,
-                    fee_currency="USD",
+            # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
+            # always positive, direction lives in `kind` alone. Fidelity's raw
+            # Amount column is signed (negative for a withdrawal/purchase-style
+            # outflow, e.g. "ELECTRONIC FUNDS TRANSFER PAID" exports -2000.00),
+            # so this abs() is load-bearing here, unlike Coinbase's twin where
+            # the raw export is already positive.
+            amount = abs(amount)
+            cash.append(
+                CanonicalCash(
+                    occurred_at=when,
+                    kind=rule.cash_kind,
+                    amount=amount,
+                    currency="USD",
+                    symbol=symbol or None,
                     external_ref=account,
+                    note=(row.get("description") or "").strip() or None,
                 )
             )
 
