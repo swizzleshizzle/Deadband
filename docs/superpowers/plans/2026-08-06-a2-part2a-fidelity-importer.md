@@ -293,7 +293,28 @@ Expected: all pass, including the pre-existing tests.
 
 - [ ] **Step 5: Mutant-gate the reachability test**
 
-Reorder `RULES` so `reinvest_security` precedes `reinvest_sweep`. Run `test_every_rule_is_reachable`. It MUST FAIL — `reinvest_sweep` becomes unreachable. Restore the order and confirm it passes. Record the verbatim failure. A reachability test that cannot detect a shadowed rule is worthless.
+> **Correction, made during execution.** This step originally prescribed reordering
+> `reinvest_security` before `reinvest_sweep`. That mutant does **not** work: those two
+> rules carry mutually exclusive `sweep_only` values (`True` / `False`), so `classify`
+> discriminates on the symbol regardless of their order and swapping them is a no-op.
+> An implementer who accepted the passing result as proof would have shipped an
+> unverified reachability test. The correct mutant must create a *genuine* shadow.
+
+Use a mutant that actually shadows. Either:
+
+- widen `reinvest_security`'s `sweep_only` from `False` to `None` (making it
+  symbol-agnostic) and place it before `reinvest_sweep`, which then becomes unreachable;
+  or
+- add a rule whose `verb` is a strict prefix of a later rule's verb — e.g. a rule matching
+  `"FEE"` placed before `fee_charged` — so the later rule can never be the first match.
+
+Run `test_every_rule_is_reachable`. It MUST FAIL. Restore, and confirm it passes. Record
+the verbatim failure.
+
+**Try both shapes if time allows.** Prefix-shadowing between two cash rules is the form
+most likely to occur when someone adds a rule later, and it is worth knowing whether the
+test catches it. If it does not, say so in the report rather than treating the gate as
+passed — a reachability test that cannot detect a shadowed rule is worthless.
 
 - [ ] **Step 6: Commit**
 
@@ -357,6 +378,28 @@ def test_a_sweep_symbol_priced_far_from_par_warns():
     row = header + "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
     result = FidelityImporter().parse(row)
     assert any("sweep" in w.lower() and "SPAXX" in w for w in result.warnings)
+
+
+def test_an_unlisted_symbol_reinvesting_at_par_warns_the_set_may_be_stale():
+    """The direction that actually costs money. An unlisted sweep is treated as a
+    real security, so its reinvestment becomes a fill that spends the dividend --
+    net cash nets to zero and a phantom position appears, silently. The warning is
+    the only thing that surfaces a missing ticker."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (NEWSW) (CASH),NEWSW,MM,10,1.00,0.00,0.00,-10.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("NEWSW" in w for w in result.warnings)
+
+
+def test_a_real_security_at_a_dollar_is_still_imported_as_a_security():
+    """The warning must not become classification. A genuine security trading at
+    a dollar stays a security -- a spurious warning is cheap, silently converting
+    a position into cash is not."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,PENNY CO,100,1.00,0.00,0.00,-100.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].instrument.symbol == "AAA"
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -365,17 +408,28 @@ Run: `uv run pytest tests/test_fidelity.py -k "sweep or par" -v`
 
 Expected: the `is_sweep` recognition tests PASS already (Task 2 introduced it) — that is correct and expected, not evidence of anything. The staleness-warning test MUST FAIL: no such warning is emitted yet.
 
-- [ ] **Step 3: Add the staleness guard**
+- [ ] **Step 3: Add the staleness guard — BOTH directions**
+
+> **Correction, made during execution.** This step originally guarded only one
+> direction: a symbol *in* the set pricing away from par. Review showed that is the
+> harmless direction. The decay that actually costs money is the opposite — a genuine
+> sweep ticker **missing from** the set. `sweep_only=False` means "not one of these
+> six," not "is a real security," so an unlisted sweep is classified as a security and
+> its reinvestment leg becomes a fill that spends the dividend. Net cash nets to zero,
+> a phantom position appears in the trade log, and nothing warns. Guard both.
 
 ```python
-# Sweep funds hold a $1.00 NAV by construction. A deviation means either the set
-# has acquired a symbol that is not a sweep fund, or a genuine sweep has broken
-# the buck. Both need a human; neither should pass unremarked.
+# Sweep funds hold a $1.00 NAV by construction.
 _SWEEP_PAR = Decimal("1.00")
 _SWEEP_PAR_TOLERANCE = Decimal("0.01")
 ```
 
-In `parse()`, when a row's symbol `is_sweep` and its price is finite and deviates from `_SWEEP_PAR` by more than `_SWEEP_PAR_TOLERANCE`, append a warning naming the symbol and the price. Do not suppress the row — warn and continue.
+In `parse()`, emit a warning in **each** of these cases. Never suppress the row — warn and continue.
+
+1. **A listed sweep priced away from par.** Symbol `is_sweep`, price finite, deviates from `_SWEEP_PAR` by more than `_SWEEP_PAR_TOLERANCE`. Means either the set has acquired a non-sweep symbol, or a genuine sweep broke the buck.
+2. **An unlisted symbol that looks like a sweep.** Symbol is NOT in `SWEEP_SYMBOLS`, the row is a `REINVESTMENT`, and its price is within tolerance of `$1.00`. Means the set is probably missing a ticker. Name the symbol explicitly so it can be added.
+
+**Why case 2 is a heuristic here but must not be one in `is_sweep`.** Using `price == 1.00` to *classify* would silently convert a real $1.00 security into cash — which is exactly why `SWEEP_SYMBOLS` is explicit. Using the same signal to *warn* is safe: the worst outcome is a spurious warning about a genuine penny security, which a human dismisses in seconds. Classification must be conservative; detection of your own blind spot should not be.
 
 **Implementation note:** the real sweep tickers are a maintenance surface. Keep them in `SWEEP_SYMBOLS` alone, with the comment pointing at this guard, and do not scatter them elsewhere.
 
