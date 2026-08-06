@@ -104,6 +104,14 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             ).fill_id
             seen_openings.append(opening_fill_id)
 
+            # Any estimated fill taints the trade -- an opening-balance fill
+            # makes the whole trade's P&L an estimate (spec section 4). ANY,
+            # not ALL: this must roll up every constituent fill, not just the
+            # opening one.
+            is_estimated = any(
+                by_id[a.fill_id].is_estimated for a in g.allocations
+            )
+
             # UPSERT, never delete-and-rebuild: derived columns are overwritten,
             # user-authored ones (intent override, planned_risk, strategy_tag, notes,
             # and B's thesis link) are left exactly as the user set them.
@@ -113,8 +121,8 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                     account_id, opening_fill_id, primary_underlying, direction, status,
                     intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
                     avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
-                    fees_realized, open_quantity, open_cost_basis
-                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                    fees_realized, open_quantity, open_cost_basis, is_estimated
+                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                 ON CONFLICT (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL
                 DO UPDATE SET
                     primary_underlying = EXCLUDED.primary_underlying,
@@ -132,6 +140,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                     fees_realized      = EXCLUDED.fees_realized,
                     open_quantity      = EXCLUDED.open_quantity,
                     open_cost_basis    = EXCLUDED.open_cost_basis,
+                    is_estimated       = EXCLUDED.is_estimated,
                     updated_at         = now()
                 RETURNING id
                 """,
@@ -153,6 +162,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 pnl.fees_realized,
                 pnl.open_quantity,
                 pnl.open_cost_basis,
+                is_estimated,
             )
 
             # r_multiple depends on planned_risk, which is user-authored — recompute
@@ -197,6 +207,12 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # it would double-count against whatever trade its fills now belong to).
     # `status` is left as-is — it is NOT NULL and no longer meaningful once the
     # row is judgment-only, but there is no null-able substitute for it.
+    # `is_estimated` is likewise NOT NULL DEFAULT FALSE, so NULL isn't an option
+    # either — but unlike `status`, FALSE is a deliberate and correct value
+    # here, not just the nearest available one: a trade owning zero live fills
+    # has nothing estimated about it (its P&L is NULL, not a real-but-uncertain
+    # number), and leaving a stale True from before protection would misrepresent
+    # a judgment-only record as still carrying a reconstructed-price P&L.
     protected = await conn.fetch(
         """
         UPDATE trade
@@ -208,7 +224,8 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                realized_pnl = NULL, gross_realized_pnl = NULL,
                fees_total = NULL, fees_realized = NULL,
                open_quantity = NULL, open_cost_basis = NULL,
-               r_multiple = NULL
+               r_multiple = NULL,
+               is_estimated = FALSE
          WHERE account_id = $1
            AND grouping_mode = 'auto'
            AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))

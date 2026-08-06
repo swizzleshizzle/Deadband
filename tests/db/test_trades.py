@@ -652,6 +652,10 @@ async def test_protected_trade_contributes_no_pnl(conn):
     assert protected["open_quantity"] is None
     assert protected["open_cost_basis"] is None
     assert protected["r_multiple"] is None
+    # NOT NULL DEFAULT FALSE -- unlike the columns above, NULL isn't available.
+    # A trade owning zero live fills has nothing estimated about it, so
+    # protection resets this to FALSE rather than leaving a stale True.
+    assert protected["is_estimated"] is False
 
     # The surviving fill (the SELL) forms a brand-new open short with no
     # realized P&L yet, so the account-wide total must be exactly zero — not
@@ -903,6 +907,118 @@ async def test_regroup_persists_derived_pnl_columns_for_short(conn):
     assert row["open_cost_basis"] == Decimal("98")         # 100 - 8/4 (subtracted for SHORT)
     assert row["fees_realized"] == Decimal("4")             # 2 exit + 8 * 1/4
     assert row["realized_pnl"] == row["gross_realized_pnl"] - row["fees_realized"]
+
+
+async def test_a_trade_containing_an_estimated_fill_is_itself_estimated(conn):
+    """Any estimated fill taints the trade: an opening-balance fill makes the
+    whole trade's P&L an estimate, so spec 4 excludes it from R-multiple and
+    win-rate. Uses ANY, not ALL -- one estimated leg is enough."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("5"),
+                price=Decimal("100"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=True,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("5"),
+                price=Decimal("110"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is True
+
+
+async def test_a_trade_of_only_exact_fills_is_not_estimated(conn):
+    """Negative control: without it the test above passes for a function that
+    hardcodes True."""
+    acc = await seed(conn, [(Side.BUY, "5", "100"), (Side.SELL, "5", "110")])
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is False
+
+
+async def test_a_trade_with_an_estimated_closing_fill_is_also_estimated(conn):
+    """The rollup is ANY over every constituent fill, not just the opening
+    fill's flag -- an exact opening leg followed by an estimated closing leg
+    must still taint the trade."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("5"),
+                price=Decimal("100"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("5"),
+                price=Decimal("110"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=True,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is True
 
 
 # --- Item 7: an unknown account_id used to reach TradeIntent(None) ----------
