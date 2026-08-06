@@ -578,3 +578,92 @@ async def test_cmd_accounts_add_ignore_on_import_flag_creates_a_skippable_accoun
     out = capsys.readouterr().out
     assert "skipped" in out.lower()
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id) == 0
+
+
+# --- Task 6: --check-duplicates is an explicit, opt-in probe on the preview --
+# --- path. Preview's structural no-connection guarantee is proven separately
+# --- in tests/test_cli.py's test_preview_import_never_opens_a_database_
+# --- connection, which passes a Namespace with no check_duplicates attribute
+# --- at all -- these tests instead exercise the flag itself, through a real
+# --- (fake-pooled) connection.
+
+
+async def test_check_duplicates_reports_an_existing_fill_and_writes_nothing(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A fill already committed to the account must be reported as a
+    duplicate by a preview run with --check-duplicates -- and that preview
+    must still refuse to write (still prints "preview only", still leaves
+    the fill table untouched)."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    commit_args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=True, check_duplicates=False
+    )
+    rc = await cli.cmd_import(commit_args)
+    assert rc == 0
+    before = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known)
+    assert before == 1
+
+    preview_args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=False, check_duplicates=True
+    )
+    rc = await cli.cmd_import(preview_args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    assert "duplicate check: 1 fill(s), 0 cash movement(s) already present" in out
+
+    after = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known)
+    assert after == before == 1
+
+
+async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
+    conn, monkeypatch, capsys
+):
+    """Coinbase carries no per-row account ref, so a preview run with
+    --check-duplicates must fall back to --account for those rows the same
+    way --commit already does (cmd_import's `unrouted` handling)."""
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    commit_args = argparse.Namespace(
+        venue="coinbase",
+        file="tests/fixtures/coinbase/transactions.csv",
+        account=str(acc),
+        commit=True,
+        check_duplicates=False,
+    )
+    rc = await cli.cmd_import(commit_args)
+    assert rc == 0
+
+    preview_args = argparse.Namespace(
+        venue="coinbase",
+        file="tests/fixtures/coinbase/transactions.csv",
+        account=str(acc),
+        commit=False,
+        check_duplicates=True,
+    )
+    rc = await cli.cmd_import(preview_args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    assert "duplicate check: 3 fill(s), 2 cash movement(s) already present" in out
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3

@@ -9,7 +9,7 @@ import sys
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
-from db.importing import commit_batch, route_batch
+from db.importing import commit_batch, probe_duplicates, route_batch
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.trades import list_trades, regroup_account
@@ -141,6 +141,58 @@ async def cmd_import(args) -> int:
                 "its own account automatically",
                 file=sys.stderr,
             )
+
+        # --check-duplicates is the one explicit, opt-in exception to preview's
+        # no-connection guarantee (see test_preview_import_never_opens_a_
+        # database_connection in tests/test_cli.py, which pins the default
+        # no-flag path). getattr, not args.check_duplicates: several existing
+        # tests build a bare Namespace by hand without this attribute, same
+        # reasoning as cmd_accounts_add's ignore_on_import getattr above. Spec
+        # §7 requires preview to report what's already present; preview
+        # deliberately never opens a connection on its own, so it structurally
+        # cannot answer that without an explicit ask.
+        if getattr(args, "check_duplicates", False):
+            pool = await create_pool()
+            try:
+                async with pool.acquire() as conn:
+                    # Read-only routing (route_batch issues only SELECTs) to
+                    # find which account(s) each row belongs to -- same
+                    # mechanism --commit uses, reused rather than reinvented so
+                    # the probe never disagrees with --commit about where a row
+                    # lands. Rows with no external_ref (e.g. Coinbase) need
+                    # --account, exactly like --commit's own `unrouted`
+                    # handling below.
+                    plan = await route_batch(conn, importer.venue, batch)
+                    targets: dict[UUID, ImportBatch] = dict(plan.by_account)
+
+                    unrouted = ImportBatch(
+                        fills=tuple(f for f in batch.fills if f.external_ref is None),
+                        cash=tuple(c for c in batch.cash if c.external_ref is None),
+                    )
+                    if (unrouted.fills or unrouted.cash) and args.account:
+                        account_id = UUID(args.account)
+                        existing = targets.get(account_id, ImportBatch())
+                        targets[account_id] = ImportBatch(
+                            fills=existing.fills + unrouted.fills,
+                            cash=existing.cash + unrouted.cash,
+                        )
+
+                    fill_dupes = cash_dupes = 0
+                    for account_id, sub_batch in targets.items():
+                        report = await probe_duplicates(conn, account_id, sub_batch)
+                        fill_dupes += report.fill_dupes
+                        cash_dupes += report.cash_dupes
+                    print(
+                        f"  duplicate check: {fill_dupes} fill(s), "
+                        f"{cash_dupes} cash movement(s) already present"
+                    )
+            finally:
+                # See cmd_import's identical comment further below: pool.close()
+                # must run after the `async with pool.acquire()` block has
+                # exited, never from inside it, or close() deadlocks waiting for
+                # a release that will never come.
+                await pool.close()
+
         print("\npreview only — rerun with --commit to write")
         return 0
 
@@ -355,6 +407,16 @@ def main() -> int:
         ),
     )
     p_import.add_argument("--commit", action="store_true", help="write to the database")
+    p_import.add_argument(
+        "--check-duplicates",
+        action="store_true",
+        help=(
+            "preview only: open a READ-ONLY database connection and report "
+            "how many rows are already present. Plain preview (without this "
+            "flag) deliberately never touches the database at all -- this is "
+            "an explicit opt-in exception, not a change to preview's default"
+        ),
+    )
     p_import.set_defaults(fn=cmd_import)
 
     p_regroup = sub.add_parser("regroup")

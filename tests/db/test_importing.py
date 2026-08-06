@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from db.accounts import create_account
-from db.importing import commit_batch, route_batch
+from db.importing import commit_batch, probe_duplicates, route_batch
 from importers.base import CanonicalCash, CanonicalFill, ImportBatch
 from importers.coinbase import CoinbaseImporter
 from importers.fidelity import FidelityImporter
@@ -677,6 +677,115 @@ async def test_routing_splits_cash_movements_too(conn):
     assert set(plan.by_account) == {a1, a2}
     assert len(plan.by_account[a1].cash) == 1
     assert len(plan.by_account[a2].cash) == 1
+
+
+# --- Task 6: preview duplicate probe -----------------------------------------
+#
+# Preview deliberately never opens a database connection (see
+# tests/test_cli.py's test_preview_import_never_opens_a_database_connection).
+# probe_duplicates is the explicit, opt-in exception -- read-only, wired
+# behind --check-duplicates in cli.py, and never called by default preview.
+
+
+def _batch_of_two_fills() -> ImportBatch:
+    return batch_of(2)
+
+
+async def test_probe_reports_duplicates_without_writing(conn):
+    """Task 6, brief Step 1. before == after proves the probe wrote nothing;
+    fill_dupes == 2 proves it recognizes both already-committed fills."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    batch = _batch_of_two_fills()
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    before = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id)
+    report = await probe_duplicates(conn, account_id, batch)
+    after = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id)
+
+    assert report.fill_dupes == 2
+    assert before == after == 2
+
+
+async def test_probe_reports_zero_for_a_batch_not_yet_committed(conn):
+    """A fresh batch against an empty account has nothing to find yet -- the
+    probe must not report phantom duplicates."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    report = await probe_duplicates(conn, account_id, batch_of(2))
+    assert report.fill_dupes == 0
+    assert report.cash_dupes == 0
+
+
+async def test_probe_agrees_with_a_subsequent_commit_on_partial_overlap(conn):
+    """The probe and commit_batch must never disagree: 2 of 3 fills already
+    committed means the probe reports 2 dupes, and a subsequent commit of the
+    same 3-fill batch inserts exactly the 1 new one -- proving they share the
+    same dedupe keys rather than two independently-maintained hashing schemes
+    that could drift apart."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    await commit_batch(conn, account_id, batch_of(2), source="csv")
+
+    three = batch_of(3)
+    report = await probe_duplicates(conn, account_id, three)
+    assert report.fill_dupes == 2
+
+    result = await commit_batch(conn, account_id, three, source="csv")
+    assert result.fills_inserted == 1
+    assert result.fills_skipped == 2
+
+
+async def test_probe_reports_duplicates_by_venue_fill_id_too(conn):
+    """Not every fill dedupes on content_hash -- a row carrying its own
+    venue_fill_id dedupes on (account_id, venue_fill_id) instead (see
+    commit_batch). The probe must recognize that path too, not just
+    content_hash."""
+    account_id = await create_account(conn, name="t", venue="coinbase", account_type="wallet")
+    fill = CanonicalFill(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.CRYPTO_SPOT, symbol="BTC", quote_currency="USD"
+        ),
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("60000"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        venue_fill_id="v-1",
+    )
+    batch = ImportBatch(fills=(fill,))
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    report = await probe_duplicates(conn, account_id, batch)
+    assert report.fill_dupes == 1
+
+
+async def test_probe_reports_cash_duplicates_without_writing(conn):
+    """Same guarantee as the fills test above, for cash movements: the probe
+    must recognize an already-committed dividend as a duplicate and must not
+    write a new one."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    dividend = ImportBatch(
+        cash=(
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("10"),
+                currency="USD",
+            ),
+        )
+    )
+    await commit_batch(conn, account_id, dividend, source="csv")
+
+    before = await conn.fetchval(
+        "SELECT count(*) FROM cash_movement WHERE account_id = $1", account_id
+    )
+    report = await probe_duplicates(conn, account_id, dividend)
+    after = await conn.fetchval(
+        "SELECT count(*) FROM cash_movement WHERE account_id = $1", account_id
+    )
+
+    assert report.cash_dupes == 1
+    assert report.fill_dupes == 0
+    assert before == after == 1
 
 
 async def test_routing_does_not_cross_venues(conn):

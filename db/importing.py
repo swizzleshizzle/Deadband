@@ -19,7 +19,7 @@ import asyncpg
 
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
-from importers.base import ImportBatch, content_hash
+from importers.base import CanonicalCash, CanonicalFill, ImportBatch, content_hash
 from ledger.types import Fill, FillSource
 
 
@@ -29,6 +29,78 @@ class CommitResult:
     fills_skipped: int
     cash_inserted: int
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateReport:
+    """Result of probe_duplicates -- see its docstring below."""
+
+    fill_dupes: int
+    cash_dupes: int
+
+
+def _fill_dedupe_keys(
+    account_id: UUID, fills: tuple[CanonicalFill, ...]
+) -> list[tuple[str | None, str | None]]:
+    """The dedupe key for each fill, in order: (venue_fill_id, None) for a row
+    the venue itself identifies, or (None, content_hash) for one that must
+    dedupe on its computed shape -- exactly the choice commit_batch makes
+    below. Factored out so commit_batch and probe_duplicates share ONE
+    computation of "what counts as a duplicate" rather than maintaining two
+    hashing schemes that could silently drift apart; see the occurrence-index
+    commentary on commit_batch for why the logic here can't be simplified
+    further.
+    """
+    fill_occurrence: dict[tuple, int] = defaultdict(int)
+    keys: list[tuple[str | None, str | None]] = []
+    for cf in fills:
+        if cf.venue_fill_id:
+            keys.append((cf.venue_fill_id, None))
+            continue
+        key = (
+            cf.executed_at,
+            cf.instrument.symbol.upper(),
+            cf.side.value.lower(),
+            cf.quantity,
+            cf.price,
+        )
+        occurrence = fill_occurrence[key]
+        fill_occurrence[key] += 1
+        fill_hash = content_hash(
+            account_id,
+            cf.executed_at,
+            cf.instrument.symbol,
+            cf.side.value,
+            cf.quantity,
+            cf.price,
+            occurrence,
+        )
+        keys.append((None, fill_hash))
+    return keys
+
+
+def _cash_dedupe_hashes(account_id: UUID, cash: tuple[CanonicalCash, ...]) -> list[str]:
+    """The content_hash for each cash movement, in order -- exactly what
+    commit_batch computes below. See _fill_dedupe_keys' docstring for why
+    this is factored out rather than duplicated."""
+    cash_occurrence: dict[tuple, int] = defaultdict(int)
+    hashes: list[str] = []
+    for c in cash:
+        cash_key = (c.occurred_at, c.symbol or c.kind, c.kind, c.amount)
+        cash_occ = cash_occurrence[cash_key]
+        cash_occurrence[cash_key] += 1
+        hashes.append(
+            content_hash(
+                account_id,
+                c.occurred_at,
+                c.symbol or c.kind,
+                c.kind,
+                c.amount,
+                Decimal(0),
+                cash_occ,
+            )
+        )
+    return hashes
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +254,10 @@ async def commit_batch(
     # two genuinely distinct same-day trades with identical symbol/side/qty/price
     # would otherwise hash identically and one would be silently deduped away as
     # a "duplicate" of the other — a real trade lost, not a benign re-import. The
-    # occurrence counter below breaks that tie while staying stable across
-    # re-imports: the same batch, walked in the same order, always assigns the
-    # same indices, so a genuine re-import still dedupes to zero.
+    # occurrence counter (inside _fill_dedupe_keys) breaks that tie while
+    # staying stable across re-imports: the same batch, walked in the same
+    # order, always assigns the same indices, so a genuine re-import still
+    # dedupes to zero.
     #
     # The key is built from the SAME normalized fields content_hash itself
     # hashes (symbol upper-cased, side lower-cased) rather than the raw
@@ -196,40 +269,10 @@ async def commit_batch(
     # or worse, diverge from what content_hash considers "the same shape" in
     # the opposite direction. Keeping the two normalizations identical is what
     # makes "same occurrence key" and "same hash inputs" the same statement.
-    fill_occurrence: dict[tuple, int] = defaultdict(int)
+    fill_keys = _fill_dedupe_keys(account_id, batch.fills)
 
-    for cf in batch.fills:
+    for cf, (_venue_fill_id, fill_hash) in zip(batch.fills, fill_keys, strict=True):
         instrument_id = await upsert_instrument(conn, cf.instrument)
-
-        # A fill lacking a venue_fill_id has nothing else to dedupe on —
-        # without a content_hash here, insert_fills' ON CONFLICT can never
-        # match it and re-importing the same export duplicates every row. Only
-        # these rows draw an occurrence index: a row that already dedupes on
-        # its own venue_fill_id must not also consume a slot, or its presence
-        # (and its position in the batch) would shift the index assigned to an
-        # unrelated hash-carrying row with the same shape, changing that row's
-        # hash on a reordered re-import and producing a phantom duplicate.
-        if cf.venue_fill_id:
-            fill_hash = None
-        else:
-            key = (
-                cf.executed_at,
-                cf.instrument.symbol.upper(),
-                cf.side.value.lower(),
-                cf.quantity,
-                cf.price,
-            )
-            occurrence = fill_occurrence[key]
-            fill_occurrence[key] += 1
-            fill_hash = content_hash(
-                account_id,
-                cf.executed_at,
-                cf.instrument.symbol,
-                cf.side.value,
-                cf.quantity,
-                cf.price,
-                occurrence,
-            )
 
         fills.append(
             Fill(
@@ -254,8 +297,8 @@ async def commit_batch(
     fill_result = await insert_fills(conn, fills)
 
     cash_inserted = 0
-    cash_occurrence: dict[tuple, int] = defaultdict(int)
-    for c in batch.cash:
+    cash_hashes = _cash_dedupe_hashes(account_id, batch.cash)
+    for c, chash in zip(batch.cash, cash_hashes, strict=True):
         instrument_id = None
         note = c.note
         if c.symbol:
@@ -268,10 +311,6 @@ async def commit_batch(
                 # sharing a symbol) both leave instrument_id NULL. Never guess;
                 # preserve the symbol instead so a human can resolve it later.
                 note = _append_symbol_note(note, c.symbol)
-
-        cash_key = (c.occurred_at, c.symbol or c.kind, c.kind, c.amount)
-        cash_occ = cash_occurrence[cash_key]
-        cash_occurrence[cash_key] += 1
 
         row = await conn.fetchval(
             """
@@ -289,15 +328,7 @@ async def commit_batch(
             c.currency,
             instrument_id,
             c.venue_ref,
-            content_hash(
-                account_id,
-                c.occurred_at,
-                c.symbol or c.kind,
-                c.kind,
-                c.amount,
-                Decimal(0),
-                cash_occ,
-            ),
+            chash,
             note,
         )
         if row is not None:
@@ -309,3 +340,50 @@ async def commit_batch(
         cash_inserted=cash_inserted,
         warnings=batch.warnings,
     )
+
+
+async def probe_duplicates(
+    conn: asyncpg.Connection, account_id: UUID, batch: ImportBatch
+) -> DuplicateReport:
+    """Explicit, opt-in, READ-ONLY duplicate check for the preview report
+    (spec §7). Preview itself never calls this and stays connection-free by
+    default -- see cli.py's --check-duplicates, and
+    tests/test_cli.py's test_preview_import_never_opens_a_database_connection,
+    which pins that guarantee for the default (no-flag) path. Only the
+    explicit flag reaches this function, and this function issues only
+    SELECTs: no INSERT, UPDATE, DELETE, or explicit transaction.
+
+    Uses _fill_dedupe_keys/_cash_dedupe_hashes -- the SAME functions
+    commit_batch itself uses -- so this can never report a row as new that
+    commit_batch would then silently skip as a duplicate, or vice versa. A
+    probe with its own, independently-derived notion of "duplicate" would be
+    worse than no probe at all: it could tell the user an import is clean
+    when commit_batch would actually drop rows, or warn about "duplicates"
+    that would actually commit as new rows.
+    """
+    fill_keys = _fill_dedupe_keys(account_id, batch.fills)
+    fill_ids = [venue_fill_id for venue_fill_id, _ in fill_keys if venue_fill_id is not None]
+    fill_hashes = [fill_hash for _, fill_hash in fill_keys if fill_hash is not None]
+
+    fill_dupes = await conn.fetchval(
+        """
+        SELECT count(*) FROM fill
+         WHERE account_id = $1
+           AND (venue_fill_id = ANY($2::text[]) OR content_hash = ANY($3::text[]))
+        """,
+        account_id,
+        fill_ids,
+        fill_hashes,
+    )
+
+    cash_hashes = _cash_dedupe_hashes(account_id, batch.cash)
+    cash_dupes = await conn.fetchval(
+        """
+        SELECT count(*) FROM cash_movement
+         WHERE account_id = $1 AND content_hash = ANY($2::text[])
+        """,
+        account_id,
+        cash_hashes,
+    )
+
+    return DuplicateReport(fill_dupes=fill_dupes, cash_dupes=cash_dupes)
