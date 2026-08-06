@@ -33,11 +33,16 @@ async def test_upsert_returns_the_same_id_for_the_same_instrument(conn):
 
 
 async def test_differently_formatted_strikes_collapse_to_one_row(conn):
+    # The shared test database is not guaranteed empty (see tests/db/test_importing.py
+    # header comment): instrument has no FK back to account, so committed rows from
+    # other tests/CLI runs can persist. Assert the delta this test itself caused,
+    # not an absolute count.
+    before = await conn.fetchval("SELECT count(*) FROM instrument")
     a = await upsert_instrument(conn, option("500"))
     b = await upsert_instrument(conn, option("500.00"))
     assert a == b
-    count = await conn.fetchval("SELECT count(*) FROM instrument")
-    assert count == 1
+    after = await conn.fetchval("SELECT count(*) FROM instrument")
+    assert after - before == 1
 
 
 async def test_different_instruments_get_different_ids(conn):
