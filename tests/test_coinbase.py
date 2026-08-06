@@ -318,3 +318,46 @@ def test_a_zero_quantity_deposit_produces_a_zero_amount_warning():
     assert len(result.cash) == 1
     assert result.cash[0].amount == Decimal("0")
     assert any("zero amount" in w.lower() for w in result.warnings)
+
+
+# --- I4: Coinbase never populated `blocking` at all -------------------------
+#
+# The spec's failure-policy table is venue-neutral; the plan narrowed the
+# money-carrying-unmapped-row blocking policy to Fidelity, so Coinbase's
+# ImportBatch never set blocking, and `--commit` proceeded past an
+# unrecognised transaction type even when it carries real money. The shipped
+# fixture (tests/fixtures/coinbase/transactions.csv) already contains an
+# unmapped "Convert" row with a non-zero Quantity Transacted -- it has always
+# been silently non-blocking.
+
+
+def test_the_shipped_fixtures_unmapped_convert_row_blocks_the_commit():
+    """The Convert row in the real, shipped fixture carries a non-zero
+    Quantity Transacted (0.1 BTC) -- exactly the shape that must refuse the
+    commit rather than let it proceed silently."""
+    result = batch()
+    assert result.blocking, "the shipped fixture's money-carrying Convert row must block"
+    assert any("Convert" in msg for _ref, msg in result.blocking)
+
+
+def test_an_unrecognised_transaction_type_carrying_an_amount_blocks():
+    header = FIXTURE.splitlines()[0]
+    row = (
+        header
+        + "\n2026-03-15T16:45:00Z,Stake,BTC,0.10000000,USD,70000.00,7000.00,7000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "an unrecognised type carrying an amount must block"
+    assert any("Stake" in msg for _ref, msg in result.blocking)
+
+
+def test_an_unrecognised_transaction_type_with_no_quantity_only_warns():
+    """A zero-quantity unrecognised row has no financial content -- blocking
+    on it would make an inert, unrecognised row type (a report footer, say)
+    refuse every import forever, same reasoning as Fidelity's twin guard."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-03-15T16:45:00Z,Stake,BTC,0,USD,70000.00,0,0,0.00,x\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking == ()

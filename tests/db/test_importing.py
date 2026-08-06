@@ -798,3 +798,30 @@ async def test_routing_does_not_cross_venues(conn):
     plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001"))
     assert plan.by_account == {}
     assert plan.unknown_refs == ("A0000001",)
+
+
+# --- I5: the probe/commit agreement tests could not fail against the drift --
+# --- they exist to catch. All five probe tests above use batch_of(n), whose
+# --- fills fall on DIFFERENT days -- occurrence is 0 for every row, so the
+# --- one non-obvious part of _fill_dedupe_keys (the occurrence index, the
+# --- entire reason it was extracted as shared code) is never exercised by
+# --- any of them. _TWO_IDENTICAL_FIDELITY_ROWS (same day, same shape) is
+# --- what actually distinguishes a probe that shares commit_batch's dedupe
+# --- keys from one that has quietly drifted.
+
+
+async def test_probe_agrees_with_commit_on_same_day_duplicate_rows(conn):
+    """Commits _TWO_IDENTICAL_FIDELITY_ROWS (same day, same symbol/side/qty/
+    price -- occurrence 0 and 1) and then probes the SAME batch again. Fails
+    if probe_duplicates ever stops sharing _fill_dedupe_keys with
+    commit_batch (e.g. an inline content_hash call that drops the occurrence
+    argument): such a drift collapses both rows onto the SAME hash, so the
+    probe would report only 1 duplicate while commit_batch (which does use
+    occurrence) would still correctly skip both on a re-commit -- the probe
+    silently disagreeing with the commit it exists to preview."""
+    batch = FidelityImporter().parse(_TWO_IDENTICAL_FIDELITY_ROWS)
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    report = await probe_duplicates(conn, account_id, batch)
+    assert report.fill_dupes == 2

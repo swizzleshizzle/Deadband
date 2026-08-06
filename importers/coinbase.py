@@ -45,6 +45,17 @@ class CoinbaseImporter:
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
+        # I4: the money-carrying-unmapped-row blocking policy (see
+        # importers/fidelity.py and ImportBatch.blocking's docstring) is
+        # venue-neutral in the spec -- the plan narrowed it to Fidelity only,
+        # so this venue never populated `blocking` at all, and an
+        # unrecognised transaction type carrying real money (the shipped
+        # fixture's own "Convert" row, for instance) never refused a commit.
+        # Each entry is (external_ref, message) for symmetry with Fidelity's
+        # ImportBatch.blocking, even though this importer never populates a
+        # row's external_ref at all (Coinbase's export carries no per-row
+        # account number) -- every entry's ref is therefore always None.
+        blocking: list[tuple[str | None, str]] = []
 
         # Strip UTF-8 BOM if present (common in Coinbase exports)
         text = text.lstrip("﻿")
@@ -179,14 +190,23 @@ class CoinbaseImporter:
                 )
             else:
                 # Never drop a row silently — an unrecognized type is a reporting gap.
-                warnings.append(
-                    f"line {line_no}: unhandled transaction type {row.get('Transaction Type')!r}"
-                )
+                msg = f"line {line_no}: unhandled transaction type {row.get('Transaction Type')!r}"
+                warnings.append(msg)
                 unmapped.append(str(row))
+                # Same reasoning as Fidelity's twin guard: blocking on every
+                # unrecognised type is unworkable (the venue's type
+                # vocabulary is open-ended), and blocking on none of them is
+                # exactly how the silent-loss defect this task exists to
+                # close looked like success. Only a row that ALSO carries
+                # money (a non-zero Quantity Transacted, already parsed
+                # above for every row) refuses the commit.
+                if quantity != 0:
+                    blocking.append((None, msg))
 
         return ImportBatch(
             fills=tuple(fills),
             cash=tuple(cash),
             warnings=tuple(warnings),
             unmapped_rows=tuple(unmapped),
+            blocking=tuple(blocking),
         )

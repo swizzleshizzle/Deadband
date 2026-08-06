@@ -248,7 +248,25 @@ def test_trailing_disclaimer_line_is_reported_as_unmapped_not_dropped():
 def test_malformed_cash_amount_is_reported_not_fatal():
     """A bad Amount on a cash row (dividend/transfer/interest) must not raise
     and must not take down the rest of the file with it — same defensive
-    pattern already applied to the fill branch's Quantity/Price/Commission/Fees."""
+    pattern already applied to the fill branch's Quantity/Price/Commission/Fees.
+
+    Restated for I3: this row is a MATCHED rule (DIVIDEND RECEIVED) that then
+    fails on a garbled Amount ("N/A") -- exactly the case I3 closes. Before
+    I3's fix this row warned and fell out as unmapped but never reached
+    `blocking` at all, because only "no rule matched" ever consulted
+    _carries_money; the bad-amount path here was one of the five parallel
+    paths that fell out through their own InvalidOperation/non-finite checks
+    instead. _carries_money fails open on InvalidOperation ("N/A" cannot be
+    parsed, so it is treated as "might carry money" rather than silently
+    read as zero), so this row must now also block.
+
+    This does NOT reinstate the original defect being tested here ("one bad
+    row must not abort the whole FILE"): parse() still does not raise, the
+    two good fills still parse, and blocking's job is to refuse the COMMIT
+    (in cli.py, at import time) rather than to raise out of parse() itself --
+    see ImportBatch.blocking's docstring. The original assertions (fill/cash/
+    unmapped/warning counts, and that "bad amount" is the warning text) are
+    kept verbatim; only the new blocking assertion is added."""
     header = FIXTURE.splitlines()[0]
     rows = "\n".join(
         [
@@ -264,6 +282,9 @@ def test_malformed_cash_amount_is_reported_not_fatal():
     assert len(result.unmapped_rows) == 1
     assert len(result.warnings) == 1
     assert "bad amount" in result.warnings[0]
+    assert len(result.blocking) == 1, "a matched rule with a garbled Amount must now block"
+    assert result.blocking[0][0] == "X1"
+    assert "bad amount" in result.blocking[0][1]
 
 
 # --- Fix round 1, item 2: direction comes from the action, not the sign, ---
@@ -738,3 +759,48 @@ def test_renaming_the_amount_column_zeroes_every_cash_movement_with_a_warning():
 
     zero_amount_warnings = [w for w in result.warnings if "zero amount" in w.lower()]
     assert len(zero_amount_warnings) == len(result.cash)
+
+
+# --- I3: blocking watched only "no rule matched", not a matched row dropped -
+# --- for a bad quantity or amount. ------------------------------------------
+#
+# _carries_money deliberately fails open (returns True) on InvalidOperation --
+# "failing open on a garbled money field is exactly the silent-loss failure
+# mode this task exists to close" -- but that only protected the "no rule
+# matched" branch. A garbled Amount/Quantity on a row that DID match a rule
+# fell out through build_fill's or the cash branch's own InvalidOperation/
+# zero/non-finite checks, which appended to unmapped + warnings directly and
+# never consulted _carries_money at all.
+
+
+def test_a_bought_row_with_a_blank_quantity_but_a_real_amount_blocks():
+    """A YOU BOUGHT row is a MATCHED rule (not an unhandled action) that then
+    fails build_fill's zero-quantity guard. Before I3's fix this only warned
+    and marked the row unmapped -- blocking stayed empty even though the
+    row's own Amount column still carries a real, non-zero dollar figure."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,DESC,,500.00,0.00,0.00,-5000.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "a matched rule with a blank quantity but real money must block"
+    assert result.blocking[0][0] == "X1"
+
+
+def test_renaming_the_quantity_column_recreates_the_original_defect_and_now_blocks():
+    """Mutant-gate for I3, from the finding's own demonstration: renaming the
+    fixture's Quantity column to Shares reproduces the original silent-loss
+    defect bit-for-bit at the parser level -- every fill-shaped row's
+    quantity resolves to Decimal('0') via _decimal(None), so all five hit
+    build_fill's zero-quantity guard. Each row's Amount column is
+    untouched by the rename and still carries real money, so all five must
+    now appear in blocking. Before I3's fix this test would see
+    len(blocking) == 0 (fills 0, unmapped 5, blocking ()), matching the
+    finding's "RC = 0" report verbatim."""
+    header = FIXTURE.splitlines()[0].replace("Quantity", "Shares")
+    body = "\n".join(FIXTURE.splitlines()[1:])
+    result = FidelityImporter().parse(header + "\n" + body + "\n")
+
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 5
+    assert len(result.blocking) == 5

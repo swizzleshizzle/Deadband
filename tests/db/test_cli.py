@@ -274,6 +274,26 @@ async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monke
     assert row["default_intent"] == "investment"
 
 
+def _coinbase_fixture_without_the_unmapped_convert_row(tmp_path: pathlib.Path) -> str:
+    """The shipped fixture (tests/fixtures/coinbase/transactions.csv, which
+    must not be modified -- see the fix-wave constraints) carries an
+    unmapped "Convert" row that carries real money. Since I4 wired Coinbase's
+    blocking policy, --commit against the real fixture now correctly refuses
+    -- see test_the_shipped_fixtures_unmapped_convert_row_blocks_the_commit
+    in tests/test_coinbase.py. The tests below exist to pin OTHER behaviour
+    (the venue-mismatch guard, --check-duplicates' account fallback) and
+    would otherwise be blocked by an unrelated row; this writes a trimmed
+    copy (real fixture minus its last, Convert, line) to tmp_path so they
+    keep exercising what they were written for."""
+    lines = pathlib.Path("tests/fixtures/coinbase/transactions.csv").read_text().splitlines()
+    assert lines[-1].startswith("2026-03-15T16:45:00Z,Convert,"), (
+        "the shipped fixture's shape changed -- update this trim"
+    )
+    trimmed = tmp_path / "transactions_no_convert.csv"
+    trimmed.write_text("\n".join(lines[:-1]) + "\n")
+    return str(trimmed)
+
+
 # --- Final fix wave, item 4: cmd_import never checked that --account's venue
 # --- matches the importer, so `import coinbase cb.csv --account <a-fidelity-
 # --- account> --commit` succeeded silently and permanently mis-attributed
@@ -281,7 +301,7 @@ async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monke
 
 
 async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
-    conn, monkeypatch, capsys
+    conn, monkeypatch, capsys, tmp_path
 ):
     """Fails if the venue check is missing (or backwards): rc would be 0 and
     the fidelity account would end up with committed coinbase fills instead
@@ -307,7 +327,7 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
 
     args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=_coinbase_fixture_without_the_unmapped_convert_row(tmp_path),
         account=str(acc),
         commit=True,
     )
@@ -320,7 +340,7 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
-async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys):
+async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys, tmp_path):
     """Positive case for the venue check above: a matching venue must still
     commit normally. Fails if the check is inverted and rejects the correct
     case instead of the mismatched one."""
@@ -333,7 +353,7 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
 
     args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=_coinbase_fixture_without_the_unmapped_convert_row(tmp_path),
         account=str(acc),
         commit=True,
     )
@@ -678,7 +698,7 @@ async def test_check_duplicates_reports_an_existing_fill_and_writes_nothing(
 
 
 async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
-    conn, monkeypatch, capsys
+    conn, monkeypatch, capsys, tmp_path
 ):
     """Coinbase carries no per-row account ref, so a preview run with
     --check-duplicates must fall back to --account for those rows the same
@@ -690,9 +710,10 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
 
+    fixture_path = _coinbase_fixture_without_the_unmapped_convert_row(tmp_path)
     commit_args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=fixture_path,
         account=str(acc),
         commit=True,
         check_duplicates=False,
@@ -702,7 +723,7 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 
     preview_args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=fixture_path,
         account=str(acc),
         commit=False,
         check_duplicates=True,
