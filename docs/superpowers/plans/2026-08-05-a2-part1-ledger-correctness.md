@@ -156,7 +156,9 @@ This task builds the guard **before** the first migration exists, so it covers e
 - Create: `tests/db/test_schema_equivalence.py`
 
 **Interfaces:**
-- Produces: `tests/db/test_schema_equivalence.py::_describe(conn, namespace) -> dict` — used only within this file.
+- Produces: `tests/db/test_schema_equivalence.py::_describe(conn, namespace) -> dict` — used only within this file. It must compare **columns, CHECK constraints, trigger definitions, and trigger function bodies**, and must assert its own results are non-empty before comparing.
+
+> **Correction, made during execution.** This task's code sample originally compared only columns and CHECK constraints. Review caught the gap empirically: a trigger added to `schema.sql` alone passed the guard unnoticed — and Task 3 adds exactly such a trigger. Trigger DDL has no informal safety net the way column and constraint DDL does, so a guard blind to it gives false confidence precisely where it is needed most. `pg_get_triggerdef()` over `pg_trigger` (with `tgisinternal = false`) and `pg_get_functiondef()` over `pg_proc` are the reliable sources; `information_schema.triggers` returns one row per event and compares awkwardly. The non-vacuity assertion exists because `[] == []` would otherwise pass forever if `_describe` ever matched nothing.
 
 - [ ] **Step 1: Freeze the baseline**
 
