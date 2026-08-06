@@ -1,3 +1,18 @@
+-- FROZEN SNAPSHOT -- do not regenerate or hand-edit this file.
+--
+-- This is the pre-migration (A-1) schema, frozen at the point migration 001
+-- was introduced. tests/db/test_schema_equivalence.py builds one database from
+-- this file plus every file under db/migrations/, and a second straight from
+-- the current db/schema.sql, then asserts the two are structurally identical
+-- -- catching a change written to schema.sql but never given a matching
+-- migration (or vice versa).
+--
+-- If this file is ever regenerated with `cp db/schema.sql
+-- tests/fixtures/schema_baseline_a1.sql`, that guard silently becomes a
+-- tautology that passes forever: every migration is written as
+-- `IF NOT EXISTS` / `DROP ... ADD`, so baseline+migrations would still equal
+-- schema.sql even while the test verifies nothing.
+--
 -- Deadband ledger schema. All money and quantity columns are NUMERIC, never
 -- FLOAT. All timestamps are TIMESTAMPTZ, stored UTC.
 

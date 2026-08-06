@@ -128,7 +128,7 @@ def test_entry_fee_is_amortized_across_closes_not_expensed_at_once():
 
     The old convention expensed the whole entry fee immediately, which matches
     no accounting convention and self-corrects only when the trade closes flat.
-    Asserts on realized_pnl, whose value the bug moves by 228.75.
+    Asserts on realized_pnl, whose value the bug moves by 225.
     """
     entry = fill(side=Side.BUY, qty="4", price="60000", minutes=0, fee="300")
     exit_ = fill(side=Side.SELL, qty="1", price="76000", minutes=10, fee="85")

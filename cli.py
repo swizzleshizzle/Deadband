@@ -47,9 +47,13 @@ async def cmd_migrate(_args) -> int:
                 "is computed. Run `regroup --account <uuid>` for every account before\n"
                 "trusting any P&L figure."
             )
-    elif not existed_before:
-        print("schema applied; no pending migrations")
     else:
+        # Unreachable with existed_before == False: db/migrations/ always holds
+        # at least one migration file (001_a2_ledger_completion.sql onward), so
+        # a virgin database's empty schema_migrations table makes `applied`
+        # non-empty every time -- the `if applied:` branch above always wins on
+        # a fresh install. This branch only ever runs on a database that was
+        # already fully up to date.
         print("already up to date")
     return 0
 

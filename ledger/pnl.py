@@ -134,6 +134,15 @@ def compute_pnl(
         fees_val = _q(fees)
 
         # Entry fees attributable to closed quantity, plus every exit fee.
+        #
+        # Deliberately computed once at end-of-trade from final totals
+        # (fees_entry * qty_closed / qty_opened), not as a running average
+        # applied at each individual close. This is prescribed by the spec: a
+        # single end-of-trade ratio is order-insensitive -- allocating a
+        # multi-lot entry's fee across several partial closes in any order
+        # yields the same fees_realized -- which is what lets
+        # test_allocations_sorted_chronologically pass. Do not "fix" this into
+        # a running average; that would make the result order-dependent.
         entry_fee_recognised = (
             fees_entry * (qty_closed / qty_opened) if qty_opened else Decimal(0)
         )
