@@ -415,6 +415,39 @@ async def test_commit_refuses_and_writes_nothing_when_a_row_routes_to_an_unknown
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
 
 
+async def test_commit_refuses_and_writes_nothing_when_a_row_carries_money_and_is_unmapped(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Same atomicity guarantee as the unknown-account case above, for
+    ImportBatch.blocking: one row is a normal, known-account fill; the other
+    is an unmapped action carrying real money (a non-zero Amount) that no
+    rule matches. The whole commit must be refused and NOTHING written,
+    including the row that classified fine -- a partial commit here would
+    look like a successful import while quietly dropping money on the floor,
+    which is the exact defect this task exists to make impossible."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000001,MYSTERIOUS NEW ACTION,AAA,DESC,,,,,123.45",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "MYSTERIOUS" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
 async def test_ignored_account_is_skipped_while_its_siblings_import(
     conn, monkeypatch, capsys, tmp_path
 ):
@@ -472,10 +505,18 @@ async def test_commit_state_report_names_an_account_whose_rows_are_entirely_unma
     known = await create_account(
         conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
     )
+    # Task 5 amendment: this row must carry NO financial content (blank
+    # Amount, not the 123.45 the pre-task-5 version of this test used) -- an
+    # unmapped row that carries money now REFUSES the whole commit (see
+    # importers/base.py's ImportBatch.blocking), which is a different, correct
+    # outcome this test does not exist to cover. A blank Amount keeps this
+    # test's actual point intact: an account whose rows are entirely
+    # unmapped, but carry no money, must still be named while its known
+    # sibling commits normally.
     file_path = _write_routing_csv(
         tmp_path,
         "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
-        "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,123.45",
+        "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,",
     )
 
     async def fake_create_pool(*_a, **_kw):

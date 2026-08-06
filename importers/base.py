@@ -139,6 +139,42 @@ class ImportBatch:
     # invisible to any report built from them. refs_seen exists so a caller
     # can report on accounts, not just on successfully classified rows.
     refs_seen: tuple[str, ...] = ()
+    # Reasons the WHOLE batch must not commit. The venue's action vocabulary
+    # is open-ended, so an unmapped row is guaranteed -- but blocking on every
+    # unmapped row is unworkable (a real export's trailing legal disclaimer is
+    # permanently unmapped by design, so nothing could ever commit) and
+    # blocking on none is exactly how the defect that motivated this whole
+    # effort looked like success. So only a row that both parsed a valid date
+    # AND carries a non-zero quantity or amount, and that no rule matched,
+    # belongs here -- a row with no financial content only warns. Empty means
+    # "safe to commit," never "nothing was unmapped" (see unmapped_rows/
+    # warnings for that).
+    blocking: tuple[str, ...] = ()
+
+
+def zero_price_warning(
+    line_no: int, symbol: str, quantity: Decimal, price: Decimal
+) -> str | None:
+    """A fill-shaped row (real quantity) priced at zero is almost always a
+    parse failure, not a free trade.
+
+    This is the defect that started the whole effort: a real export names its
+    money columns with a currency suffix, the importer read the bare names,
+    missed every one, and `_decimal(None)` silently returned `Decimal("0")`
+    for each -- no warning, dates/quantities/symbols all correct, the result
+    plausible and financially meaningless. Downstream of `_decimal` a missing
+    column and a genuine zero are indistinguishable, so the check must live
+    HERE, at the point of parsing the row, while the distinction still
+    exists -- not in any consumer of the already-built CanonicalFill.
+
+    Shared by every importer building a fill (see importers/fidelity.py and
+    importers/coinbase.py) so the guard can never drift between venues, and so
+    a venue added later gets it by construction rather than by remembering to
+    copy it.
+    """
+    if quantity != 0 and price == 0:
+        return f"line {line_no}: {symbol} has quantity {quantity} at zero price"
+    return None
 
 
 class Importer(Protocol):

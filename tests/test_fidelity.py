@@ -661,3 +661,50 @@ def test_a_real_security_at_a_dollar_is_still_imported_as_a_security():
     result = FidelityImporter().parse(row)
     assert len(result.fills) == 1
     assert result.fills[0].instrument.symbol == "AAA"
+
+
+# --- Task 5: silent loss must be impossible ---------------------------------
+
+
+def test_an_unmapped_row_carrying_money_blocks_the_commit():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,MYSTERIOUS NEW ACTION,AAA,DESC,,,,,123.45\n"
+    result = FidelityImporter().parse(row)
+    assert result.blocking, "a money-carrying unmapped row must block"
+    assert any("MYSTERIOUS" in b for b in result.blocking)
+
+
+def test_an_unmapped_row_with_no_financial_content_only_warns():
+    """The trailing disclaimer block is permanently unmapped by design. If it
+    blocked, no real export could ever be committed."""
+    result = FidelityImporter().parse(FIXTURE + "This report is informational only.\n")
+    assert result.blocking == ()
+    assert result.unmapped_rows
+
+
+def test_an_unmapped_row_with_a_valid_date_and_no_money_only_warns():
+    """The disclaimer case above never actually reaches the money-carrying
+    check: its line has no commas, so it fails the *date* parse and is warned
+    about via that branch entirely, before classify() is ever consulted --
+    confirmed directly against _locate_header/DictReader's own output for that
+    line. That means the disclaimer test alone cannot pin the "no financial
+    content warns only" half of the guard: a mutant that blocks every
+    unmapped row unconditionally would leave the disclaimer test green
+    (blocking still empty, for an unrelated reason) despite the guard being
+    broken. This row has a VALID date and an unmapped action, and reaches
+    classify() with quantity/amount both blank, so it genuinely exercises the
+    guard's money check rather than sidestepping it."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,ADMINISTRATIVE NOTICE,AAA,DESC,,,,,\n"
+    result = FidelityImporter().parse(row)
+    assert result.blocking == ()
+    assert result.unmapped_rows
+
+
+def test_a_fill_shaped_row_with_a_zero_price_is_reported():
+    """Downstream of _decimal, a missing column and a genuine zero are
+    indistinguishable. The check must live where they still differ."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,DESC,10,0.00,0.00,0.00,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("zero price" in w.lower() for w in result.warnings)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch
+from importers.base import CanonicalCash, CanonicalFill, ImportBatch, zero_price_warning
 from ledger.types import AssetClass, Instrument, Side
 
 # -SPY260919C500  →  underlying SPY, 2026-09-19, call, strike 500
@@ -196,6 +196,18 @@ def _decimal(raw: str | None) -> Decimal:
     return Decimal(cleaned) if cleaned else Decimal("0")
 
 
+def _carries_money(raw: str | None) -> bool:
+    """True if a raw quantity/amount field is non-zero -- or is present but
+    unparseable, which must be treated as "might carry money" rather than
+    silently read as empty. Blocking on a false positive costs a human a
+    glance; failing open on a garbled money field is exactly the silent-loss
+    failure mode this whole task exists to close."""
+    try:
+        return _decimal(raw) != 0
+    except InvalidOperation:
+        return True
+
+
 def _locate_header(text: str) -> tuple[list[str], int]:
     """Find the header row and split off any preamble before it.
 
@@ -233,6 +245,10 @@ class FidelityImporter:
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
+        # Reasons the whole batch must refuse to commit -- see
+        # ImportBatch.blocking's docstring for why this is narrower than
+        # "every unmapped row" and wider than "none of them".
+        blocking: list[str] = []
         # Every account ref seen in the raw rows, independent of whether the
         # row went on to become a fill/cash movement or fell out as
         # unmapped -- see ImportBatch.refs_seen's docstring for why this
@@ -277,6 +293,14 @@ class FidelityImporter:
                 warnings.append(f"line {line_no}: non-finite number, skipped")
                 unmapped.append(str(raw_row))
                 return
+
+            # Real quantity at zero price is almost always a parse failure
+            # (see importers.base.zero_price_warning's docstring), not a free
+            # trade -- report it, but still record the fill: suppressing it
+            # would trade one silent-loss failure mode for another.
+            warn = zero_price_warning(line_no, symbol, abs(raw_qty), price)
+            if warn is not None:
+                warnings.append(warn)
 
             instrument = parse_option_symbol(symbol) or Instrument(
                 id=None,
@@ -375,8 +399,19 @@ class FidelityImporter:
 
             rule = classify(action, symbol)
             if rule is None:
-                warnings.append(f"line {line_no}: unhandled action {action!r}")
+                msg = f"line {line_no}: unhandled action {action!r}"
+                warnings.append(msg)
                 unmapped.append(str(raw_row))
+                # A row the classifier doesn't recognise is guaranteed --
+                # the venue's action vocabulary is open-ended, and a real
+                # export's trailing legal disclaimer is permanently unmapped
+                # by design. Blocking on every such row is unworkable;
+                # blocking on none of them is exactly how the silent-zero
+                # defect looked like success. So: only a row that ALSO
+                # carries money (a non-zero quantity or amount) refuses the
+                # commit -- one with no financial content only warns.
+                if _carries_money(row.get("quantity")) or _carries_money(row.get("amount")):
+                    blocking.append(msg)
                 continue
 
             if rule.outcome is Outcome.INTERNAL:
@@ -442,4 +477,5 @@ class FidelityImporter:
             warnings=tuple(warnings),
             unmapped_rows=tuple(unmapped),
             refs_seen=tuple(sorted(refs_seen)),
+            blocking=tuple(blocking),
         )

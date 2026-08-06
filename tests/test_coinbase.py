@@ -275,3 +275,27 @@ def test_zero_price_on_non_fiat_cash_is_warned_about():
     assert result.warnings[0].startswith("line 2:")
     # Amount should be 0 (0.01 * 0)
     assert result.cash[0].amount == Decimal("0")
+
+
+# --- Task 5: silent loss must be impossible ---------------------------------
+#
+# The defect that started this whole effort: a real export names its money
+# columns with a currency suffix, the importer read the bare names, missed
+# every one, and _decimal(None) silently returned Decimal("0") for each --
+# dates/quantities/symbols all correct, price and fee zero, no warning.
+# importers/base.zero_price_warning is the shared guard; this pins that
+# Coinbase's fill branch actually calls it, not just Fidelity's.
+
+
+def _coinbase_row_with_zero_price() -> str:
+    header = FIXTURE.splitlines()[0]
+    return (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,0.00,0.00,0.00,0.00,zero price test\n"
+    )
+
+
+def test_the_zero_price_guard_covers_coinbase_too():
+    """Same defect class, same guard. Coinbase was never audited for it."""
+    result = CoinbaseImporter().parse(_coinbase_row_with_zero_price())
+    assert any("zero price" in w.lower() for w in result.warnings)

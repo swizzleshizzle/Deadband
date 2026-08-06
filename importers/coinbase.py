@@ -7,7 +7,7 @@ import io
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch
+from importers.base import CanonicalCash, CanonicalFill, ImportBatch, zero_price_warning
 from ledger.types import AssetClass, Instrument, Side
 
 _FILL_TYPES = {
@@ -97,6 +97,16 @@ class CoinbaseImporter:
                     warnings.append(f"line {line_no}: non-positive quantity, skipped")
                     unmapped.append(str(row))
                     continue
+
+                # Same defect class as Fidelity's twin (see
+                # importers.base.zero_price_warning's docstring): a real
+                # quantity priced at zero is almost always a parse failure --
+                # e.g. a currency-suffixed money column the importer's bare
+                # header names missed -- not a free trade. Report it, but
+                # still record the fill.
+                warn = zero_price_warning(line_no, asset, quantity, price)
+                if warn is not None:
+                    warnings.append(warn)
 
                 fills.append(
                     CanonicalFill(
