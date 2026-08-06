@@ -40,6 +40,7 @@ class TradePnL:
     avg_exit: Decimal | None  # Average price of closing fills (or None if position never closed)
     gross_realized_pnl: Decimal
     fees_total: Decimal
+    fees_realized: Decimal
     realized_pnl: Decimal  # net of fees
     open_quantity: Decimal
     open_cost_basis: Decimal  # per unit, running average after closes (excluding multiplier)
@@ -74,6 +75,9 @@ def compute_pnl(
         exit_notional = Decimal(0)
         gross = Decimal(0)
         fees = Decimal(0)
+        fees_entry = Decimal(0)
+        fees_exit = Decimal(0)
+        entry_mult = Decimal(0)
 
         for alloc in ordered:
             f = fills_by_id[alloc.fill_id]
@@ -85,14 +89,24 @@ def compute_pnl(
                     f"no contract multiplier supplied for instrument {f.instrument_id}"
                 ) from e
 
-            # Pro-rate the fee by this allocation's share of the fill.
-            fees += (f.fee * qty / f.quantity) if f.quantity else Decimal(0)
+            # Split by side: an entry fee is part of the basis of the units
+            # acquired and is recognised as those units are sold; an exit fee
+            # is recognised in full at the close. Pro-rating by the allocation's
+            # share of the FILL (the old behaviour) expensed an entry fee
+            # entirely on a fill wholly inside a barely-closed trade.
+            fee_share = (f.fee * qty / f.quantity) if f.quantity else Decimal(0)
+            fees += fee_share
+            if f.side is opening_side:
+                fees_entry += fee_share
+            else:
+                fees_exit += fee_share
 
             if f.side is opening_side:
                 basis_total += qty * f.price
                 position += qty
                 qty_opened += qty
                 entry_notional += qty * f.price
+                entry_mult = mult  # opening leg's multiplier, for fee capitalization
             else:
                 # Remove a proportional slice of the EXACT basis rather than reconstructing
                 # from a rounded per-unit average. Identical in intent, but exact when the
@@ -118,7 +132,21 @@ def compute_pnl(
         )
         gross_val = _q(gross)
         fees_val = _q(fees)
-        open_cost_basis_val = _q((basis_total / position) if position else Decimal(0))
+
+        # Entry fees attributable to closed quantity, plus every exit fee.
+        entry_fee_recognised = (
+            fees_entry * (qty_closed / qty_opened) if qty_opened else Decimal(0)
+        )
+        fees_realized_val = _q(fees_exit + entry_fee_recognised)
+
+        # The remainder rides with the open units. open_cost_basis is per-unit and
+        # excludes the multiplier, so convert the currency fee into price terms.
+        entry_fee_per_unit = Decimal(0)
+        if qty_opened and position and entry_mult:
+            entry_fee_per_unit = (fees_entry / qty_opened) / entry_mult
+        open_cost_basis_val = _q(
+            ((basis_total / position) + entry_fee_per_unit) if position else Decimal(0)
+        )
 
         return TradePnL(
             qty_opened=qty_opened,
@@ -127,7 +155,8 @@ def compute_pnl(
             avg_exit=avg_exit_val,
             gross_realized_pnl=gross_val,
             fees_total=fees_val,
-            realized_pnl=gross_val - fees_val,
+            fees_realized=fees_realized_val,
+            realized_pnl=gross_val - fees_realized_val,
             open_quantity=position,
             open_cost_basis=open_cost_basis_val,
         )
