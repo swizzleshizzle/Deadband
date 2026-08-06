@@ -752,7 +752,7 @@ async def test_partial_manual_allocation_leaves_the_remainder_groupable(conn):
         side=Side.SELL,
         quantity=Decimal("1"),
         price=Decimal("100"),
-        fee=Decimal("0"),
+        fee=Decimal("1.00"),
         fee_currency="USD",
         source=FillSource.MANUAL,
         venue_fill_id="s1",
@@ -766,7 +766,7 @@ async def test_partial_manual_allocation_leaves_the_remainder_groupable(conn):
         side=Side.BUY,
         quantity=Decimal("5"),
         price=Decimal("90"),
-        fee=Decimal("0"),
+        fee=Decimal("5.00"),
         fee_currency="USD",
         source=FillSource.MANUAL,
         venue_fill_id="b1",
@@ -789,6 +789,27 @@ async def test_partial_manual_allocation_leaves_the_remainder_groupable(conn):
         "SELECT sum(quantity) FROM trade_fill WHERE fill_id = $1", buy.id
     )
     assert total_allocated == Decimal("5")
+
+    # Fee conservation: the sum of fees_total across every trade in the account
+    # must equal the fee actually paid across the fills that fund them, no
+    # matter how a fill's quantity was split between a manual holder and the
+    # auto-grouped remainder. When a fill is partly held by a manual trade,
+    # db/trades.py hands the pure grouper a quantity-reduced copy of that fill
+    # (`remaining = f.quantity - manual_held...`); if the fee isn't prorated
+    # alongside the quantity, compute_pnl's `fee_share = f.fee * qty /
+    # f.quantity` uses the reduced quantity as its own denominator and the
+    # auto remainder absorbs the fill's ENTIRE fee on top of whatever the
+    # manual trade already recorded for it -- manufacturing fee out of thin
+    # air. Here: sell fee 1.00 + buy fee 5.00 = 6.00 paid; a broken prorate
+    # inflates the account total to 7.00 (manual trade's frozen 2.00, which
+    # already counted 1.00 of the buy fill's fee, plus the reduced-quantity
+    # remainder wrongly absorbing the buy fill's full 5.00 instead of its
+    # rightful 4.00 share).
+    total_fees_paid = sell.fee + buy.fee
+    total_fees_total = await conn.fetchval(
+        "SELECT sum(fees_total) FROM trade WHERE account_id = $1", acc
+    )
+    assert total_fees_total == total_fees_paid
 
 
 # --- Task 5: persist open_quantity, open_cost_basis, fees_realized ---------

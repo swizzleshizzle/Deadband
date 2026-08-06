@@ -72,7 +72,11 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         remaining = f.quantity - manual_held.get(f.id, Decimal(0))
         if remaining <= 0:
             continue  # wholly owned by a manual trade
-        fills.append(f if remaining == f.quantity else replace(f, quantity=remaining))
+        fills.append(
+            f
+            if remaining == f.quantity
+            else replace(f, quantity=remaining, fee=f.fee * remaining / f.quantity)
+        )
 
     seen_openings: list[UUID] = []
     written = 0
