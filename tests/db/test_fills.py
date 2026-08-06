@@ -20,7 +20,9 @@ async def setup_account_and_instrument(conn):
     return acc, inst
 
 
-def make_fill(acc, inst, *, venue_fill_id=None, content_hash=None, qty="1") -> Fill:
+def make_fill(
+    acc, inst, *, venue_fill_id=None, content_hash=None, qty="1", funding_source="external"
+) -> Fill:
     return Fill(
         id=uuid4(),
         account_id=acc,
@@ -35,6 +37,7 @@ def make_fill(acc, inst, *, venue_fill_id=None, content_hash=None, qty="1") -> F
         venue_fill_id=venue_fill_id,
         content_hash=content_hash,
         is_estimated=False,
+        funding_source=funding_source,
     )
 
 
@@ -71,3 +74,22 @@ async def test_same_venue_fill_id_in_a_different_account_is_not_a_duplicate(conn
     await insert_fills(conn, [make_fill(acc, inst, venue_fill_id="v1")])
     result = await insert_fills(conn, [make_fill(other, inst, venue_fill_id="v1")])
     assert result.inserted == 1
+
+
+async def test_fetch_fills_round_trips_funding_source(conn):
+    """_to_fill's row-to-dataclass mapping is a separate code path from the raw
+    SQL SELECT used in tests/db/test_importing.py's round-trip test, and
+    regroup_account reads fills through fetch_fills -- so a dropped mapping
+    here would quietly mislabel every fill's funding source in any downstream
+    computation. Explicit non-default values on both fills (rather than
+    relying on make_fill's own default) so this cannot pass for a mapping
+    that hardcodes either 'external' or 'reinvestment'."""
+    acc, inst = await setup_account_and_instrument(conn)
+    reinvested = make_fill(
+        acc, inst, venue_fill_id="v-reinvest", funding_source="reinvestment"
+    )
+    external = make_fill(acc, inst, venue_fill_id="v-external", funding_source="external")
+    await insert_fills(conn, [reinvested, external])
+
+    fetched = {f.venue_fill_id: f.funding_source for f in await fetch_fills(conn, acc)}
+    assert fetched == {"v-reinvest": "reinvestment", "v-external": "external"}
