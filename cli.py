@@ -18,18 +18,25 @@ from importers.registry import get_importer, list_importers
 
 async def cmd_migrate(_args) -> int:
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        # apply() unconditionally (re-)executes schema.sql, and db/migrations/
-        # holds real migrations (starting with 001_a2_ledger_completion.sql),
-        # so `applied` can be non-empty for two different reasons: pending
-        # migrations on a database that already existed, or the entire schema
-        # having just been created on a virgin one. Those are different
-        # outcomes and must not share one message. Check for a table
-        # schema.sql creates before calling apply(), while it's still
-        # meaningful to ask "did this exist already?".
-        existed_before = await conn.fetchval("SELECT to_regclass('public.account') IS NOT NULL")
-        applied = await apply_migrations(conn)
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            # apply() unconditionally (re-)executes schema.sql, and db/migrations/
+            # holds real migrations (starting with 001_a2_ledger_completion.sql),
+            # so `applied` can be non-empty for two different reasons: pending
+            # migrations on a database that already existed, or the entire schema
+            # having just been created on a virgin one. Those are different
+            # outcomes and must not share one message. Check for a table
+            # schema.sql creates before calling apply(), while it's still
+            # meaningful to ask "did this exist already?".
+            existed_before = await conn.fetchval(
+                "SELECT to_regclass('public.account') IS NOT NULL"
+            )
+            applied = await apply_migrations(conn)
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
     if applied:
         print(f"applied {len(applied)} migration(s):")
         for name in applied:
@@ -60,25 +67,35 @@ async def cmd_migrate(_args) -> int:
 
 async def cmd_accounts(_args) -> int:
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        for a in await list_accounts(conn):
-            print(f"{a['id']}  {a['venue']:<10} {a['name']:<24} {a['external_ref'] or '-'}")
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            for a in await list_accounts(conn):
+                print(f"{a['id']}  {a['venue']:<10} {a['name']:<24} {a['external_ref'] or '-'}")
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
     return 0
 
 
 async def cmd_accounts_add(args) -> int:
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        account_id = await create_account(
-            conn,
-            name=args.name,
-            venue=args.venue,
-            account_type=args.account_type,
-            default_intent=args.default_intent,
-            external_ref=args.external_ref,
-        )
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            account_id = await create_account(
+                conn,
+                name=args.name,
+                venue=args.venue,
+                account_type=args.account_type,
+                default_intent=args.default_intent,
+                external_ref=args.external_ref,
+            )
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
     print(account_id)
     return 0
 
@@ -177,9 +194,14 @@ async def cmd_regroup(args) -> int:
 
 async def cmd_trades(args) -> int:
     pool = await create_pool()
-    async with pool.acquire() as conn:
-        rows = await list_trades(conn, UUID(args.account) if args.account else None)
-    await pool.close()
+    try:
+        async with pool.acquire() as conn:
+            rows = await list_trades(conn, UUID(args.account) if args.account else None)
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
     for t in rows:
         print(
             f"{t['opened_at']:%Y-%m-%d}  {t['primary_underlying'] or '?':<8} "

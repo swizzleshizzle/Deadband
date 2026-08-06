@@ -354,8 +354,11 @@ def test_money_headers_without_a_space_before_the_paren_are_also_parsed():
     "Fees ($)". Normalisation must therefore be structural, not a lookup table of
     the two spellings that happen to have been observed."""
     result = FidelityImporter().parse(_with_currency_suffixed_headers(FIXTURE, "($)"))
+    baseline = batch()
     assert result.fills[0].price == Decimal("500.00")
-    assert [c.amount for c in result.cash] == [c.amount for c in batch().cash]
+    assert [f.fee for f in result.fills] == [f.fee for f in baseline.fills]
+    assert any(f.fee > 0 for f in result.fills)
+    assert [c.amount for c in result.cash] == [c.amount for c in baseline.cash]
 
 
 def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
