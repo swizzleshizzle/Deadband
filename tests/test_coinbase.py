@@ -361,3 +361,89 @@ def test_an_unrecognised_transaction_type_with_no_quantity_only_warns():
     result = CoinbaseImporter().parse(row)
     assert len(result.unmapped_rows) == 1
     assert result.blocking == ()
+
+
+# --- I4 residual: matched-but-bad-data rows still only warned, never --------
+# --- blocked. `blocking` was populated ONLY by the "unhandled transaction ---
+# --- type" branch; the matched-but-garbled-money paths -- non-finite -------
+# --- quantity/price/fee, non-positive quantity in the fill branch, and -----
+# --- non-finite amount in the cash branch -- appended to `unmapped` and ----
+# --- `warnings` directly and never consulted `blocking` at all. A row that -
+# --- DID match a rule (Buy/Sell/Deposit/...) but carried a garbled or -------
+# --- negative quantity/price/fee/amount therefore dropped a real dollar ----
+# --- figure with only a warning nobody has to read, and --commit proceeded -
+# --- with rc=0. This is the exact defect shape already closed for Fidelity -
+# --- (finding I3) -- see importers/fidelity.py's reject().
+
+
+def test_reviewer_demonstration_row_negative_quantity_with_real_total_blocks():
+    """The reviewer's exact demonstration row: a Buy with a negative quantity
+    and a real $30,000 total. Before the fix this fell into the
+    non-positive-quantity branch, which appended to unmapped/warnings but
+    never to blocking -- the $30,000 fill vanished with a warning nobody has
+    to read, and the import reported success."""
+    header = FIXTURE.splitlines()[0]
+    row = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,-0.50000000,USD,60000.00,30000.00,30000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "a negative-quantity row carrying a real total must block"
+
+
+def test_non_finite_quantity_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,Infinity,USD,61200.00,30600.00,30753.00,153.00,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite quantity carrying a real total must block"
+
+
+def test_non_finite_price_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,Infinity,30600.00,30753.00,153.00,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite price on a real-quantity row must block"
+
+
+def test_non_finite_fee_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,61200.00,30600.00,30753.00,Infinity,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite fee on a real-quantity row must block"
+
+
+def test_non_finite_cash_amount_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-02-10T00:00:00Z,Deposit,USD,Infinity,USD,1.00,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.cash == ()
+    assert result.blocking, "a non-finite cash amount must block"
+
+
+def test_no_money_unmapped_row_still_warns_without_blocking():
+    """A blank-quantity, blank-subtotal, blank-total unrecognised row has no
+    financial content -- it must still be reported as unmapped (with a
+    warning) but must NOT block, otherwise the fix would make a
+    legitimately-unmappable row (a report footer, a currency-neutral no-op)
+    refuse every import forever -- exactly the trap the Fidelity policy was
+    carefully designed to avoid."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-03-15T16:45:00Z,Stake,BTC,,USD,70000.00,,,0.00,x\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert any("unhandled transaction type" in w for w in result.warnings)
+    assert result.blocking == ()

@@ -37,6 +37,34 @@ def _decimal(raw: str) -> Decimal:
     return Decimal((raw or "0").replace("$", "").replace(",", "").strip() or "0")
 
 
+def _carries_money(raw: str | None) -> bool:
+    """True if a raw quantity/subtotal/total field is non-zero -- or is
+    present but unparseable, which must be treated as "might carry money"
+    rather than silently read as empty. Mirrors importers/fidelity.py's twin:
+    blocking on a false positive costs a human a glance; failing closed on a
+    garbled money field is exactly the silent-loss failure mode this whole
+    task exists to close."""
+    try:
+        return _decimal(raw) != 0
+    except InvalidOperation:
+        return True
+
+
+def _row_carries_money(row: dict[str, str]) -> bool:
+    """Coinbase's notion of "carries money" is its own, unlike Fidelity's
+    single Amount column: a row carries money if it has a non-zero Quantity
+    Transacted OR a non-zero Subtotal/Total, judged on the RAW strings
+    before conversion. Subtotal/Total matter independently of Quantity
+    Transacted because a cash-shaped row's dollar figure can live there even
+    when quantity itself is what's garbled (or vice versa for a fill-shaped
+    row)."""
+    return (
+        _carries_money(row.get("Quantity Transacted"))
+        or _carries_money(row.get("Subtotal"))
+        or _carries_money(row.get("Total (inclusive of fees and/or spread)"))
+    )
+
+
 class CoinbaseImporter:
     venue = "coinbase"
 
@@ -47,15 +75,37 @@ class CoinbaseImporter:
         unmapped: list[str] = []
         # I4: the money-carrying-unmapped-row blocking policy (see
         # importers/fidelity.py and ImportBatch.blocking's docstring) is
-        # venue-neutral in the spec -- the plan narrowed it to Fidelity only,
-        # so this venue never populated `blocking` at all, and an
-        # unrecognised transaction type carrying real money (the shipped
-        # fixture's own "Convert" row, for instance) never refused a commit.
+        # venue-neutral in the spec. It was first wired up here for ONLY the
+        # "unhandled transaction type" branch -- but that left every
+        # matched-but-bad-data path (top-level parse failure, non-finite
+        # quantity/price/fee, non-positive quantity in the fill branch,
+        # non-finite amount in the cash branch) still appending to
+        # `unmapped`/`warnings` directly and never to `blocking`. A row that
+        # DID match a rule (Buy/Sell/Deposit/...) but carried a garbled or
+        # negative quantity/price/fee/amount therefore dropped a real dollar
+        # figure with only a warning nobody has to read, while --commit
+        # proceeded with rc=0 -- the exact asymmetry already closed for
+        # Fidelity (finding I3). `reject()` below is the one path every
+        # unmapped branch now flows through, same shape as Fidelity's twin.
         # Each entry is (external_ref, message) for symmetry with Fidelity's
         # ImportBatch.blocking, even though this importer never populates a
         # row's external_ref at all (Coinbase's export carries no per-row
         # account number) -- every entry's ref is therefore always None.
         blocking: list[tuple[str | None, str]] = []
+
+        def reject(row: dict[str, str], line_no: int, message: str) -> None:
+            """ONE path for every row parse() drops as unmapped -- top-level
+            parse failure, non-finite quantity/price/fee, non-positive
+            quantity, non-finite cash amount, and "unhandled transaction
+            type" alike. See the `blocking` comment above for why routing
+            every such row through this one function (instead of only the
+            "no rule matched" branch consulting `_row_carries_money`) is
+            what stops the asymmetry from recurring the next time a new
+            guard is added."""
+            warnings.append(message)
+            unmapped.append(str(row))
+            if _row_carries_money(row):
+                blocking.append((None, message))
 
         # Strip UTF-8 BOM if present (common in Coinbase exports)
         text = text.lstrip("﻿")
@@ -77,8 +127,7 @@ class CoinbaseImporter:
                 price = _decimal(row.get("Spot Price at Transaction", ""))
                 fee = _decimal(row.get("Fees and/or Spread", ""))
             except (ValueError, InvalidOperation) as exc:
-                warnings.append(f"line {line_no}: could not parse row ({exc})")
-                unmapped.append(str(row))
+                reject(row, line_no, f"line {line_no}: could not parse row ({exc})")
                 continue
 
             if kind in _FILL_TYPES:
@@ -96,8 +145,7 @@ class CoinbaseImporter:
                 # Infinity, so a non-finite fee has no other guard anywhere on its
                 # way to the DB.
                 if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
-                    warnings.append(f"line {line_no}: non-finite number, skipped")
-                    unmapped.append(str(row))
+                    reject(row, line_no, f"line {line_no}: non-finite number, skipped")
                     continue
 
                 # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
@@ -111,8 +159,7 @@ class CoinbaseImporter:
                 # `<= 0`, not `== 0`. This ordering comparison is now safe because
                 # the finiteness check above already ran and skipped any NaN.
                 if quantity <= 0:
-                    warnings.append(f"line {line_no}: non-positive quantity, skipped")
-                    unmapped.append(str(row))
+                    reject(row, line_no, f"line {line_no}: non-positive quantity, skipped")
                     continue
 
                 # Same defect class as Fidelity's twin (see
@@ -154,8 +201,7 @@ class CoinbaseImporter:
                 # via multiplication) with nothing downstream to catch it —
                 # cash_movement.amount has no CHECK constraint at all.
                 if not amount.is_finite():
-                    warnings.append(f"line {line_no}: non-finite amount, skipped")
-                    unmapped.append(str(row))
+                    reject(row, line_no, f"line {line_no}: non-finite amount, skipped")
                     continue
                 # For non-fiat cash (e.g., rewards in ETH), warn if price is missing.
                 # This already explains a zero amount for that specific shape (no
@@ -190,18 +236,18 @@ class CoinbaseImporter:
                 )
             else:
                 # Never drop a row silently — an unrecognized type is a reporting gap.
-                msg = f"line {line_no}: unhandled transaction type {row.get('Transaction Type')!r}"
-                warnings.append(msg)
-                unmapped.append(str(row))
                 # Same reasoning as Fidelity's twin guard: blocking on every
                 # unrecognised type is unworkable (the venue's type
                 # vocabulary is open-ended), and blocking on none of them is
                 # exactly how the silent-loss defect this task exists to
-                # close looked like success. Only a row that ALSO carries
-                # money (a non-zero Quantity Transacted, already parsed
-                # above for every row) refuses the commit.
-                if quantity != 0:
-                    blocking.append((None, msg))
+                # close looked like success. reject() only escalates to
+                # blocking when the row ALSO carries money (see
+                # _row_carries_money).
+                reject(
+                    row,
+                    line_no,
+                    f"line {line_no}: unhandled transaction type {row.get('Transaction Type')!r}",
+                )
 
         return ImportBatch(
             fills=tuple(fills),
