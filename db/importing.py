@@ -152,6 +152,7 @@ async def commit_batch(
                 venue_fill_id=cf.venue_fill_id,
                 content_hash=fill_hash,
                 is_estimated=False,
+                funding_source=cf.funding_source,
             )
         )
 

@@ -83,6 +83,10 @@ class Fill:
     is_estimated: bool
     venue_order_id: str | None = None
     content_hash: str | None = None
+    # 'external' = the user's own capital. 'reinvestment' = bought with a
+    # distribution the position itself produced. Mirrors
+    # CanonicalFill.funding_source; constrained by fill_funding_source_chk.
+    funding_source: str = "external"
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:

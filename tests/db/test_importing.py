@@ -455,6 +455,57 @@ async def test_coinbase_import_with_a_negative_quantity_row_commits_the_good_row
     assert await _fill_count(conn, acc) == 2
 
 
+# --- Task 1: funding_source round-trips through the database ---------------
+
+
+def _fill(*, symbol: str, funding_source: str | None = None) -> CanonicalFill:
+    """Local helper mirroring the shape batch_of()/the other tests build inline
+    (equity Instrument + a fixed executed_at/side/qty/price shape), with
+    funding_source only passed through when the caller wants a non-default
+    value — so omitting it exercises CanonicalFill's own default."""
+    kwargs = dict(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"
+        ),
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("10"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+    )
+    if funding_source is not None:
+        kwargs["funding_source"] = funding_source
+    return CanonicalFill(**kwargs)
+
+
+async def test_funding_source_round_trips_through_commit(conn):
+    """A reinvestment-funded fill must persist as such. Without this the column
+    exists but nothing can ever set it, and contributed_capital cannot be
+    distinguished from cost basis."""
+    account_id = await create_account(
+        conn, name="t", venue="coinbase", account_type="cash"
+    )
+    batch = ImportBatch(
+        fills=(
+            _fill(symbol="AAA", funding_source="reinvestment"),
+            _fill(symbol="BBB"),  # defaults to external
+        )
+    )
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    rows = await conn.fetch(
+        """SELECT i.symbol, f.funding_source
+             FROM fill f JOIN instrument i ON i.id = f.instrument_id
+            WHERE f.account_id = $1 ORDER BY i.symbol""",
+        account_id,
+    )
+    assert [(r["symbol"], r["funding_source"]) for r in rows] == [
+        ("AAA", "reinvestment"),
+        ("BBB", "external"),
+    ]
+
+
 async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
     """A row carrying its own venue_fill_id dedupes on that id alone and must
     not also consume an occurrence slot in the shared counter — if it did, a

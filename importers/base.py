@@ -106,6 +106,11 @@ class CanonicalFill:
     venue_fill_id: str | None = None
     venue_order_id: str | None = None
     external_ref: str | None = None  # venue's account number, for routing
+    # 'external' = the user's own capital. 'reinvestment' = bought with a
+    # distribution the position itself produced. Both carry real cost basis;
+    # the distinction exists so contributed_capital can exclude reinvestment
+    # while cost_basis stays tax-correct. Constrained by fill_funding_source_chk.
+    funding_source: str = "external"
 
 
 @dataclass(frozen=True, slots=True)

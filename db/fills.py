@@ -27,8 +27,8 @@ async def insert_fills(conn: asyncpg.Connection, fills: list[Fill]) -> InsertRes
             INSERT INTO fill (
                 id, account_id, instrument_id, executed_at, side, quantity, price,
                 fee, fee_currency, source, venue_order_id, venue_fill_id,
-                content_hash, is_estimated
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                content_hash, is_estimated, funding_source
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             ON CONFLICT DO NOTHING
             RETURNING id
             """,
@@ -46,6 +46,7 @@ async def insert_fills(conn: asyncpg.Connection, fills: list[Fill]) -> InsertRes
             f.venue_fill_id,
             f.content_hash,
             f.is_estimated,
+            f.funding_source,
         )
         if row is not None:
             inserted += 1
@@ -68,6 +69,7 @@ def _to_fill(r: asyncpg.Record) -> Fill:
         venue_fill_id=r["venue_fill_id"],
         content_hash=r["content_hash"],
         is_estimated=r["is_estimated"],
+        funding_source=r["funding_source"],
     )
 
 
