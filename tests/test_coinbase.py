@@ -299,3 +299,22 @@ def test_the_zero_price_guard_covers_coinbase_too():
     """Same defect class, same guard. Coinbase was never audited for it."""
     result = CoinbaseImporter().parse(_coinbase_row_with_zero_price())
     assert any("zero price" in w.lower() for w in result.warnings)
+
+
+# --- C2: cash rows had no zero-amount guard ---------------------------------
+#
+# Coinbase's cash branch computes `amount` from Quantity Transacted (and,
+# for non-fiat cash, Spot Price) with no equivalent of the fill branch's
+# zero_price_warning. A blank/zero Quantity Transacted on a deposit-shaped
+# row silently produces a $0.00 cash_movement with no warning at all --
+# unlike the fill branch, which at least gets a "non-positive quantity"
+# warning (and drops the row) for the same input shape.
+
+
+def test_a_zero_quantity_deposit_produces_a_zero_amount_warning():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-02-10T00:00:00Z,Deposit,USD,0,USD,1.00,0,0,0,blank deposit\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.cash) == 1
+    assert result.cash[0].amount == Decimal("0")
+    assert any("zero amount" in w.lower() for w in result.warnings)

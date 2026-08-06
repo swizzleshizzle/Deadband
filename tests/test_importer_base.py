@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from importers.base import content_hash
+from importers.base import content_hash, zero_amount_warning
 from importers.registry import get_importer, list_importers
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
@@ -139,3 +139,17 @@ def test_registry_rejects_unknown_venue():
 
 def test_registry_lists_available_importers():
     assert set(list_importers()) >= {"coinbase", "fidelity"}
+
+
+# --- C2: cash rows had no zero-amount guard ---------------------------------
+
+
+def test_zero_amount_warning_fires_on_a_zero_amount_cash_movement():
+    warn = zero_amount_warning(7, "dividend", Decimal("0"))
+    assert warn is not None
+    assert "line 7" in warn
+    assert "dividend" in warn
+
+
+def test_zero_amount_warning_is_silent_on_a_real_amount():
+    assert zero_amount_warning(7, "dividend", Decimal("42.15")) is None

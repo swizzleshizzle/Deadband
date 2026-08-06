@@ -214,29 +214,42 @@ async def cmd_import(args) -> int:
         )
         return 2
 
-    # Same "refuse the whole batch, write nothing" shape as the unknown-ref
-    # refusal below, but decided purely from the parsed file -- no database
-    # involved -- so it's checked before the pool is ever opened, same as the
-    # unrouted-rows check above. See ImportBatch.blocking's docstring for why
-    # this is neither "block on every unmapped row" nor "block on none": an
-    # unmapped row that also carries money (a non-zero quantity or amount)
-    # is exactly the shape of the defect that motivated this whole task --
-    # committing everything else and silently dropping that row's money would
-    # look like a successful import.
-    if batch.blocking:
-        print(
-            "error: refusing to commit -- unmapped row(s) carry money and no "
-            "rule matched them:",
-            file=sys.stderr,
-        )
-        for reason in batch.blocking:
-            print(f"  {reason}", file=sys.stderr)
-        return 2
-
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
             plan = await route_batch(conn, importer.venue, batch)
+
+            # Same "refuse the whole batch, write nothing" shape as the
+            # unknown-ref refusal below. See ImportBatch.blocking's
+            # docstring for why this is neither "block on every unmapped
+            # row" nor "block on none": an unmapped row that also carries
+            # money (a non-zero quantity or amount) is exactly the shape of
+            # the defect that motivated this whole task -- committing
+            # everything else and silently dropping that row's money would
+            # look like a successful import.
+            #
+            # C1: this check must run AFTER route_batch, not before, and
+            # must drop any reason whose row belongs to an account
+            # registered ignore_on_import (plan.ignored_refs) -- otherwise a
+            # money-carrying unmapped row on an account the user has
+            # explicitly said to skip (e.g. a retirement plan with no
+            # instrument identity) refuses the ENTIRE import, permanently,
+            # with no escape. route_batch issues only SELECTs, so this still
+            # returns before `async with conn.transaction():` below --
+            # "refuses and writes nothing" is preserved.
+            effective_blocking = [
+                (ref, msg) for ref, msg in batch.blocking if ref not in plan.ignored_refs
+            ]
+            if effective_blocking:
+                print(
+                    "error: refusing to commit -- unmapped row(s) carry money and no "
+                    "rule matched them:",
+                    file=sys.stderr,
+                )
+                for _ref, msg in effective_blocking:
+                    print(f"  {msg}", file=sys.stderr)
+                return 2
+
             targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
             if unrouted.fills or unrouted.cash:

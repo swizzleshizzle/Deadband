@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch, zero_price_warning
+from importers.base import (
+    CanonicalCash,
+    CanonicalFill,
+    ImportBatch,
+    zero_amount_warning,
+    zero_price_warning,
+)
 from ledger.types import AssetClass, Instrument, Side
 
 # -SPY260919C500  →  underlying SPY, 2026-09-19, call, strike 500
@@ -247,8 +253,38 @@ class FidelityImporter:
         unmapped: list[str] = []
         # Reasons the whole batch must refuse to commit -- see
         # ImportBatch.blocking's docstring for why this is narrower than
-        # "every unmapped row" and wider than "none of them".
-        blocking: list[str] = []
+        # "every unmapped row" and wider than "none of them". Each entry is
+        # (account, message) -- attributed to the row's own account so a
+        # caller can drop reasons belonging to an ignore_on_import account
+        # (see ImportBatch.blocking's docstring) without dropping every
+        # reason in the file.
+        blocking: list[tuple[str | None, str]] = []
+
+        def reject(
+            row: dict[str, str],
+            raw_row: dict[str, str],
+            account: str | None,
+            line_no: int,
+            message: str,
+        ) -> None:
+            """ONE path for every row parse() or build_fill drops as
+            unmapped -- bad number, zero quantity, non-finite quantity/price/
+            fee, bad amount, non-finite amount, and "no rule matched" alike.
+            Before this existed, only the "no rule matched" branch consulted
+            _carries_money; the other five (build_fill's InvalidOperation/
+            zero-quantity/non-finite paths, and the cash branch's
+            InvalidOperation/non-finite-amount paths) appended to `unmapped`
+            and `warnings` directly and never to `blocking` -- so a row that
+            DID match a rule but carried a garbled quantity or amount failed
+            open exactly the way an unmatched row used to, before Task 5.
+            Routing every such row through this one function is what stops
+            that asymmetry from recurring the next time a new guard is added.
+            """
+            warnings.append(message)
+            unmapped.append(str(raw_row))
+            if _carries_money(row.get("quantity")) or _carries_money(row.get("amount")):
+                blocking.append((account, message))
+
         # Every account ref seen in the raw rows, independent of whether the
         # row went on to become a fill/cash movement or fell out as
         # unmapped -- see ImportBatch.refs_seen's docstring for why this
@@ -274,13 +310,11 @@ class FidelityImporter:
                 price = _decimal(row.get("price"))
                 fee = _decimal(row.get("commission")) + _decimal(row.get("fees"))
             except InvalidOperation as exc:
-                warnings.append(f"line {line_no}: bad number ({exc})")
-                unmapped.append(str(raw_row))
+                reject(row, raw_row, account, line_no, f"line {line_no}: bad number ({exc})")
                 return
 
             if raw_qty == 0:
-                warnings.append(f"line {line_no}: zero quantity, skipped")
-                unmapped.append(str(raw_row))
+                reject(row, raw_row, account, line_no, f"line {line_no}: zero quantity, skipped")
                 return
 
             # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they are
@@ -290,8 +324,9 @@ class FidelityImporter:
             # fee is included too: Fill.__post_init__ never validates fee, and
             # Postgres NUMERIC (PG14+) accepts Infinity, so nothing else catches it.
             if not raw_qty.is_finite() or not price.is_finite() or not fee.is_finite():
-                warnings.append(f"line {line_no}: non-finite number, skipped")
-                unmapped.append(str(raw_row))
+                reject(
+                    row, raw_row, account, line_no, f"line {line_no}: non-finite number, skipped"
+                )
                 return
 
             # Real quantity at zero price is almost always a parse failure
@@ -399,9 +434,6 @@ class FidelityImporter:
 
             rule = classify(action, symbol)
             if rule is None:
-                msg = f"line {line_no}: unhandled action {action!r}"
-                warnings.append(msg)
-                unmapped.append(str(raw_row))
                 # A row the classifier doesn't recognise is guaranteed --
                 # the venue's action vocabulary is open-ended, and a real
                 # export's trailing legal disclaimer is permanently unmapped
@@ -409,9 +441,17 @@ class FidelityImporter:
                 # blocking on none of them is exactly how the silent-zero
                 # defect looked like success. So: only a row that ALSO
                 # carries money (a non-zero quantity or amount) refuses the
-                # commit -- one with no financial content only warns.
-                if _carries_money(row.get("quantity")) or _carries_money(row.get("amount")):
-                    blocking.append(msg)
+                # commit -- one with no financial content only warns. See
+                # reject()'s docstring for why this now shares one path with
+                # every other unmapped branch instead of being the only one
+                # that consulted _carries_money.
+                reject(
+                    row,
+                    raw_row,
+                    account,
+                    line_no,
+                    f"line {line_no}: unhandled action {action!r}",
+                )
                 continue
 
             if rule.outcome is Outcome.INTERNAL:
@@ -441,16 +481,16 @@ class FidelityImporter:
             try:
                 amount = _decimal(row.get("amount"))
             except InvalidOperation as exc:
-                warnings.append(f"line {line_no}: bad amount ({exc})")
-                unmapped.append(str(raw_row))
+                reject(row, raw_row, account, line_no, f"line {line_no}: bad amount ({exc})")
                 continue
             # Decimal("Infinity")/Decimal("NaN") are valid constructions and slip
             # past the `except InvalidOperation` above (same hazard as quantity/
             # price above); cash_movement.amount has no CHECK constraint to catch
             # one downstream.
             if not amount.is_finite():
-                warnings.append(f"line {line_no}: non-finite amount, skipped")
-                unmapped.append(str(raw_row))
+                reject(
+                    row, raw_row, account, line_no, f"line {line_no}: non-finite amount, skipped"
+                )
                 continue
             # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
             # always positive, direction lives in `kind` alone. Fidelity's raw
@@ -459,6 +499,15 @@ class FidelityImporter:
             # so this abs() is load-bearing here, unlike Coinbase's twin where
             # the raw export is already positive.
             amount = abs(amount)
+            # C2: cash rows had no equivalent of the fill branch's
+            # zero_price_warning -- a missing/misnamed Amount column
+            # silently produced a $0.00 cash movement with no warning at
+            # all. Warn, but still record it: suppressing it would trade one
+            # silent-loss failure mode for another, same reasoning as
+            # zero_price_warning on the fill side.
+            warn = zero_amount_warning(line_no, rule.cash_kind, amount)
+            if warn is not None:
+                warnings.append(warn)
             cash.append(
                 CanonicalCash(
                     occurred_at=when,

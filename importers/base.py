@@ -149,7 +149,16 @@ class ImportBatch:
     # belongs here -- a row with no financial content only warns. Empty means
     # "safe to commit," never "nothing was unmapped" (see unmapped_rows/
     # warnings for that).
-    blocking: tuple[str, ...] = ()
+    #
+    # Each entry is (external_ref, reason) -- the row's own account ref (or
+    # None for a venue that carries no per-row account, e.g. Coinbase), not
+    # just the message text. A blocking row belonging to an account the user
+    # has registered `ignore_on_import` (see db.accounts) must not refuse an
+    # import it was never going to be part of -- see cli.py's cmd_import,
+    # which drops any reason whose ref is in RoutingPlan.ignored_refs AFTER
+    # route_batch runs, rather than refusing on blocking unconditionally
+    # before an account's ignore status is even known.
+    blocking: tuple[tuple[str | None, str], ...] = ()
 
 
 def zero_price_warning(
@@ -174,6 +183,30 @@ def zero_price_warning(
     """
     if quantity != 0 and price == 0:
         return f"line {line_no}: {symbol} has quantity {quantity} at zero price"
+    return None
+
+
+def zero_amount_warning(line_no: int, kind: str, amount: Decimal) -> str | None:
+    """A cash movement recorded at zero amount is almost always a parse
+    failure, not a genuine zero-dollar cash event.
+
+    zero_price_warning (above) covers FILLS -- a real quantity priced at
+    zero. It was shared across venues but never across row KINDS: cash
+    movements (dividends, interest, transfers, fees, ...) are built from
+    their own `_decimal(...)` call in both importers, with no equivalent
+    check. Renaming the fixture's Amount column to something the importer's
+    bare header lookup misses reproduces the exact same silent-zero defect
+    zero_price_warning exists to catch, on the larger half of the rows: a
+    fully "successful" parse in which every cash figure is $0.00 and nothing
+    says so.
+
+    Shared by every importer building a cash movement (see
+    importers/fidelity.py and importers/coinbase.py), same rationale as
+    zero_price_warning: the guard can never drift between venues, and a
+    venue added later gets it by construction.
+    """
+    if amount == 0:
+        return f"line {line_no}: {kind} cash movement has zero amount"
     return None
 
 

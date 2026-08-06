@@ -580,6 +580,53 @@ async def test_cmd_accounts_add_ignore_on_import_flag_creates_a_skippable_accoun
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id) == 0
 
 
+# --- C1: ignore_on_import must be an escape hatch from blocking, not just ---
+# --- from routing. blocking used to be checked BEFORE route_batch ever ran,
+# --- and carried no account attribution at all -- so a money-carrying
+# --- unmapped row belonging to an ignore_on_import account refused the
+# --- ENTIRE import, permanently, exactly the retirement-plan scenario the
+# --- flag exists to escape.
+
+
+async def test_ignored_accounts_money_carrying_unmapped_rows_do_not_block_the_import(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The plan account's only row is an unrecognised action carrying money
+    (a non-zero Amount) -- before the fix this refused the whole commit even
+    though the account is registered ignore_on_import. Its row also
+    contributes NOTHING to fills/cash (every action on it is unrecognised),
+    so its ref never reaches route_batch through fills/cash at all -- this
+    only passes if blocking's own ref is also considered when deciding
+    ignored/unknown/routable, not just fills/cash refs."""
+    active = await create_account(
+        conn, name="active", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000003,MYSTERIOUS PLAN ACTION,,DESC,,,,,123.45",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0, capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", active) == 1
+
+
 # --- Task 6: --check-duplicates is an explicit, opt-in probe on the preview --
 # --- path. Preview's structural no-connection guarantee is proven separately
 # --- in tests/test_cli.py's test_preview_import_never_opens_a_database_

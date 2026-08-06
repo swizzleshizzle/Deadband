@@ -7,7 +7,13 @@ import io
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch, zero_price_warning
+from importers.base import (
+    CanonicalCash,
+    CanonicalFill,
+    ImportBatch,
+    zero_amount_warning,
+    zero_price_warning,
+)
 from ledger.types import AssetClass, Instrument, Side
 
 _FILL_TYPES = {
@@ -140,12 +146,27 @@ class CoinbaseImporter:
                     warnings.append(f"line {line_no}: non-finite amount, skipped")
                     unmapped.append(str(row))
                     continue
-                # For non-fiat cash (e.g., rewards in ETH), warn if price is missing
+                # For non-fiat cash (e.g., rewards in ETH), warn if price is missing.
+                # This already explains a zero amount for that specific shape (no
+                # spot price to convert quantity into a dollar figure), so it takes
+                # priority over the generic zero_amount_warning below -- firing
+                # both would double-warn the same row for the same underlying
+                # cause.
                 if asset != currency and price == 0:
                     warnings.append(
                         f"line {line_no}: {row.get('Transaction Type')!r} in {asset} has no "
                         "spot price; amount recorded as 0 and needs manual valuation"
                     )
+                else:
+                    # C2: cash rows had no equivalent of the fill branch's
+                    # zero_price_warning -- a zero/blank Quantity Transacted on a
+                    # cash-shaped row (e.g. a deposit) silently produced a $0.00
+                    # cash movement with no warning at all. Warn, but still
+                    # record it -- same reasoning as zero_price_warning on the
+                    # fill side.
+                    warn = zero_amount_warning(line_no, _CASH_TYPES[kind], amount)
+                    if warn is not None:
+                        warnings.append(warn)
                 cash.append(
                     CanonicalCash(
                         occurred_at=when,

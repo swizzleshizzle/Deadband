@@ -135,9 +135,20 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
     a None ref to that lookup in the first place, and never treating an
     account row with a NULL external_ref as a match for one.
     """
+    # C1: refs must also be drawn from batch.blocking, not only fills/cash.
+    # An account whose rows are ENTIRELY blocking (e.g. a retirement plan
+    # with no instrument identity -- zero symbols, zero prices, every row
+    # unmapped but money-carrying) contributes nothing to fills or cash, so
+    # its ref would otherwise never reach this query at all -- meaning it
+    # could never be recognised as ignore_on_import here, and the caller's
+    # "drop blocking reasons whose ref is ignored" check (see cli.py) would
+    # have nothing to drop against. Rows this pulls in that have no other
+    # fills/cash of their own simply route to an empty ImportBatch below,
+    # which is harmless.
     refs = sorted(
         {f.external_ref for f in batch.fills if f.external_ref is not None}
         | {c.external_ref for c in batch.cash if c.external_ref is not None}
+        | {ref for ref, _msg in batch.blocking if ref is not None}
     )
 
     unknown_refs: list[str] = []

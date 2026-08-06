@@ -671,7 +671,11 @@ def test_an_unmapped_row_carrying_money_blocks_the_commit():
     row = header + "\n06/01/2026,X1,MYSTERIOUS NEW ACTION,AAA,DESC,,,,,123.45\n"
     result = FidelityImporter().parse(row)
     assert result.blocking, "a money-carrying unmapped row must block"
-    assert any("MYSTERIOUS" in b for b in result.blocking)
+    # C1: each blocking reason is (external_ref, message) -- attributed to
+    # the row's own account so a caller can drop reasons belonging to an
+    # account registered ignore_on_import, without dropping every reason.
+    assert any(ref == "X1" for ref, _msg in result.blocking)
+    assert any("MYSTERIOUS" in msg for _ref, msg in result.blocking)
 
 
 def test_an_unmapped_row_with_no_financial_content_only_warns():
@@ -708,3 +712,29 @@ def test_a_fill_shaped_row_with_a_zero_price_is_reported():
     row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,DESC,10,0.00,0.00,0.00,0.00\n"
     result = FidelityImporter().parse(row)
     assert any("zero price" in w.lower() for w in result.warnings)
+
+
+# --- C2: cash rows had no zero-amount guard ---------------------------------
+#
+# zero_price_warning was shared across VENUES but never across ROW KINDS.
+# Renaming the fixture's Amount column reproduces the exact silent-zero
+# defect that motivated the whole task, on the cash side: a fully
+# "successful" parse in which every cash figure is silently $0.00.
+
+
+def test_renaming_the_amount_column_zeroes_every_cash_movement_with_a_warning():
+    """Demonstrated bug: rename FIXTURE's Amount column to Net Amount and
+    every cash row's amount silently resolves to Decimal('0') via
+    _decimal(None) -- no warning, dates/actions/symbols all correct. Fails
+    (no "zero amount" warning present) without the guard."""
+    header = FIXTURE.splitlines()[0].replace("Amount", "Net Amount")
+    body = "\n".join(FIXTURE.splitlines()[1:])
+    result = FidelityImporter().parse(header + "\n" + body + "\n")
+
+    baseline = batch()
+    assert len(result.cash) == len(baseline.cash) == 2
+    # Guard the guard: the renamed column really did zero every cash amount.
+    assert all(c.amount == Decimal("0") for c in result.cash)
+
+    zero_amount_warnings = [w for w in result.warnings if "zero amount" in w.lower()]
+    assert len(zero_amount_warnings) == len(result.cash)
