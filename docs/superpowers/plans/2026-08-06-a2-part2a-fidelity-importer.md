@@ -141,7 +141,7 @@ def test_reinvestment_of_a_real_security_is_a_fill():
 def test_reinvestment_of_a_sweep_fund_is_internal_not_cash():
     """The sweep IS cash under A2-9, so the dividend leg already recorded this
     money. Recording the reinvestment leg too would count it twice."""
-    rule = classify("REINVESTMENT MONEY MARKET (SWEEPX) (CASH)", "SWEEPX")
+    rule = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
     assert rule is not None
     assert rule.outcome is Outcome.INTERNAL
 
@@ -150,7 +150,7 @@ def test_the_same_action_verb_resolves_differently_by_symbol():
     """The whole reason the table is keyed on action AND symbol. An action-only
     table cannot express this, so this test fails against any such design."""
     security = classify("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA")
-    sweep = classify("REINVESTMENT MONEY MARKET (SWEEPX) (CASH)", "SWEEPX")
+    sweep = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
     assert security.outcome is not sweep.outcome
 
 
@@ -201,9 +201,16 @@ and the tests that pin the design choice:
 # Membership is DATA, not logic, so it can be reviewed at a glance. Identified
 # explicitly rather than by `price == 1.00`: a real security can trade at
 # exactly a dollar, and that heuristic would silently convert a genuine
-# position into cash. Substitute the venue's real money-market and
-# FDIC-deposit sweep tickers at implementation time.
-SWEEP_SYMBOLS: frozenset[str] = frozenset({"SWEEPX"})
+# position into cash.
+#
+# Use the venue's PUBLISHED sweep vehicles -- the full documented list, not
+# only the ones this user happens to hold. A sweep ticker is product
+# infrastructure attached to essentially every account at the venue, so the
+# complete list discloses nothing about anyone's holdings, and completeness is
+# what keeps a sweep from being misclassified as a position.
+SWEEP_SYMBOLS: frozenset[str] = frozenset({
+    "SPAXX", "FDRXX", "FZFXX", "SPRXX", "FDLXX", "QPIHQ",
+})
 
 
 def is_sweep(symbol: str | None) -> bool:
@@ -321,8 +328,8 @@ Task 2 introduced `SWEEP_SYMBOLS` and `is_sweep` because `classify` could not be
 
 ```python
 def test_a_sweep_symbol_is_recognised():
-    assert is_sweep("SWEEPX") is True
-    assert is_sweep("sweepx") is True   # case-insensitive
+    assert is_sweep("SPAXX") is True
+    assert is_sweep("spaxx") is True   # case-insensitive
 
 
 def test_a_real_security_is_not_a_sweep():
@@ -347,9 +354,9 @@ def test_a_sweep_symbol_priced_far_from_par_warns():
     set has acquired a non-sweep symbol or a sweep has broken the buck -- both
     need a human, and neither should pass unremarked."""
     header = FIXTURE.splitlines()[0]
-    row = header + "\n06/01/2026,X1,REINVESTMENT MM (SWEEPX) (CASH),SWEEPX,MM,10,1.40,0.00,0.00,-14.00\n"
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
     result = FidelityImporter().parse(row)
-    assert any("sweep" in w.lower() and "SWEEPX" in w for w in result.warnings)
+    assert any("sweep" in w.lower() and "SPAXX" in w for w in result.warnings)
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -683,7 +690,7 @@ load-bearing and stays intact unless asked otherwise."
 
 Deferred to **part 2b**: the Coinbase Advanced Trade API source and its cut-over (A2-16), the `positions` CLI command (gap #12), and the residual A-1 gaps — `upsert_instrument` repaint, self-referential corporate-action validation, the `content_hash` side-escaping test, the spinoff-child dedupe test, and §9's property test.
 
-**Placeholder scan.** No TBDs. `SWEEP_SYMBOLS` ships with a placeholder ticker and an explicit instruction to substitute the venue's real ones at implementation — deliberate, because real tickers are holdings data and must not enter this public repository from a plan document.
+**Placeholder scan.** No TBDs. `SWEEP_SYMBOLS` carries the venue's published sweep vehicles rather than a placeholder. A pre-flight scan caught the original approach: the first cut of the repository deny-list denied sweep tickers alongside genuine holdings, which would have made the pre-commit hook block the importer's own source file. The deny-list now distinguishes instruments the user *chose to invest in* (denied) from instruments the venue uses as *cash infrastructure* (allowed, and nameable in tracked code).
 
 **Type consistency.** `funding_source` is named identically in `CanonicalFill` (Task 1), the rule table (Task 2), and the existing `fill_funding_source_chk` constraint. `Outcome`/`Rule`/`RULES`/`classify` are defined in Task 2 and used in Tasks 3 and 5.
 
