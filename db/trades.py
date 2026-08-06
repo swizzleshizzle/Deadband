@@ -112,8 +112,9 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 INSERT INTO trade (
                     account_id, opening_fill_id, primary_underlying, direction, status,
                     intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
-                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total
-                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
+                    fees_realized, open_quantity, open_cost_basis
+                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 ON CONFLICT (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL
                 DO UPDATE SET
                     primary_underlying = EXCLUDED.primary_underlying,
@@ -128,6 +129,9 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                     realized_pnl       = EXCLUDED.realized_pnl,
                     gross_realized_pnl = EXCLUDED.gross_realized_pnl,
                     fees_total         = EXCLUDED.fees_total,
+                    fees_realized      = EXCLUDED.fees_realized,
+                    open_quantity      = EXCLUDED.open_quantity,
+                    open_cost_basis    = EXCLUDED.open_cost_basis,
                     updated_at         = now()
                 RETURNING id
                 """,
@@ -146,6 +150,9 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 pnl.realized_pnl,
                 pnl.gross_realized_pnl,
                 pnl.fees_total,
+                pnl.fees_realized,
+                pnl.open_quantity,
+                pnl.open_cost_basis,
             )
 
             # r_multiple depends on planned_risk, which is user-authored — recompute
@@ -199,7 +206,9 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                qty_opened = NULL, qty_closed = NULL,
                avg_entry = NULL, avg_exit = NULL,
                realized_pnl = NULL, gross_realized_pnl = NULL,
-               fees_total = NULL, r_multiple = NULL
+               fees_total = NULL, fees_realized = NULL,
+               open_quantity = NULL, open_cost_basis = NULL,
+               r_multiple = NULL
          WHERE account_id = $1
            AND grouping_mode = 'auto'
            AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))

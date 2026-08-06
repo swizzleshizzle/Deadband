@@ -648,6 +648,9 @@ async def test_protected_trade_contributes_no_pnl(conn):
     assert protected["avg_entry"] is None
     assert protected["avg_exit"] is None
     assert protected["fees_total"] is None
+    assert protected["fees_realized"] is None
+    assert protected["open_quantity"] is None
+    assert protected["open_cost_basis"] is None
     assert protected["r_multiple"] is None
 
     # The surviving fill (the SELL) forms a brand-new open short with no
@@ -782,6 +785,124 @@ async def test_partial_manual_allocation_leaves_the_remainder_groupable(conn):
         "SELECT sum(quantity) FROM trade_fill WHERE fill_id = $1", buy.id
     )
     assert total_allocated == Decimal("5")
+
+
+# --- Task 5: persist open_quantity, open_cost_basis, fees_realized ---------
+
+
+async def test_regroup_persists_derived_pnl_columns(conn):
+    """unrealized_pnl() must be able to read its inputs from the database
+    without re-running the grouper. Asserts on values, not on non-NULL --
+    a column written as 0 would satisfy a NOT NULL check and still be wrong."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("4"),
+                price=Decimal("100"),
+                fee=Decimal("8"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("1"),
+                price=Decimal("120"),
+                fee=Decimal("2"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    row = await conn.fetchrow(
+        """SELECT open_quantity, open_cost_basis, fees_realized, realized_pnl,
+                  gross_realized_pnl
+             FROM trade WHERE account_id = $1""",
+        acc,
+    )
+    assert row["open_quantity"] == Decimal("3")
+    assert row["open_cost_basis"] == Decimal("102")        # 100 + 8/4
+    assert row["fees_realized"] == Decimal("4")            # 2 exit + 8 * 1/4
+    assert row["realized_pnl"] == row["gross_realized_pnl"] - row["fees_realized"]
+
+
+async def test_regroup_persists_derived_pnl_columns_for_short(conn):
+    """SHORT open_cost_basis carries the entry fee SUBTRACTED (net sale
+    proceeds), not added -- the opposite sign from the LONG case above. The
+    round-trip through the database is what's under test: a sign flip in
+    persistence would not be caught by a long-only test."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.SELL,
+                quantity=Decimal("4"),
+                price=Decimal("100"),
+                fee=Decimal("8"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("80"),
+                fee=Decimal("2"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    row = await conn.fetchrow(
+        """SELECT open_quantity, open_cost_basis, fees_realized, realized_pnl,
+                  gross_realized_pnl
+             FROM trade WHERE account_id = $1""",
+        acc,
+    )
+    assert row["open_quantity"] == Decimal("3")
+    assert row["open_cost_basis"] == Decimal("98")         # 100 - 8/4 (subtracted for SHORT)
+    assert row["fees_realized"] == Decimal("4")             # 2 exit + 8 * 1/4
+    assert row["realized_pnl"] == row["gross_realized_pnl"] - row["fees_realized"]
 
 
 # --- Item 7: an unknown account_id used to reach TradeIntent(None) ----------
