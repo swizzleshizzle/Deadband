@@ -460,3 +460,73 @@ def test_every_rule_is_reachable():
     an ordering bug."""
     matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
     assert matched == {r.name for r in RULES}
+
+
+# --- Fix round 1, item 1: end-to-end tests pinning the double-counting ------
+# --- invariant. Every classify()-level test above inspects the Rule object -
+# --- returned by classify() alone; none of them parses a CSV, so the wiring
+# --- between the rule table and parse() -- the thing that actually prevents
+# --- the double count -- was unpinned. A mutant that guts the INTERNAL branch
+# --- in parse() (while leaving RULES and classify() untouched) passed the
+# --- whole suite green and silently doubled every sweep dividend.
+
+
+def test_sweep_dividend_and_its_reinvestment_produce_exactly_one_cash_movement():
+    """The sweep IS cash (A2-9): a sweep dividend appears as two CSV rows (the
+    dividend, then its reinvestment back into the sweep), but that is ONE cash
+    event, not two. Fails if the INTERNAL branch in parse() is ever collapsed
+    into the cash path or reordered so the reinvestment leg gets recorded."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "04/01/2026,X1,DIVIDEND RECEIVED MONEY MARKET (SPAXX) (CASH),SPAXX,"
+            "FIDELITY GOVERNMENT MONEY MARKET,,,,,10.00",
+            "04/01/2026,X1,REINVESTMENT MONEY MARKET (SPAXX) (CASH),SPAXX,"
+            "FIDELITY GOVERNMENT MONEY MARKET,10,1.00,0.00,0.00,-10.00",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.cash) == 1
+    assert len(result.fills) == 0
+    assert result.cash[0].amount == Decimal("10.00")
+
+
+def test_real_security_dividend_and_its_reinvestment_produce_both_legs():
+    """The opposite case: a real security's dividend is cash in, and the DRIP
+    that follows is a genuine acquisition funded by that cash. Both legs must
+    record, or contributed_capital/cost_basis silently lose real data."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "04/01/2026,X1,DIVIDEND RECEIVED ACME CORP (AAA) (CASH),AAA,ACME CORP,,,,,5.00",
+            "04/01/2026,X1,REINVESTMENT ACME CORP (AAA) (CASH),AAA,"
+            "ACME CORP,0.5,10.00,0.00,0.00,-5.00",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.cash) == 1
+    assert len(result.fills) == 1
+    assert result.fills[0].funding_source == "reinvestment"
+
+
+# --- Fix round 1, item 2: the BOUGHT/SOLD branch must anchor on the leading -
+# --- "YOU BOUGHT"/"YOU SOLD" verb, not scan for the bare substring anywhere -
+# --- in the action. This task's entire premise is that the security NAME is
+# --- concatenated into the action field, so a name containing "SOLD" (e.g.
+# --- "SOLDIERS FIELD CAP") would otherwise hijack the row as a phantom sell.
+
+
+def test_action_containing_sold_inside_a_security_name_is_not_hijacked_as_a_sell():
+    header = FIXTURE.splitlines()[0]
+    bad_row = (
+        header
+        + "\n04/01/2026,X1,DIVIDEND RECEIVED SOLDIERS FIELD CAP (AAA) (CASH),AAA,"
+        "SOLDIERS FIELD CAP,,,,,7.50\n"
+    )
+    result = FidelityImporter().parse(bad_row)
+    assert result.fills == ()
+    assert len(result.cash) == 1
+    assert result.cash[0].kind == "dividend"
+    assert result.cash[0].amount == Decimal("7.50")

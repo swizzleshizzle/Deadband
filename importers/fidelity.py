@@ -281,7 +281,14 @@ class FidelityImporter:
             # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction
             # comes from the action text and the sign is corroboration, which
             # the rule table below does not (and should not) model.
-            if "BOUGHT" in action or "SOLD" in action:
+            #
+            # Anchored on the leading "YOU BOUGHT"/"YOU SOLD" verb via
+            # startswith, NOT a bare "BOUGHT"/"SOLD" substring scan. This
+            # task's whole premise is that the security NAME is concatenated
+            # into the same action field (see classify()) -- a bare substring
+            # scan would let a name like "SOLDIERS FIELD CAP" hijack a
+            # dividend row as a phantom sell.
+            if action.startswith("YOU BOUGHT") or action.startswith("YOU SOLD"):
                 build_fill(
                     row,
                     raw_row,
@@ -289,7 +296,7 @@ class FidelityImporter:
                     symbol,
                     when,
                     account,
-                    side=Side.SELL if "SOLD" in action else Side.BUY,
+                    side=Side.SELL if action.startswith("YOU SOLD") else Side.BUY,
                     funding_source="external",
                 )
                 continue
