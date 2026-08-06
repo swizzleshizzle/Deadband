@@ -439,6 +439,26 @@ Run: `uv run pytest tests/test_fidelity.py -v`
 
 Expected: all pass.
 
+- [ ] **Step 4b: Mutant-gate the design-pinning test**
+
+`test_a_real_security_at_a_dollar_is_still_imported_as_a_security` only has value if it
+fails against an implementation that classifies by price. Prove it does.
+
+> **Correction, made during execution.** The obvious mutant — making `is_sweep` return
+> `True` for anything priced at $1.00 — is **not sufficient**. The `YOU BOUGHT` /
+> `YOU SOLD` branch has its own dedicated path and never consults `is_sweep` or
+> `classify()` at all, so that mutation cannot reach the code the test exercises. An
+> implementer who applied it, saw the test stay green, and recorded the gate as passed
+> would have shipped a decorative test.
+
+The mutant must reach the fill-building path. Introduce price-based sweep classification
+where fills are actually constructed — so a $1.00 equity buy is diverted into the cash
+path — and confirm the test goes **red**. Then revert and confirm green.
+
+The general lesson, which recurs across this plan: **a mutant is only a proof if it
+reaches the code under test.** Verify the mutation actually changes behaviour on the path
+the test exercises before concluding anything from a passing result.
+
 - [ ] **Step 5: Commit**
 
 ```bash
