@@ -10,7 +10,34 @@ Ordered by when they must be addressed, not by severity.
 
 ## Must land before subsystem C
 
-### Fee allocation on partially-closed trades is wrong
+### ~~Fee allocation on partially-closed trades is wrong~~ — FIXED 2026-08-06
+
+**Fixed in A-2 part 1**, pulled forward from "before subsystem C" because it needed a
+schema migration and was cheapest while the database still held disposable data. The
+description below is retained because the reasoning still explains the convention.
+
+Verified against the case recorded here: `gross 1750`, `fees_total 390`,
+`fees_realized 161.25`, `realized 1588.75` (was 1360), `open_cost_basis 61305` — all four
+figures reproduced exactly.
+
+> [!warning] The fix prescribed below was direction-blind, and that caused a second bug
+> "Fold the residual into `open_cost_basis`" is correct only for **long** trades. For a
+> short, `open_cost_basis` accumulates *sale proceeds*, and a fee **reduces** net
+> proceeds — so the capitalised entry fee must be **subtracted**, not added. Implemented
+> literally, it produced an error of twice the unamortised fee with inverted sign on
+> every open short (191 of 200 property-check cases), made worse by `unrealized_pnl`
+> computing `open_cost_basis − mark_price` for shorts.
+>
+> Caught in review, fixed, and now guarded permanently by a conservation property test
+> parametrised over both directions:
+> `realized_pnl + unrealized_pnl(mark) == gross_at_mark − fees_total`.
+> That test was verified to fail when the bug is reintroduced.
+>
+> This is the same shape as the recurring A-1 defect named at the bottom of this file:
+> **an invariant applied correctly in one place and not in its twin.** It is worth noting
+> that the twin here was not a second code path but a second *direction*.
+
+The original description follows.
 
 `ledger/pnl.py` pro-rates each fill's fee by that allocation's share **of the fill**, so a
 fill wholly inside a trade contributes 100% of its fee no matter how little of the
@@ -44,6 +71,11 @@ restate it as `realized = gross − fees_realized`. Needs a schema migration.
 **Why before C:** C's expectancy and R-multiple denominators are built on `realized_pnl`.
 Changing the convention afterwards means recomputing history.
 
+**Post-fix note.** Existing rows keep the old convention until regrouped — the migration
+adds the columns but cannot recompute them, since the new figure requires the grouper.
+Run a regroup for every account after migrating, or one column carries two meanings
+across rows.
+
 ---
 
 ## Must land before A-2's manual-grouping UI — sequence it first
@@ -69,6 +101,83 @@ into a hard error for the *entire* regroup, so the day the UI creates the first 
 allocation, imports stop working for that account until the pure-layer fix lands.
 
 **Fix:** exclude only the quantity a manual trade actually holds, rather than the fill id.
+
+---
+
+## Found by the first real Fidelity export (2026-08-05)
+
+A genuine Fidelity account-activity export was run through the preview path. The large
+majority of its rows failed to map, and **every monetary value parsed as zero**. Details
+below; the header defect is fixed, the rest are open.
+
+> [!note] Deliberately non-specific
+> Findings from real exports are recorded as shapes, never as specimens. No tickers,
+> position details, account counts or amounts appear here — this repository is public.
+> Reproduction cases belong in `docs/ops/`, which is not version-controlled.
+
+**Fixed already:** real exports suffix money columns with a currency parenthetical
+(`Price ($)`, and — per the export's own disclaimer text — sometimes `Fees($)` with no
+space). The importer looked up bare `price`/`commission`/`fees`/`amount`, missed every
+one, and `_decimal(None)`'s `Decimal("0")` silently replaced them. No warning: dates,
+quantities, symbols and option terms all survived, so the output looked entirely
+plausible while every price, fee and cash amount was zero. `_normalize_field` now strips
+the qualifier structurally rather than aliasing observed spellings.
+
+That defect is worth remembering as a *class*, not an incident: **a missing column is
+indistinguishable from a zero value** anywhere `_decimal` is fed a `.get()`. Coinbase
+has the same shape. The general fix is a parse-level guard that a fill-shaped row
+(quantity *and* price columns present) resolving to a zero price is reported, not
+accepted.
+
+| # | Gap | Why it matters |
+|---|---|---|
+| R1 | `REINVESTMENT` rows are dropped — the large majority of the file's fill-shaped rows | These are genuine acquisitions. **Decided 2026-08-05:** money-market sweep rows (priced at exactly `1.00`) are cash, never fills — importing them would invent a position in a cash sweep. Real-security dividend reinvestment becomes a fill with real basis, tagged `funding_source='reinvestment'`, so `contributed_capital` can exclude it while `cost_basis` stays tax-correct. Zero-basis DRIP was considered and rejected: it overstates every later gain and contradicts the 1099-B. |
+| R2 | The multi-account warning is blind to accounts whose rows are *all* unmapped | It under-reported the account count, missing a retirement-plan account whose rows are entirely unhandled actions. A safety check that cannot see the account it most needed to flag. |
+| R3 | `external_ref` receives the account *nickname*, not an identifier | Real exports carry both an `Account` (nickname) and a separate `Account Number` column. The fixture had only the latter, under the former's name. |
+| R4 | `_CASH_ACTIONS` covers 4 actions; the real vocabulary is far wider and *compound* | Unhandled: `CONTRIBUTIONS`, `INVESTMENT GAIN/LOSS`, `RECORDKEEPING FEE`, `FOREIGN TAX PAID`, `FEE CHARGED`, `RETURN OF CAPITAL`, `REVENUE CREDIT`, `DIVIDENDS`, `EXCHANGED TO`. Action text is action + security name + ticker + settlement type concatenated into one field, so exact-match mapping cannot work — the leading verb phrase is the only reliable signal. |
+| R5 | Activity & Orders exports cap at **90 days** | Bulk history needs a different source — per-account statement exports, annual Realized Gain/Loss files (which carry cost basis directly), or the OFX/Direct Connect feed. "Repeated 90-day CSVs" and "one historical bulk load" are different import designs; settle this before A-2 fixes its model. |
+
+**Confirmed working against real data**, and worth not re-litigating: UTF-8 BOM stripped;
+blank preamble lines skipped; header located case-insensitively; the trailing disclaimer
+block falls out as unmapped rows with warnings exactly as `_locate_header`'s docstring
+claimed (that was the untested half of the twin, and it holds); and a real option
+contract parsed correctly into underlying, expiry, right and strike with the ×100
+multiplier applied.
+
+---
+
+## Carried into A-2 part 2 and beyond
+
+Recorded here rather than only in an execution ledger, because ledgers are scratch and
+this file is the project's memory.
+
+- **`OUTFLOW_KINDS` needs `tax`.** `importers/base.py` lists `{"withdrawal", "fee"}`. The
+  schema now accepts `tax` and `return_of_capital`, but nothing emits them until part 2's
+  rule table. A `tax` movement not registered as an outflow counts as an *inflow* in any
+  net-cash calculation — silently, and in the wrong direction.
+- **Subsystem C must not filter win-rate eligibility on `is_estimated = FALSE` alone.**
+  A protected (orphaned) trade carries `FALSE` because the column is `NOT NULL`, not
+  because its P&L is exact. C needs `realized_pnl IS NOT NULL` as well, or protected
+  trades land in the denominator.
+- **Column ordinal positions differ between a fresh and a migrated database.** New
+  columns land mid-table in `schema.sql` and appended in a migrated one. Nothing uses
+  positional access today and the equivalence guard sorts by name, so there is no live
+  bug — but Postgres cannot reorder columns, so this is permanent and grows with every
+  migration. Any future `INSERT … SELECT *`, `COPY`, or positional row access will behave
+  differently on a migrated database than on a fresh one. Do not attempt to "fix" the
+  ordering; just never rely on it.
+- **The `fill.updated_at` trigger has no behavioural test.** The equivalence guard proves
+  both schemas *define* it; nothing proves it *fires*, and no application code updates a
+  fill yet. When a test is written, note that the obvious version is vacuous: `now()` is
+  `transaction_timestamp()`, so within one transaction `updated_at` after an UPDATE is
+  byte-identical to the `DEFAULT now()` set at INSERT. The test must set the column
+  explicitly and assert the trigger overrides it, or commit across transactions.
+- **The equivalence guard compares CHECK *clauses* but not constraint *names*.** A
+  name-only divergence would pass, and would then make a future migration's
+  `DROP CONSTRAINT IF EXISTS` silently no-op on one of the two shapes. Adding
+  `constraint_name` naively fails, because `information_schema.check_constraints` includes
+  Postgres's OID-derived NOT NULL pseudo-constraints whose names differ per database;
+  filter those out first.
 
 ---
 

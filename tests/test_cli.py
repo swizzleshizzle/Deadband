@@ -240,6 +240,52 @@ async def test_import_does_not_warn_when_a_file_has_a_single_account_ref(capsys)
     assert "account ref" not in err
 
 
+# --- Pool-leak fix: every command that opens a pool must close it even if ---
+# --- its body raises. cmd_import and cmd_regroup already used try/finally; ---
+# --- cmd_migrate, cmd_accounts, cmd_accounts_add and cmd_trades did not. ------
+
+
+async def test_pool_is_closed_when_the_command_body_raises(monkeypatch):
+    """One representative command (cmd_accounts) is enough to prove the
+    try/finally shape: if it regresses back to a bare `pool = await
+    create_pool() ... await pool.close()`, an exception from list_accounts
+    skips the close and this test catches it. Fails today because cmd_accounts
+    has no try/finally around the acquire block."""
+
+    class FakeAcquireCM:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class FakePool:
+        def __init__(self):
+            self.closed = False
+
+        def acquire(self):
+            return FakeAcquireCM()
+
+        async def close(self):
+            self.closed = True
+
+    fake_pool = FakePool()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return fake_pool
+
+    async def raises(_conn):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "list_accounts", raises)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await cli.cmd_accounts(argparse.Namespace())
+
+    assert fake_pool.closed is True
+
+
 def test_import_missing_file_prints_a_clean_error_not_a_traceback(monkeypatch, capsys):
     """A typo'd path is the most likely first user mistake. Fails if main()
     lets FileNotFoundError propagate — the test itself would error out with an

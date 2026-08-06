@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ledger.grouping import group_fills
+from ledger.grouping import FillAllocation, group_fills
 from ledger.pnl import compute_pnl, r_multiple, unrealized_pnl
 from ledger.types import Direction, Fill, FillSource, Side
 
@@ -36,6 +36,14 @@ def pnl_for(fills, multipliers=None):
     assert len(groups) == 1
     g = groups[0]
     return compute_pnl(g.allocations, {f.id: f for f in fills}, multipliers or ONE, g.direction)
+
+
+def _allocs(*pairs):
+    """Build FillAllocation tuples from (fill, qty) pairs: _allocs(f1, "4", f2, "1")."""
+    items = list(pairs)
+    return [
+        FillAllocation(items[i].id, Decimal(items[i + 1])) for i in range(0, len(items), 2)
+    ]
 
 
 def test_simple_long_profit():
@@ -113,6 +121,142 @@ def test_fee_is_prorated_when_a_fill_is_split_across_trades():
     assert closed.fees_total == Decimal("4.00")
     assert opened.fees_total == Decimal("1.00")
     assert closed.fees_total + opened.fees_total == Decimal("5.00")
+
+
+def test_entry_fee_is_amortized_across_closes_not_expensed_at_once():
+    """A trade 25% closed must recognise 25% of its entry fee, not all of it.
+
+    The old convention expensed the whole entry fee immediately, which matches
+    no accounting convention and self-corrects only when the trade closes flat.
+    Asserts on realized_pnl, whose value the bug moves by 225.
+    """
+    entry = fill(side=Side.BUY, qty="4", price="60000", minutes=0, fee="300")
+    exit_ = fill(side=Side.SELL, qty="1", price="76000", minutes=10, fee="85")
+    result = compute_pnl(
+        _allocs(entry, "4", exit_, "1"),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: Decimal(1)},
+        Direction.LONG,
+    )
+
+    assert result.qty_closed == Decimal("1")
+    assert result.fees_total == Decimal("385")  # unchanged meaning
+    assert result.fees_realized == Decimal("160")  # 85 exit + 300 * 1/4
+    assert result.realized_pnl == result.gross_realized_pnl - result.fees_realized
+
+
+def test_unamortized_entry_fee_is_carried_in_open_cost_basis():
+    """The 225 of entry fee not yet recognised belongs to the 3 open units.
+
+    Per-unit, and divided by the multiplier, because open_cost_basis is
+    expressed in price terms while a fee is expressed in currency.
+    """
+    entry = fill(side=Side.BUY, qty="4", price="60000", minutes=0, fee="300")
+    exit_ = fill(side=Side.SELL, qty="1", price="76000", minutes=10, fee="85")
+    result = compute_pnl(
+        _allocs(entry, "4", exit_, "1"),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: Decimal(1)},
+        Direction.LONG,
+    )
+    assert result.open_quantity == Decimal("3")
+    assert result.open_cost_basis == Decimal("60075")  # 60000 + 300/4
+
+
+def test_option_entry_fee_capitalizes_per_contract_not_per_share():
+    """open_cost_basis excludes the multiplier, so a currency fee must be
+    divided by (quantity * multiplier) to land in the same units as price.
+
+    Without the multiplier this is 100x wrong for options -- the exact silent
+    failure mode that CHECK (contract_multiplier > 0) exists to bound.
+    """
+    entry = fill(side=Side.BUY, qty="10", price="0.40", fee="6.60")
+    result = compute_pnl(
+        _allocs(entry, "10"),
+        {entry.id: entry},
+        {entry.instrument_id: Decimal(100)},
+        Direction.LONG,
+    )
+    assert result.open_quantity == Decimal("10")
+    # 0.40 + 6.60/(10*100) = 0.40 + 0.0066 = 0.4066
+    assert result.open_cost_basis == Decimal("0.4066")
+
+
+def test_short_entry_fee_reduces_open_cost_basis_not_increases():
+    """A SHORT's open_cost_basis is average SALE proceeds per unit, so an
+    entry (opening SELL) fee reduces net proceeds and must be SUBTRACTED --
+    not added, as is correct for a LONG's average purchase cost.
+
+    Adding it (the LONG rule applied blindly) is wrong in two ways at once:
+    open_cost_basis comes out too high, and unrealized_pnl for a SHORT is
+    (open_cost_basis - mark_price), so the sign error doubles into the
+    reported unrealized P&L. fees_realized and realized_pnl do not involve
+    this sign at all and must be unaffected -- only open_cost_basis moves.
+    """
+    entry = fill(side=Side.SELL, qty="10", price="0.40", minutes=0, fee="6.60")
+    exit_ = fill(side=Side.BUY, qty="2", price="0.30", minutes=10, fee="0")
+    result = compute_pnl(
+        _allocs(entry, "10", exit_, "2"),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: Decimal(100)},
+        Direction.SHORT,
+    )
+    assert result.open_quantity == Decimal("8")
+    # 0.40 - 6.60/(10*100) = 0.40 - 0.0066 = 0.3934
+    assert result.open_cost_basis == Decimal("0.3934")
+    assert result.fees_realized == Decimal("1.32")
+    assert result.realized_pnl == Decimal("18.68")
+
+
+@pytest.mark.parametrize(
+    "direction,mult,exit_qty",
+    [
+        (Direction.LONG, Decimal(1), "1"),
+        (Direction.LONG, Decimal(100), "1"),
+        (Direction.LONG, Decimal(1), "4"),
+        (Direction.SHORT, Decimal(1), "1"),
+        (Direction.SHORT, Decimal(100), "1"),
+        (Direction.SHORT, Decimal(1), "4"),
+    ],
+)
+def test_realized_plus_unrealized_conserves_gross_minus_fees(direction, mult, exit_qty):
+    """realized_pnl + unrealized_pnl(mark) must equal gross-at-mark minus fees_total.
+
+    Nothing is created or destroyed by splitting a fee between the realized
+    and still-open portions of a trade: whatever amortization does to
+    open_cost_basis, the two halves must still sum to the same total economic
+    result as if fees were never split at all. "gross-at-mark" is computed
+    independently of open_cost_basis (from avg_entry, which is pure price with
+    no fee folded in) so this test cannot be fooled by a self-consistent sign
+    error in open_cost_basis alone -- it is the check that would have caught
+    the SHORT sign inversion this file's earlier version had.
+
+    Deterministic fixtures, parametrized over LONG/SHORT, a contract
+    multiplier, and full vs. partial close.
+    """
+    if direction is Direction.LONG:
+        entry = fill(side=Side.BUY, qty="4", price="60000", minutes=0, fee="300")
+        exit_ = fill(side=Side.SELL, qty=exit_qty, price="76000", minutes=10, fee="85")
+    else:
+        entry = fill(side=Side.SELL, qty="4", price="60000", minutes=0, fee="300")
+        exit_ = fill(side=Side.BUY, qty=exit_qty, price="44000", minutes=10, fee="85")
+
+    result = compute_pnl(
+        _allocs(entry, "4", exit_, exit_qty),
+        {entry.id: entry, exit_.id: exit_},
+        {entry.instrument_id: mult},
+        direction,
+    )
+
+    mark = Decimal("50000")
+    unreal = unrealized_pnl(result.open_quantity, result.open_cost_basis, mark, mult, direction)
+    if direction is Direction.SHORT:
+        unreal_gross = (result.avg_entry - mark) * result.open_quantity * mult
+    else:
+        unreal_gross = (mark - result.avg_entry) * result.open_quantity * mult
+    gross_at_mark = result.gross_realized_pnl + unreal_gross
+
+    assert result.realized_pnl + unreal == gross_at_mark - result.fees_total
 
 
 def test_unrealized_long():
@@ -208,6 +352,11 @@ def test_compute_pnl_is_independent_of_ambient_decimal_precision():
             == str(result_prec28.fees_total)
         )
         assert (
+            str(result_prec3.fees_realized)
+            == str(result_prec10.fees_realized)
+            == str(result_prec28.fees_realized)
+        )
+        assert (
             str(result_prec3.realized_pnl)
             == str(result_prec10.realized_pnl)
             == str(result_prec28.realized_pnl)
@@ -245,7 +394,12 @@ def test_exact_pnl_on_full_close():
 
 
 def test_realized_pnl_identity_with_non_terminating_average():
-    """realized_pnl = gross_realized_pnl - fees_total must hold exactly."""
+    """realized_pnl = gross_realized_pnl - fees_realized must hold exactly.
+
+    This trade closes fully (qty_closed == qty_opened), so every entry fee
+    is recognised and fees_realized == fees_total here -- asserted explicitly
+    so the full-close case where the two fee figures coincide stays covered.
+    """
     result = pnl_for(
         [
             fill(Side.BUY, "1", "100", 0, fee="0.50"),
@@ -253,7 +407,8 @@ def test_realized_pnl_identity_with_non_terminating_average():
             fill(Side.SELL, "3", "250", 20, fee="1.50"),
         ]
     )
-    assert result.realized_pnl == result.gross_realized_pnl - result.fees_total
+    assert result.fees_realized == result.fees_total
+    assert result.realized_pnl == result.gross_realized_pnl - result.fees_realized
 
 
 def test_avg_exit_is_none_on_open_only_trade():
@@ -353,6 +508,7 @@ def test_allocations_sorted_chronologically():
     assert result_chrono.avg_exit == result_shuffled.avg_exit
     assert result_chrono.gross_realized_pnl == result_shuffled.gross_realized_pnl
     assert result_chrono.fees_total == result_shuffled.fees_total
+    assert result_chrono.fees_realized == result_shuffled.fees_realized
     assert result_chrono.realized_pnl == result_shuffled.realized_pnl
     assert result_chrono.open_quantity == result_shuffled.open_quantity
     assert result_chrono.open_cost_basis == result_shuffled.open_cost_basis

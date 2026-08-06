@@ -648,7 +648,14 @@ async def test_protected_trade_contributes_no_pnl(conn):
     assert protected["avg_entry"] is None
     assert protected["avg_exit"] is None
     assert protected["fees_total"] is None
+    assert protected["fees_realized"] is None
+    assert protected["open_quantity"] is None
+    assert protected["open_cost_basis"] is None
     assert protected["r_multiple"] is None
+    # NOT NULL DEFAULT FALSE -- unlike the columns above, NULL isn't available.
+    # A trade owning zero live fills has nothing estimated about it, so
+    # protection resets this to FALSE rather than leaving a stale True.
+    assert protected["is_estimated"] is False
 
     # The surviving fill (the SELL) forms a brand-new open short with no
     # realized P&L yet, so the account-wide total must be exactly zero — not
@@ -712,25 +719,27 @@ async def test_protected_trades_opening_fill_id_is_released(conn):
     assert new_trade["id"] != trade["id"]
 
 
-# --- Fix round 3 addition ---------------------------------------------------
+# --- Task 1: quantity-aware exclusion in group_fills -------------------------
+#
+# Fix round 3 had added test_regroup_refuses_a_manual_trade_holding_a_partial_fill,
+# asserting regroup_account raised NotImplementedError for exactly this scenario
+# (a manual trade holding only part of a zero-crossing fill). Task 1 replaced
+# that hard failure with quantity-aware exclusion (db/trades.py now reduces a
+# fill's available quantity by what manual trades hold, instead of excluding it
+# whole), so that assertion is obsolete and was deleted rather than left
+# skipped or xfailed. The test below covers the same scenario's new, correct
+# behavior.
 
 
-async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
-    """The same bug shape as round 2's Pass A failure, reached via a different
-    path: a manual trade holding only PART of a fill (not the whole thing) would
-    make manual_fill_ids exclude that fill WHOLE from the auto pass, stranding
-    the rest of its quantity. Nothing in db/, ledger/, or importers/ creates this
-    state today — the only writer of grouping_mode='manual' is the protection
-    step, which drops its allocations first — but a hand-marked manual trade
-    (exactly what a future "group these fills manually" UI would do, and exactly
-    what test_regroup_does_not_touch_manual_trades does via a plain UPDATE)
-    could. regroup_account must fail loudly instead of silently losing an open
-    position.
+async def test_partial_manual_allocation_leaves_the_remainder_groupable(conn):
+    """SELL 1 @100 then BUY 5 @90 closes a short of 1 and opens a long of 4.
+    Marking the closed short manual must not strand the open long of 4: the
+    BUY fill is only 1/5 the manual trade's, and the other 4 must regroup.
 
-    SELL 1 @100 opens a short of 1; BUY 5 @90 closes that short (quantity 1,
-    partial) and opens a long of 4 on the same fill. Hand-marking the closed
-    trade manual leaves it holding only 1 of the BUY fill's 5 units."""
-    acc = await create_account(conn, name="PartialManual", venue="manual", account_type="cash")
+    Asserts on the surviving open quantity, not on a trade count -- a count of
+    2 would also hold if the remainder were grouped with the wrong quantity.
+    """
+    acc = await create_account(conn, name="PartialManual2", venue="manual", account_type="cash")
     inst = await upsert_instrument(
         conn,
         Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"),
@@ -743,7 +752,7 @@ async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
         side=Side.SELL,
         quantity=Decimal("1"),
         price=Decimal("100"),
-        fee=Decimal("0"),
+        fee=Decimal("1.00"),
         fee_currency="USD",
         source=FillSource.MANUAL,
         venue_fill_id="s1",
@@ -757,7 +766,7 @@ async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
         side=Side.BUY,
         quantity=Decimal("5"),
         price=Decimal("90"),
-        fee=Decimal("0"),
+        fee=Decimal("5.00"),
         fee_currency="USD",
         source=FillSource.MANUAL,
         venue_fill_id="b1",
@@ -767,14 +776,270 @@ async def test_regroup_refuses_a_manual_trade_holding_a_partial_fill(conn):
     await regroup_account(conn, acc)
 
     closed = next(t for t in await list_trades(conn, acc) if t["status"] == "closed")
-    # Hand-mark it manual with a plain UPDATE, exactly as
-    # test_regroup_does_not_touch_manual_trades does — this is what a future
-    # manual-grouping UI would do, and it leaves the trade holding only 1 of the
-    # BUY fill's 5 units.
     await conn.execute("UPDATE trade SET grouping_mode = 'manual' WHERE id = $1", closed["id"])
 
-    with pytest.raises(NotImplementedError, match=str(buy.id)):
-        await regroup_account(conn, acc)
+    await regroup_account(conn, acc)  # must not raise
+
+    rows = await conn.fetch(
+        "SELECT qty_opened, qty_closed, status FROM trade WHERE account_id = $1", acc
+    )
+    open_qty = sum(r["qty_opened"] - r["qty_closed"] for r in rows if r["status"] == "open")
+    assert open_qty == Decimal("4")
+    total_allocated = await conn.fetchval(
+        "SELECT sum(quantity) FROM trade_fill WHERE fill_id = $1", buy.id
+    )
+    assert total_allocated == Decimal("5")
+
+    # Fee conservation: the sum of fees_total across every trade in the account
+    # must equal the fee actually paid across the fills that fund them, no
+    # matter how a fill's quantity was split between a manual holder and the
+    # auto-grouped remainder. When a fill is partly held by a manual trade,
+    # db/trades.py hands the pure grouper a quantity-reduced copy of that fill
+    # (`remaining = f.quantity - manual_held...`); if the fee isn't prorated
+    # alongside the quantity, compute_pnl's `fee_share = f.fee * qty /
+    # f.quantity` uses the reduced quantity as its own denominator and the
+    # auto remainder absorbs the fill's ENTIRE fee on top of whatever the
+    # manual trade already recorded for it -- manufacturing fee out of thin
+    # air. Here: sell fee 1.00 + buy fee 5.00 = 6.00 paid; a broken prorate
+    # inflates the account total to 7.00 (manual trade's frozen 2.00, which
+    # already counted 1.00 of the buy fill's fee, plus the reduced-quantity
+    # remainder wrongly absorbing the buy fill's full 5.00 instead of its
+    # rightful 4.00 share).
+    total_fees_paid = sell.fee + buy.fee
+    total_fees_total = await conn.fetchval(
+        "SELECT sum(fees_total) FROM trade WHERE account_id = $1", acc
+    )
+    assert total_fees_total == total_fees_paid
+
+
+# --- Task 5: persist open_quantity, open_cost_basis, fees_realized ---------
+
+
+async def test_regroup_persists_derived_pnl_columns(conn):
+    """unrealized_pnl() must be able to read its inputs from the database
+    without re-running the grouper. Asserts on values, not on non-NULL --
+    a column written as 0 would satisfy a NOT NULL check and still be wrong."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("4"),
+                price=Decimal("100"),
+                fee=Decimal("8"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("1"),
+                price=Decimal("120"),
+                fee=Decimal("2"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    row = await conn.fetchrow(
+        """SELECT open_quantity, open_cost_basis, fees_realized, realized_pnl,
+                  gross_realized_pnl
+             FROM trade WHERE account_id = $1""",
+        acc,
+    )
+    assert row["open_quantity"] == Decimal("3")
+    assert row["open_cost_basis"] == Decimal("102")        # 100 + 8/4
+    assert row["fees_realized"] == Decimal("4")            # 2 exit + 8 * 1/4
+    assert row["realized_pnl"] == row["gross_realized_pnl"] - row["fees_realized"]
+
+
+async def test_regroup_persists_derived_pnl_columns_for_short(conn):
+    """SHORT open_cost_basis carries the entry fee SUBTRACTED (net sale
+    proceeds), not added -- the opposite sign from the LONG case above. The
+    round-trip through the database is what's under test: a sign flip in
+    persistence would not be caught by a long-only test."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.SELL,
+                quantity=Decimal("4"),
+                price=Decimal("100"),
+                fee=Decimal("8"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("80"),
+                fee=Decimal("2"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    row = await conn.fetchrow(
+        """SELECT open_quantity, open_cost_basis, fees_realized, realized_pnl,
+                  gross_realized_pnl
+             FROM trade WHERE account_id = $1""",
+        acc,
+    )
+    assert row["open_quantity"] == Decimal("3")
+    assert row["open_cost_basis"] == Decimal("98")         # 100 - 8/4 (subtracted for SHORT)
+    assert row["fees_realized"] == Decimal("4")             # 2 exit + 8 * 1/4
+    assert row["realized_pnl"] == row["gross_realized_pnl"] - row["fees_realized"]
+
+
+async def test_a_trade_containing_an_estimated_fill_is_itself_estimated(conn):
+    """Any estimated fill taints the trade: an opening-balance fill makes the
+    whole trade's P&L an estimate, so spec 4 excludes it from R-multiple and
+    win-rate. Uses ANY, not ALL -- one estimated leg is enough."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("5"),
+                price=Decimal("100"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=True,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("5"),
+                price=Decimal("110"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is True
+
+
+async def test_a_trade_of_only_exact_fills_is_not_estimated(conn):
+    """Negative control: without it the test above passes for a function that
+    hardcodes True."""
+    acc = await seed(conn, [(Side.BUY, "5", "100"), (Side.SELL, "5", "110")])
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is False
+
+
+async def test_a_trade_with_an_estimated_closing_fill_is_also_estimated(conn):
+    """The rollup is ANY over every constituent fill, not just the opening
+    fill's flag -- an exact opening leg followed by an estimated closing leg
+    must still taint the trade."""
+    acc = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ACME", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0,
+                side=Side.BUY,
+                quantity=Decimal("5"),
+                price=Decimal("100"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="b1",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=T0 + timedelta(minutes=10),
+                side=Side.SELL,
+                quantity=Decimal("5"),
+                price=Decimal("110"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="s1",
+                is_estimated=True,
+            ),
+        ],
+    )
+
+    await regroup_account(conn, acc)
+
+    assert await conn.fetchval(
+        "SELECT is_estimated FROM trade WHERE account_id = $1", acc
+    ) is True
 
 
 # --- Item 7: an unknown account_id used to reach TradeIntent(None) ----------

@@ -120,7 +120,58 @@ async def test_cmd_migrate_reports_already_up_to_date(conn, monkeypatch, capsys)
 
     rc = await cli.cmd_migrate(argparse.Namespace())
     assert rc == 0
-    assert "already up to date" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already up to date" in out
+    # Pins placement, not just presence: the regroup warning belongs only to
+    # the "migrations were just applied" branch. Printing it here too would
+    # train the operator to ignore it.
+    assert "regroup" not in out.lower()
+
+
+async def test_cmd_migrate_warns_to_regroup_when_migrations_applied_to_an_existing_database(
+    conn, monkeypatch, capsys
+):
+    """Migration 001 changes how realized_pnl is computed, but a migration
+    cannot rewrite rows that already exist under the old convention — only a
+    regroup can. `conn` already has a schema applied by the fixtures (i.e.
+    this is not a virgin database), so forcing apply() to report something
+    applied must produce the regroup warning. Fails if cmd_migrate stays
+    silent about stale derived columns after applying migrations."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_apply(_conn):
+        return ["001_fake.sql"]
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "apply_migrations", fake_apply)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    assert "regroup" in capsys.readouterr().out.lower()
+
+
+async def test_cmd_migrate_does_not_warn_to_regroup_on_a_virgin_database(
+    conn, monkeypatch, capsys
+):
+    """A brand-new database has no pre-existing rows computed under the old
+    fee convention -- there is nothing to regroup yet, so telling the
+    operator to do so here would be misleading noise. Drops and recreates the
+    public schema (rolled back by conftest's `conn` fixture at teardown, same
+    as the existing virgin-database test above) to reach that state, then
+    runs the real cmd_migrate. Fails if the regroup warning fires even though
+    `existed_before` is False."""
+    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    assert "regroup" not in capsys.readouterr().out.lower()
 
 
 async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, capsys):
@@ -144,10 +195,17 @@ async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, ca
     assert "002_fake.sql" in out
 
 
-# --- Blocker pass, item 6: db/migrations/ is empty, so apply() returns []
-# --- both when nothing was pending AND on a virgin database that just had
-# --- its entire schema created by apply()'s own schema.sql call — those are
-# --- different outcomes and must not share the "already up to date" message.
+# --- Blocker pass, item 6: on a virgin database, apply()'s own schema.sql
+# --- call creates every table from nothing — that must never be reported as
+# --- "already up to date". Originally db/migrations/ was empty too, so
+# --- apply() returned [] on a virgin db and cmd_migrate needed a separate
+# --- "schema applied; no pending migrations" branch to distinguish that from
+# --- a truly up-to-date database. Migration 001 (A-2 ledger completion) is
+# --- now the first real migration, so on a virgin db it is pending
+# --- immediately after schema.sql creates the tables, and apply() returns it
+# --- as applied — exercising the `if applied:` branch instead. Either way,
+# --- the one thing that must never happen is "already up to date" on a
+# --- database that had zero tables a moment earlier.
 
 
 async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, monkeypatch, capsys):
@@ -168,7 +226,7 @@ async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, mon
     assert rc == 0
     out = capsys.readouterr().out
     assert "already up to date" not in out
-    assert "schema applied" in out
+    assert "001_a2_ledger_completion.sql" in out
 
 
 async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monkeypatch, capsys):

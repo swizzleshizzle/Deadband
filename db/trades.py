@@ -3,6 +3,8 @@ this module only moves data between that pure core and Postgres."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+from decimal import Decimal
 from uuid import UUID
 
 import asyncpg
@@ -48,47 +50,33 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # such problem — its fills were never partially claimed by anything else —
     # so only those are excluded here. Every other trade, including one that
     # is about to be protected below, is regrouped in full first.
-    manual_fill_ids = {
-        r["fill_id"]
+    #
+    # How much of each fill is already held by a manual trade. A manual trade may
+    # hold only PART of a zero-crossing fill, so excluding the fill whole would
+    # strand -- and then reap -- the remainder. Reduce the available quantity
+    # instead, and let the pure grouper allocate what is left.
+    manual_held: dict[UUID, Decimal] = {
+        r["fill_id"]: r["held"]
         for r in await conn.fetch(
-            """
-            SELECT tf.fill_id FROM trade_fill tf
-            JOIN trade t ON t.id = tf.trade_id
-            WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
-            """,
+            """SELECT tf.fill_id, sum(tf.quantity) AS held
+                 FROM trade_fill tf
+                 JOIN trade t ON t.id = tf.trade_id
+                WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
+             GROUP BY tf.fill_id""",
             account_id,
         )
     }
 
-    # A manual trade holding only PART of a fill would make the auto pass exclude
-    # that fill whole via manual_fill_ids above, stranding the rest of its
-    # quantity — the same failure shape as round 2's Pass A bug, reached through a
-    # hand-marked manual trade instead of the protection step. Nothing in db/,
-    # ledger/, or importers/ creates that state today (the only writer of
-    # grouping_mode='manual' is the protection step, which drops its allocations
-    # first), but a future manual-grouping UI could. Fail loudly rather than
-    # silently losing an open position.
-    partial = await conn.fetch(
-        """
-        SELECT tf.fill_id, f.quantity AS fill_quantity, SUM(tf.quantity) AS held
-          FROM trade_fill tf
-          JOIN trade t ON t.id = tf.trade_id
-          JOIN fill  f ON f.id = tf.fill_id
-         WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
-         GROUP BY tf.fill_id, f.quantity
-        HAVING SUM(tf.quantity) < f.quantity
-        """,
-        account_id,
-    )
-    if partial:
-        raise NotImplementedError(
-            "a manual trade holds a partial allocation of "
-            f"fill {partial[0]['fill_id']} ({partial[0]['held']} of "
-            f"{partial[0]['fill_quantity']}); regrouping would strand the remainder. "
-            "Partial manual allocations need quantity-aware exclusion in group_fills."
+    fills = []
+    for f in await fetch_fills(conn, account_id):
+        remaining = f.quantity - manual_held.get(f.id, Decimal(0))
+        if remaining <= 0:
+            continue  # wholly owned by a manual trade
+        fills.append(
+            f
+            if remaining == f.quantity
+            else replace(f, quantity=remaining, fee=f.fee * remaining / f.quantity)
         )
-
-    fills = [f for f in await fetch_fills(conn, account_id) if f.id not in manual_fill_ids]
 
     seen_openings: list[UUID] = []
     written = 0
@@ -120,6 +108,14 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             ).fill_id
             seen_openings.append(opening_fill_id)
 
+            # Any estimated fill taints the trade -- an opening-balance fill
+            # makes the whole trade's P&L an estimate (spec section 4). ANY,
+            # not ALL: this must roll up every constituent fill, not just the
+            # opening one.
+            is_estimated = any(
+                by_id[a.fill_id].is_estimated for a in g.allocations
+            )
+
             # UPSERT, never delete-and-rebuild: derived columns are overwritten,
             # user-authored ones (intent override, planned_risk, strategy_tag, notes,
             # and B's thesis link) are left exactly as the user set them.
@@ -128,8 +124,9 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 INSERT INTO trade (
                     account_id, opening_fill_id, primary_underlying, direction, status,
                     intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
-                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total
-                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
+                    fees_realized, open_quantity, open_cost_basis, is_estimated
+                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                 ON CONFLICT (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL
                 DO UPDATE SET
                     primary_underlying = EXCLUDED.primary_underlying,
@@ -144,6 +141,10 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                     realized_pnl       = EXCLUDED.realized_pnl,
                     gross_realized_pnl = EXCLUDED.gross_realized_pnl,
                     fees_total         = EXCLUDED.fees_total,
+                    fees_realized      = EXCLUDED.fees_realized,
+                    open_quantity      = EXCLUDED.open_quantity,
+                    open_cost_basis    = EXCLUDED.open_cost_basis,
+                    is_estimated       = EXCLUDED.is_estimated,
                     updated_at         = now()
                 RETURNING id
                 """,
@@ -162,6 +163,10 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 pnl.realized_pnl,
                 pnl.gross_realized_pnl,
                 pnl.fees_total,
+                pnl.fees_realized,
+                pnl.open_quantity,
+                pnl.open_cost_basis,
+                is_estimated,
             )
 
             # r_multiple depends on planned_risk, which is user-authored — recompute
@@ -206,6 +211,12 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # it would double-count against whatever trade its fills now belong to).
     # `status` is left as-is — it is NOT NULL and no longer meaningful once the
     # row is judgment-only, but there is no null-able substitute for it.
+    # `is_estimated` is likewise NOT NULL DEFAULT FALSE, so NULL isn't an option
+    # either — but unlike `status`, FALSE is a deliberate and correct value
+    # here, not just the nearest available one: a trade owning zero live fills
+    # has nothing estimated about it (its P&L is NULL, not a real-but-uncertain
+    # number), and leaving a stale True from before protection would misrepresent
+    # a judgment-only record as still carrying a reconstructed-price P&L.
     protected = await conn.fetch(
         """
         UPDATE trade
@@ -215,7 +226,10 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                qty_opened = NULL, qty_closed = NULL,
                avg_entry = NULL, avg_exit = NULL,
                realized_pnl = NULL, gross_realized_pnl = NULL,
-               fees_total = NULL, r_multiple = NULL
+               fees_total = NULL, fees_realized = NULL,
+               open_quantity = NULL, open_cost_basis = NULL,
+               r_multiple = NULL,
+               is_estimated = FALSE
          WHERE account_id = $1
            AND grouping_mode = 'auto'
            AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))
