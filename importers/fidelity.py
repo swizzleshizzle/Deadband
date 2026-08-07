@@ -14,6 +14,7 @@ from importers.base import (
     CanonicalCash,
     CanonicalFill,
     ImportBatch,
+    normalize_field,
     zero_amount_warning,
     zero_price_warning,
 )
@@ -29,15 +30,14 @@ _OPTION_RE = re.compile(
 # currency parenthetical; the fixtures did not, so every price, commission, fee
 # and cash amount resolved to a missing key and _decimal(None)'s Decimal("0")
 # silently replaced it — no warning, quantities and dates intact, the result
-# plausible and financially meaningless. Strip the parenthetical structurally
-# rather than aliasing the observed spellings: the export's own disclaimer text
-# writes "Fees($)" without the space its header row uses, so an alias table
-# would be one Fidelity inconsistency away from silently zeroing a column again.
-_FIELD_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
-
-
-def _normalize_field(name: str | None) -> str:
-    return _FIELD_QUALIFIER_RE.sub("", (name or "").strip().lower()).strip()
+# plausible and financially meaningless. normalize_field (importers/base.py)
+# strips the parenthetical structurally rather than aliasing the observed
+# spellings, and is shared with importers/coinbase.py (finding B) so the two
+# venues can never drift onto two different normalization schemes: the
+# export's own disclaimer text writes "Fees($)" without the space its header
+# row uses, so an alias table would be one Fidelity inconsistency away from
+# silently zeroing a column again.
+_normalize_field = normalize_field
 
 
 # Membership is DATA, not logic, so it can be reviewed at a glance. Identified
@@ -396,8 +396,20 @@ class FidelityImporter:
                     tzinfo=UTC
                 )
             except ValueError as exc:
-                warnings.append(f"line {line_no}: bad date ({exc})")
-                unmapped.append(str(raw_row))
+                # Finding A: this branch used to append straight to
+                # unmapped/warnings and never route through reject(), on the
+                # reasoning that "no rule can have matched yet, so there is
+                # nothing to be inconsistent with." That reasoning is about
+                # RULE consistency and says nothing about MONEY loss -- a row
+                # whose date fails to parse can still carry a real dollar
+                # figure in Amount, and dropping it with only a warning is
+                # the exact silent-loss shape reject() exists to close for
+                # every other path. reject() reads row.get("quantity")/
+                # row.get("amount") directly from the raw string fields, so
+                # the money determination here does not depend on `when`
+                # ever having been computed -- it can't be, since the date is
+                # precisely what failed.
+                reject(row, raw_row, account, line_no, f"line {line_no}: bad date ({exc})")
                 continue
 
             # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction

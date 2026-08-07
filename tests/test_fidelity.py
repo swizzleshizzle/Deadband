@@ -804,3 +804,60 @@ def test_renaming_the_quantity_column_recreates_the_original_defect_and_now_bloc
     assert result.fills == ()
     assert len(result.unmapped_rows) == 5
     assert len(result.blocking) == 5
+
+
+# --- Finding A: a bad Run Date silently dropped money -----------------------
+#
+# The top-level date-parse failure branch appended straight to
+# unmapped/warnings and never routed through reject() -- reasoned, when I3
+# closed every OTHER unmapped path, as "no rule can have matched yet, so
+# there's nothing to be inconsistent with." That reasoning is about RULE
+# consistency; it says nothing about money loss. A row whose Run Date fails
+# to parse can still carry a real dollar figure in Amount, and that money
+# was dropped with only a warning nobody has to read -- exactly the silent-
+# loss shape I3 closed for every other path. The money check must not depend
+# on the date having parsed: it reads the raw quantity/amount fields
+# directly, independent of `when`.
+
+
+def test_a_bad_run_date_carrying_money_blocks_the_commit():
+    """The finding's own reproduction: a $4,321.00 dividend row whose date is
+    garbage. Before the fix this fell into the bad-date branch, which never
+    consulted _carries_money at all -- blocking stayed empty and --commit
+    reported success while silently dropping the row's money."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\nNOT-A-DATE,A0000001,DIVIDEND RECEIVED,AAA,DESC,,,,,4321.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("bad date" in w for w in result.warnings)
+    assert result.blocking, "a bad-date row carrying money must block"
+    assert result.blocking[0][0] == "A0000001"
+    assert "bad date" in result.blocking[0][1]
+
+
+def test_a_bad_run_date_with_no_money_only_warns_without_blocking():
+    """The single most important test in this fix: a bad-date row with NO
+    financial content (blank Quantity and blank Amount, same shape as the
+    trailing disclaimer block every real export ends with) must still warn
+    but must NOT block. Get this wrong -- e.g. by making every bad-date row
+    block unconditionally instead of routing through the money-aware
+    reject() -- and every real Fidelity export refuses forever, since every
+    export ends with a disclaimer block whose date also fails to parse."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\nNOT-A-DATE,A0000001,SOME DISCLAIMER TEXT,,,,,,,\n"
+    result = FidelityImporter().parse(row)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("bad date" in w for w in result.warnings)
+    assert result.blocking == (), "a bad-date row with no money must not block"
+
+
+def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix():
+    """Guards the guard against a regression in the other direction on the
+    REAL disclaimer shape (no commas at all, so most fields come back None
+    from csv.DictReader's restval rather than empty strings) -- not just the
+    synthetic no-money row above."""
+    result = FidelityImporter().parse(FIXTURE + "This report is for informational purposes only.\n")
+    assert result.blocking == ()
+    assert result.unmapped_rows

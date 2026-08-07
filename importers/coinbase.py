@@ -11,6 +11,7 @@ from importers.base import (
     CanonicalCash,
     CanonicalFill,
     ImportBatch,
+    normalize_field,
     zero_amount_warning,
     zero_price_warning,
 )
@@ -57,11 +58,24 @@ def _row_carries_money(row: dict[str, str]) -> bool:
     before conversion. Subtotal/Total matter independently of Quantity
     Transacted because a cash-shaped row's dollar figure can live there even
     when quantity itself is what's garbled (or vice versa for a fill-shaped
-    row)."""
+    row).
+
+    `row` MUST already be normalized (see normalize_field in
+    importers/base.py and this importer's parse(), which builds it the same
+    way importers/fidelity.py does) -- finding B: this used to look up the
+    raw, exact-cased header names ("Quantity Transacted", "Subtotal",
+    "Total (inclusive of fees and/or spread)") directly. If the venue
+    re-cases or renames a column, every one of those lookups misses, this
+    function returns False, and a money-carrying row silently stops
+    blocking -- the same shape as the defect that motivated the whole task,
+    just on header casing instead of a currency suffix. Reading from the
+    normalized row (lowercased, trailing parenthetical qualifier stripped)
+    is what fixes that, mirroring importers/fidelity.py's own normalization
+    instead of inventing a second scheme."""
     return (
-        _carries_money(row.get("Quantity Transacted"))
-        or _carries_money(row.get("Subtotal"))
-        or _carries_money(row.get("Total (inclusive of fees and/or spread)"))
+        _carries_money(row.get("quantity transacted"))
+        or _carries_money(row.get("subtotal"))
+        or _carries_money(row.get("total"))
     )
 
 
@@ -93,7 +107,7 @@ class CoinbaseImporter:
         # account number) -- every entry's ref is therefore always None.
         blocking: list[tuple[str | None, str]] = []
 
-        def reject(row: dict[str, str], line_no: int, message: str) -> None:
+        def reject(row: dict[str, str], raw_row: dict[str, str], line_no: int, message: str) -> None:
             """ONE path for every row parse() drops as unmapped -- top-level
             parse failure, non-finite quantity/price/fee, non-positive
             quantity, non-finite cash amount, and "unhandled transaction
@@ -101,9 +115,16 @@ class CoinbaseImporter:
             every such row through this one function (instead of only the
             "no rule matched" branch consulting `_row_carries_money`) is
             what stops the asymmetry from recurring the next time a new
-            guard is added."""
+            guard is added.
+
+            `row` is the NORMALIZED dict (see normalize_field/parse() below)
+            -- `_row_carries_money` must read normalized keys (finding B).
+            `raw_row` is the original, as-exported dict, kept only for the
+            unmapped-row display text so a human sees the venue's own header
+            spelling rather than the normalized one -- mirrors
+            importers/fidelity.py's identical row/raw_row split."""
             warnings.append(message)
-            unmapped.append(str(row))
+            unmapped.append(str(raw_row))
             if _row_carries_money(row):
                 blocking.append((None, message))
 
@@ -114,20 +135,26 @@ class CoinbaseImporter:
             return ImportBatch()
 
         reader = csv.DictReader(io.StringIO(text))
-        for line_no, row in enumerate(reader, start=2):
-            kind = (row.get("Transaction Type") or "").strip().lower()
-            asset = (row.get("Asset") or "").strip().upper()
-            currency = (row.get("Spot Price Currency") or "USD").strip().upper()
+        for line_no, raw_row in enumerate(reader, start=2):
+            # Normalize header casing once, same as importers/fidelity.py's
+            # twin -- finding B: reading even one raw, exact-cased header
+            # name is one venue re-casing or renaming away from silently
+            # missing that column and reading it as Decimal("0") with no
+            # warning at all.
+            row = {normalize_field(k): v for k, v in raw_row.items()}
+            kind = (row.get("transaction type") or "").strip().lower()
+            asset = (row.get("asset") or "").strip().upper()
+            currency = (row.get("spot price currency") or "USD").strip().upper()
 
             try:
                 when = datetime.fromisoformat(
-                    (row.get("Timestamp") or "").replace("Z", "+00:00")
+                    (row.get("timestamp") or "").replace("Z", "+00:00")
                 ).astimezone(UTC)
-                quantity = _decimal(row.get("Quantity Transacted", ""))
-                price = _decimal(row.get("Spot Price at Transaction", ""))
-                fee = _decimal(row.get("Fees and/or Spread", ""))
+                quantity = _decimal(row.get("quantity transacted", ""))
+                price = _decimal(row.get("spot price at transaction", ""))
+                fee = _decimal(row.get("fees and/or spread", ""))
             except (ValueError, InvalidOperation) as exc:
-                reject(row, line_no, f"line {line_no}: could not parse row ({exc})")
+                reject(row, raw_row, line_no, f"line {line_no}: could not parse row ({exc})")
                 continue
 
             if kind in _FILL_TYPES:
@@ -145,7 +172,7 @@ class CoinbaseImporter:
                 # Infinity, so a non-finite fee has no other guard anywhere on its
                 # way to the DB.
                 if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
-                    reject(row, line_no, f"line {line_no}: non-finite number, skipped")
+                    reject(row, raw_row, line_no, f"line {line_no}: non-finite number, skipped")
                     continue
 
                 # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
@@ -159,7 +186,7 @@ class CoinbaseImporter:
                 # `<= 0`, not `== 0`. This ordering comparison is now safe because
                 # the finiteness check above already ran and skipped any NaN.
                 if quantity <= 0:
-                    reject(row, line_no, f"line {line_no}: non-positive quantity, skipped")
+                    reject(row, raw_row, line_no, f"line {line_no}: non-positive quantity, skipped")
                     continue
 
                 # Same defect class as Fidelity's twin (see
@@ -201,7 +228,7 @@ class CoinbaseImporter:
                 # via multiplication) with nothing downstream to catch it —
                 # cash_movement.amount has no CHECK constraint at all.
                 if not amount.is_finite():
-                    reject(row, line_no, f"line {line_no}: non-finite amount, skipped")
+                    reject(row, raw_row, line_no, f"line {line_no}: non-finite amount, skipped")
                     continue
                 # For non-fiat cash (e.g., rewards in ETH), warn if price is missing.
                 # This already explains a zero amount for that specific shape (no
@@ -211,7 +238,7 @@ class CoinbaseImporter:
                 # cause.
                 if asset != currency and price == 0:
                     warnings.append(
-                        f"line {line_no}: {row.get('Transaction Type')!r} in {asset} has no "
+                        f"line {line_no}: {row.get('transaction type')!r} in {asset} has no "
                         "spot price; amount recorded as 0 and needs manual valuation"
                     )
                 else:
@@ -231,7 +258,7 @@ class CoinbaseImporter:
                         amount=amount,
                         currency=currency,
                         symbol=None if asset == currency else asset,
-                        note=(row.get("Notes") or "").strip() or None,
+                        note=(row.get("notes") or "").strip() or None,
                     )
                 )
             else:
@@ -245,8 +272,9 @@ class CoinbaseImporter:
                 # _row_carries_money).
                 reject(
                     row,
+                    raw_row,
                     line_no,
-                    f"line {line_no}: unhandled transaction type {row.get('Transaction Type')!r}",
+                    f"line {line_no}: unhandled transaction type {row.get('transaction type')!r}",
                 )
 
         return ImportBatch(

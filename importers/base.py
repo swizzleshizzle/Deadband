@@ -7,6 +7,7 @@ three-phase — parse, preview, commit — so nothing is written before it is se
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
@@ -14,6 +15,31 @@ from typing import Protocol
 from uuid import UUID
 
 from ledger.types import Instrument, Side
+
+# "Price ($)" -> "price", "Total (inclusive of fees and/or spread)" -> "total".
+# Real venue exports commonly suffix (or qualify) a money column with a
+# trailing parenthetical -- a currency denomination for Fidelity, a
+# descriptive qualifier for Coinbase. Strip it STRUCTURALLY rather than
+# aliasing the observed spellings: Fidelity's own export is inconsistent with
+# itself (its trailing disclaimer text writes "Fees($)" without the space its
+# header row uses), so an alias table would be one venue inconsistency away
+# from silently zeroing a column again -- see importers/fidelity.py's
+# original comment on this, which this shares with importers/coinbase.py so
+# the two venues can never drift onto two different normalization schemes.
+_FIELD_QUALIFIER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def normalize_field(name: str | None) -> str:
+    """Case- and qualifier-insensitive header key: lowercased, trailing
+    parenthetical stripped, whitespace trimmed. Every importer must build its
+    row dict by normalizing every key this same way (see importers/fidelity.py
+    and importers/coinbase.py) and look fields up by their normalized name --
+    an importer that reads even one raw, exact-cased header name is one
+    venue re-casing or renaming away from silently reading that column as
+    missing, which _decimal(None) then turns into a silent Decimal("0") with
+    no warning at all. This is the exact defect that started the whole
+    effort (see zero_price_warning's docstring)."""
+    return _FIELD_QUALIFIER_RE.sub("", (name or "").strip().lower()).strip()
 
 # Canonical sign convention for CanonicalCash.amount: amount is ALWAYS positive;
 # direction is carried entirely by `kind`, never by the sign of `amount`. A

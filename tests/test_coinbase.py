@@ -434,6 +434,64 @@ def test_non_finite_cash_amount_with_money_blocks():
     assert result.blocking, "a non-finite cash amount must block"
 
 
+# --- Finding B: the money guard read raw, exact-cased header names ---------
+#
+# _row_carries_money looked up "Quantity Transacted", "Subtotal", and
+# "Total (inclusive of fees and/or spread)" verbatim. importers/fidelity.py
+# normalizes header casing (and strips a trailing parenthetical qualifier)
+# before any lookup; Coinbase did not. If the venue re-cases or renames a
+# column, all three lookups miss, the guard returns False, and a
+# money-carrying row silently stops blocking -- the same shape as the defect
+# that motivated the whole task (money columns renamed with a currency
+# suffix, read as zero, no warning), just on Coinbase's header casing
+# instead of Fidelity's currency suffix.
+
+
+def _with_recased_money_headers(text: str) -> str:
+    """Rewrite the fixture's header row so every money column Coinbase's
+    guard inspects is differently cased than the venue's own documented
+    names, preserving column order so the data rows still align."""
+    lines = text.splitlines()
+    header = lines[0]
+    header = header.replace("Quantity Transacted", "quantity transacted")
+    header = header.replace("Subtotal", "SUBTOTAL")
+    header = header.replace(
+        "Total (inclusive of fees and/or spread)",
+        "TOTAL (Inclusive Of Fees And/Or Spread)",
+    )
+    return "\n".join([header, *lines[1:]]) + "\n"
+
+
+def test_recased_headers_still_parse_fills_and_cash_normally():
+    """Guards against the fix breaking the ordinary path: re-casing the
+    header must not change a single parsed value."""
+    result = CoinbaseImporter().parse(_with_recased_money_headers(FIXTURE))
+    baseline = batch()
+    assert [f.quantity for f in result.fills] == [f.quantity for f in baseline.fills]
+    assert [f.price for f in result.fills] == [f.price for f in baseline.fills]
+    assert [c.amount for c in result.cash] == [c.amount for c in baseline.cash]
+    assert result.fills[0].quantity == Decimal("0.50000000")
+
+
+def test_recased_money_headers_still_block_a_money_carrying_unmapped_row():
+    """Reproduces finding B directly: before normalization, re-casing
+    'Subtotal' and 'Quantity Transacted' makes _row_carries_money's
+    exact-cased lookups miss every one, so an unrecognised-transaction-type
+    row that carries real money (a non-zero Quantity Transacted and Total)
+    silently stops blocking, and --commit would proceed with rc=0."""
+    header = _with_recased_money_headers(FIXTURE).splitlines()[0]
+    row = (
+        header
+        + "\n2026-03-15T16:45:00Z,Stake,BTC,0.10000000,USD,70000.00,7000.00,7000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, (
+        "a money-carrying unmapped row must still block after header re-casing"
+    )
+    assert any("Stake" in msg for _ref, msg in result.blocking)
+
+
 def test_no_money_unmapped_row_still_warns_without_blocking():
     """A blank-quantity, blank-subtotal, blank-total unrecognised row has no
     financial content -- it must still be reported as unmapped (with a
