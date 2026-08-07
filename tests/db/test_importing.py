@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from db.accounts import create_account
-from db.importing import commit_batch
+from db.importing import commit_batch, probe_duplicates, route_batch
 from importers.base import CanonicalCash, CanonicalFill, ImportBatch
 from importers.coinbase import CoinbaseImporter
 from importers.fidelity import FidelityImporter
@@ -455,6 +455,57 @@ async def test_coinbase_import_with_a_negative_quantity_row_commits_the_good_row
     assert await _fill_count(conn, acc) == 2
 
 
+# --- Task 1: funding_source round-trips through the database ---------------
+
+
+def _fill(*, symbol: str, funding_source: str | None = None) -> CanonicalFill:
+    """Local helper mirroring the shape batch_of()/the other tests build inline
+    (equity Instrument + a fixed executed_at/side/qty/price shape), with
+    funding_source only passed through when the caller wants a non-default
+    value — so omitting it exercises CanonicalFill's own default."""
+    kwargs = dict(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"
+        ),
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("10"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+    )
+    if funding_source is not None:
+        kwargs["funding_source"] = funding_source
+    return CanonicalFill(**kwargs)
+
+
+async def test_funding_source_round_trips_through_commit(conn):
+    """A reinvestment-funded fill must persist as such. Without this the column
+    exists but nothing can ever set it, and contributed_capital cannot be
+    distinguished from cost basis."""
+    account_id = await create_account(
+        conn, name="t", venue="coinbase", account_type="cash"
+    )
+    batch = ImportBatch(
+        fills=(
+            _fill(symbol="AAA", funding_source="reinvestment"),
+            _fill(symbol="BBB"),  # defaults to external
+        )
+    )
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    rows = await conn.fetch(
+        """SELECT i.symbol, f.funding_source
+             FROM fill f JOIN instrument i ON i.id = f.instrument_id
+            WHERE f.account_id = $1 ORDER BY i.symbol""",
+        account_id,
+    )
+    assert [(r["symbol"], r["funding_source"]) for r in rows] == [
+        ("AAA", "reinvestment"),
+        ("BBB", "external"),
+    ]
+
+
 async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
     """A row carrying its own venue_fill_id dedupes on that id alone and must
     not also consume an occurrence slot in the shared counter — if it did, a
@@ -491,3 +542,357 @@ async def test_reordering_a_mixed_venue_fill_id_batch_stays_idempotent(conn):
     assert second.fills_inserted == 0
     assert second.fills_skipped == 2
     assert await _fill_count(conn, acc) == 2
+
+
+# --- Task 4: route_batch splits a parsed batch by account -------------------
+#
+# One export can span several accounts. Routing matches each row's
+# external_ref (the venue's own account NUMBER, never the nickname -- see
+# tests/test_fidelity.py) against account.external_ref within the venue.
+
+
+def _batch_spanning(*refs: str) -> ImportBatch:
+    """One fill per ref, all otherwise identical -- only external_ref varies,
+    since that's the only thing route_batch looks at."""
+    return ImportBatch(
+        fills=tuple(
+            CanonicalFill(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+                ),
+                executed_at=datetime(2026, 1, 15, tzinfo=UTC),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("500"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                external_ref=ref,
+            )
+            for ref in refs
+        )
+    )
+
+
+async def test_routing_splits_a_batch_by_account(conn):
+    a1 = await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    a2 = await create_account(
+        conn, name="two", venue="fidelity", account_type="cash", external_ref="A0000002"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001", "A0000002"))
+    assert set(plan.by_account) == {a1, a2}
+    assert plan.unknown_refs == ()
+
+
+async def test_an_unknown_account_ref_is_reported_not_merged(conn):
+    await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001", "A0000009"))
+    assert plan.unknown_refs == ("A0000009",)
+
+
+async def test_an_ignored_account_routes_successfully_and_is_skipped(conn):
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000003"))
+    assert plan.ignored_refs == ("A0000003",)
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()  # ignored is NOT unknown
+
+
+# --- Finding F: refs_seen-only refs (all-unmapped, non-financial rows) were -
+# --- invisible to route_batch's classification entirely. --------------------
+#
+# route_batch built its ref set from fills, cash, and blocking only. An
+# account contributing NOTHING but unmapped, non-financial rows (no fill, no
+# cash, no blocking reason -- refs_seen is the ONLY place such an account is
+# visible at all, see importers/fidelity.py's own refs_seen test) therefore
+# never reached this function's account lookup and could never be classified
+# as unknown or ignored. The external reviewer proposed making this REFUSE
+# the commit -- rejected: that reintroduces the over-block trap A2-6 exists
+# to avoid, where one stray boilerplate row attributed to an unregistered
+# account refuses every import permanently. The fix instead completes the
+# CLASSIFICATION (so reporting can say mapped/ignored/unknown) without
+# extending the REFUSAL, which stays keyed on money (fills/cash/blocking).
+
+
+def _batch_with_refs_seen_only(*refs: str) -> ImportBatch:
+    """No fills, no cash, no blocking -- refs_seen is the only place these
+    refs appear, exactly the "every row on this account failed to classify,
+    and none of them carried money" shape."""
+    return ImportBatch(refs_seen=tuple(refs))
+
+
+async def test_an_unregistered_refs_seen_only_account_is_classified_unknown_not_invisible(conn):
+    """No account is registered for A0000099 at all. Before the fix this ref
+    never reached the account lookup (fills/cash/blocking are all empty), so
+    it was neither unknown_refs nor ignored_refs nor routable -- invisible to
+    every classification. It must now show up as reported-unknown, and
+    critically must NOT show up in unknown_refs (which drives cli.py's
+    refusal) since it carries no money."""
+    plan = await route_batch(conn, "fidelity", _batch_with_refs_seen_only("A0000099"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == (), (
+        "a refs_seen-only ref must never drive refusal -- that's the over-block trap"
+    )
+    assert "A0000099" in plan.reported_unknown_refs
+
+
+async def test_a_registered_ignored_refs_seen_only_account_is_classified_ignored(conn):
+    """The mirror case: the account IS registered, and IS ignore_on_import,
+    but contributed only non-financial unmapped rows. Must classify as
+    ignored (for reporting), not as unknown -- same as an ignored account
+    that does contribute fills/cash."""
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    plan = await route_batch(conn, "fidelity", _batch_with_refs_seen_only("A0000003"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()
+    assert "A0000003" in plan.ignored_refs
+    assert "A0000003" not in plan.reported_unknown_refs
+
+
+async def test_a_money_carrying_unknown_ref_still_drives_refusal_even_when_also_in_refs_seen(conn):
+    """The other direction, pinned at the route_batch level: a ref that DOES
+    carry money (via a blocking reason) and has no matching account must
+    still land in unknown_refs -- refusal is unaffected by this fix."""
+    batch = ImportBatch(
+        blocking=(("A0000099", "line 2: unhandled action 'X'"),),
+        refs_seen=("A0000099",),
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert plan.unknown_refs == ("A0000099",)
+    assert "A0000099" in plan.reported_unknown_refs
+
+
+async def test_a_null_external_ref_account_is_never_a_wildcard(conn):
+    """UNIQUE (venue, external_ref) does not constrain NULLs, so several accounts
+    may have none. Treating NULL as a match would make the first such account a
+    silent catch-all for every unroutable row."""
+    await create_account(conn, name="no-ref", venue="fidelity", account_type="cash")
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000009"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ("A0000009",)
+
+
+async def test_a_row_with_no_external_ref_is_never_routed(conn):
+    """A row whose external_ref is None (e.g. a venue with no per-row account
+    identifier) must never be routed to any account -- not even one that also
+    has no external_ref. Distinguishes routing on a NULL row-side ref from
+    routing on a NULL account-side ref (the sibling test above)."""
+    await create_account(conn, name="no-ref", venue="fidelity", account_type="cash")
+    batch = ImportBatch(
+        fills=(
+            CanonicalFill(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD"
+                ),
+                executed_at=datetime(2026, 1, 15, tzinfo=UTC),
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("500"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                external_ref=None,
+            ),
+        )
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()
+    assert plan.ignored_refs == ()
+
+
+async def test_routing_splits_cash_movements_too(conn):
+    """route_batch must partition cash, not only fills -- a cash-only batch
+    (e.g. a dividend-only export) must still route correctly."""
+    a1 = await create_account(
+        conn, name="one", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    a2 = await create_account(
+        conn, name="two", venue="fidelity", account_type="cash", external_ref="A0000002"
+    )
+    batch = ImportBatch(
+        cash=(
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("5"),
+                currency="USD",
+                external_ref="A0000001",
+            ),
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("7"),
+                currency="USD",
+                external_ref="A0000002",
+            ),
+        )
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert set(plan.by_account) == {a1, a2}
+    assert len(plan.by_account[a1].cash) == 1
+    assert len(plan.by_account[a2].cash) == 1
+
+
+# --- Task 6: preview duplicate probe -----------------------------------------
+#
+# Preview deliberately never opens a database connection (see
+# tests/test_cli.py's test_preview_import_never_opens_a_database_connection).
+# probe_duplicates is the explicit, opt-in exception -- read-only, wired
+# behind --check-duplicates in cli.py, and never called by default preview.
+
+
+def _batch_of_two_fills() -> ImportBatch:
+    return batch_of(2)
+
+
+async def test_probe_reports_duplicates_without_writing(conn):
+    """Task 6, brief Step 1. before == after proves the probe wrote nothing;
+    fill_dupes == 2 proves it recognizes both already-committed fills."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    batch = _batch_of_two_fills()
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    before = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id)
+    report = await probe_duplicates(conn, account_id, batch)
+    after = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id)
+
+    assert report.fill_dupes == 2
+    assert before == after == 2
+
+
+async def test_probe_reports_zero_for_a_batch_not_yet_committed(conn):
+    """A fresh batch against an empty account has nothing to find yet -- the
+    probe must not report phantom duplicates."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    report = await probe_duplicates(conn, account_id, batch_of(2))
+    assert report.fill_dupes == 0
+    assert report.cash_dupes == 0
+
+
+async def test_probe_agrees_with_a_subsequent_commit_on_partial_overlap(conn):
+    """The probe and commit_batch must never disagree: 2 of 3 fills already
+    committed means the probe reports 2 dupes, and a subsequent commit of the
+    same 3-fill batch inserts exactly the 1 new one -- proving they share the
+    same dedupe keys rather than two independently-maintained hashing schemes
+    that could drift apart."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    await commit_batch(conn, account_id, batch_of(2), source="csv")
+
+    three = batch_of(3)
+    report = await probe_duplicates(conn, account_id, three)
+    assert report.fill_dupes == 2
+
+    result = await commit_batch(conn, account_id, three, source="csv")
+    assert result.fills_inserted == 1
+    assert result.fills_skipped == 2
+
+
+async def test_probe_reports_duplicates_by_venue_fill_id_too(conn):
+    """Not every fill dedupes on content_hash -- a row carrying its own
+    venue_fill_id dedupes on (account_id, venue_fill_id) instead (see
+    commit_batch). The probe must recognize that path too, not just
+    content_hash."""
+    account_id = await create_account(conn, name="t", venue="coinbase", account_type="wallet")
+    fill = CanonicalFill(
+        instrument=Instrument(
+            id=None, asset_class=AssetClass.CRYPTO_SPOT, symbol="BTC", quote_currency="USD"
+        ),
+        executed_at=datetime(2026, 1, 15, 14, 30, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        price=Decimal("60000"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        venue_fill_id="v-1",
+    )
+    batch = ImportBatch(fills=(fill,))
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    report = await probe_duplicates(conn, account_id, batch)
+    assert report.fill_dupes == 1
+
+
+async def test_probe_reports_cash_duplicates_without_writing(conn):
+    """Same guarantee as the fills test above, for cash movements: the probe
+    must recognize an already-committed dividend as a duplicate and must not
+    write a new one."""
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    dividend = ImportBatch(
+        cash=(
+            CanonicalCash(
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),
+                kind="dividend",
+                amount=Decimal("10"),
+                currency="USD",
+            ),
+        )
+    )
+    await commit_batch(conn, account_id, dividend, source="csv")
+
+    before = await conn.fetchval(
+        "SELECT count(*) FROM cash_movement WHERE account_id = $1", account_id
+    )
+    report = await probe_duplicates(conn, account_id, dividend)
+    after = await conn.fetchval(
+        "SELECT count(*) FROM cash_movement WHERE account_id = $1", account_id
+    )
+
+    assert report.cash_dupes == 1
+    assert report.fill_dupes == 0
+    assert before == after == 1
+
+
+async def test_routing_does_not_cross_venues(conn):
+    """An account with a matching external_ref at a DIFFERENT venue must not
+    be matched -- routing is scoped to (venue, external_ref), same as the
+    UNIQUE constraint."""
+    await create_account(
+        conn, name="other-venue", venue="coinbase", account_type="wallet", external_ref="A0000001"
+    )
+    plan = await route_batch(conn, "fidelity", _batch_spanning("A0000001"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ("A0000001",)
+
+
+# --- I5: the probe/commit agreement tests could not fail against the drift --
+# --- they exist to catch. All five probe tests above use batch_of(n), whose
+# --- fills fall on DIFFERENT days -- occurrence is 0 for every row, so the
+# --- one non-obvious part of _fill_dedupe_keys (the occurrence index, the
+# --- entire reason it was extracted as shared code) is never exercised by
+# --- any of them. _TWO_IDENTICAL_FIDELITY_ROWS (same day, same shape) is
+# --- what actually distinguishes a probe that shares commit_batch's dedupe
+# --- keys from one that has quietly drifted.
+
+
+async def test_probe_agrees_with_commit_on_same_day_duplicate_rows(conn):
+    """Commits _TWO_IDENTICAL_FIDELITY_ROWS (same day, same symbol/side/qty/
+    price -- occurrence 0 and 1) and then probes the SAME batch again. Fails
+    if probe_duplicates ever stops sharing _fill_dedupe_keys with
+    commit_batch (e.g. an inline content_hash call that drops the occurrence
+    argument): such a drift collapses both rows onto the SAME hash, so the
+    probe would report only 1 duplicate while commit_batch (which does use
+    occurrence) would still correctly skip both on a re-commit -- the probe
+    silently disagreeing with the commit it exists to preview."""
+    batch = FidelityImporter().parse(_TWO_IDENTICAL_FIDELITY_ROWS)
+    account_id = await create_account(conn, name="t", venue="fidelity", account_type="cash")
+    await commit_batch(conn, account_id, batch, source="csv")
+
+    report = await probe_duplicates(conn, account_id, batch)
+    assert report.fill_dupes == 2

@@ -190,25 +190,47 @@ async def test_preview_import_never_opens_a_database_connection(monkeypatch, cap
     assert "preview only" in out
 
 
-def test_commit_without_account_is_rejected(monkeypatch):
-    """main() must refuse --commit without --account before ever touching asyncio
-    or the database. Fails if that guard is removed or weakened."""
+def test_commit_without_account_is_rejected(monkeypatch, capsys):
+    """Task 4 amendment: whether --account is required depends on whether the
+    parsed file has any row with no account ref to route by (a venue like
+    Fidelity that carries its own per-row account number needs no --account
+    at all) -- that can't be known until the file is read, so it's no longer
+    an argparse-time guard (SystemExit before cmd_import even runs). Coinbase
+    carries no per-row account ref, so it still needs --account; this is now
+    enforced inside cmd_import, returning a non-zero code.
+
+    The old version asserted only the return code, which is satisfiable even
+    if the check were moved to run AFTER a database connection is opened —
+    that regressed the "no DB connection" guarantee the original SystemExit
+    version pinned structurally (a SystemExit from argparse is, by
+    construction, before asyncio.run ever starts). Proven the same way
+    test_preview_import_never_opens_a_database_connection above does: make
+    create_pool blow up if called, and assert the command still returns
+    non-zero without ever calling it."""
+
+    async def boom(*_args, **_kwargs):
+        raise AssertionError(
+            "the --account-required check must run before any database "
+            "connection is opened"
+        )
+
+    monkeypatch.setattr(cli, "create_pool", boom)
     monkeypatch.setattr(
         "sys.argv",
         ["deadband", "import", "coinbase", "tests/fixtures/coinbase/transactions.csv", "--commit"],
     )
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main()
-    assert exc_info.value.code != 0
+    rc = cli.main()
+    assert rc != 0
+    assert "account" in capsys.readouterr().err.lower()
 
 
 async def test_import_warns_when_a_file_mixes_multiple_account_refs(capsys):
     """The Fidelity fixture deliberately carries two account numbers
-    (X12345678, X87654321), and routing to per-account ledgers isn't
-    implemented — every row still lands under the single --account given. That
-    makes a loud warning here the only thing standing between "silent merge"
-    and "known limitation." Fails if the warning is missing, or if it's printed
-    but doesn't name both refs."""
+    (X12345678, X87654321). --commit routes each row to its own account
+    automatically (see db.importing.route_batch); preview never opens a
+    connection, so this loud, DB-free warning is what stands in for that
+    report before a commit is attempted. Fails if the warning is missing, or
+    if it's printed but doesn't name both refs."""
     args = argparse.Namespace(
         venue="fidelity",
         file="tests/fixtures/fidelity/activity.csv",
@@ -221,6 +243,36 @@ async def test_import_warns_when_a_file_mixes_multiple_account_refs(capsys):
     err = capsys.readouterr().err
     assert "X12345678" in err
     assert "X87654321" in err
+
+
+async def test_preview_names_an_account_whose_rows_are_entirely_unmapped(tmp_path, capsys):
+    """The defect this task exists to fix: an account contributing ONLY
+    unrecognised-action rows produces zero fills and zero cash, so a report
+    derived from fills/cash can never see it -- exactly the account most in
+    need of being flagged. Fails if the preview report is derived from
+    batch.fills/batch.cash instead of batch.refs_seen (every account ref seen
+    in the raw rows, mapped or not)."""
+    header = (
+        "Run Date,Account Number,Action,Symbol,Description,Quantity,"
+        "Price,Commission,Fees,Amount"
+    )
+    rows = "\n".join(
+        [
+            header,
+            "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+            "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,123.45",
+            "01/17/2026,A0000005,ANOTHER UNRECOGNISED ACTION,BBB,DESC,,,,,67.89",
+        ]
+    )
+    file_path = tmp_path / "partial.csv"
+    file_path.write_text(rows + "\n")
+
+    args = argparse.Namespace(venue="fidelity", file=str(file_path), account=None, commit=False)
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert "A0000005" in err
 
 
 async def test_import_does_not_warn_when_a_file_has_a_single_account_ref(capsys):
@@ -284,6 +336,47 @@ async def test_pool_is_closed_when_the_command_body_raises(monkeypatch):
         await cli.cmd_accounts(argparse.Namespace())
 
     assert fake_pool.closed is True
+
+
+# --- Finding C: --check-duplicates could print "0 duplicates" for rows it --
+# --- never actually probed. ---------------------------------------------------
+#
+# The probe path didn't apply the account/routing validation --commit does:
+# a row with no resolvable target (no --account for a venue with no per-row
+# ref) was simply skipped, and the printed count silently omitted it.
+
+
+async def test_check_duplicates_refuses_when_unrouted_rows_have_no_account_fallback(
+    monkeypatch, capsys
+):
+    """Coinbase carries no per-row account ref; --commit already requires
+    --account for such rows before it ever opens a connection (see
+    test_commit_without_account_is_rejected above). --check-duplicates must
+    apply the identical requirement instead of silently dropping those rows
+    from the probe and printing a count that looks complete but isn't.
+    Proven the same structural way: create_pool blows up if called, so this
+    also pins that the check runs before any connection is opened."""
+
+    async def boom(*_args, **_kwargs):
+        raise AssertionError(
+            "the --account-required check must run before any database "
+            "connection is opened, even under --check-duplicates"
+        )
+
+    monkeypatch.setattr(cli, "create_pool", boom)
+
+    args = argparse.Namespace(
+        venue="coinbase",
+        file="tests/fixtures/coinbase/transactions.csv",
+        account=None,
+        commit=False,
+        check_duplicates=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc != 0
+
+    err = capsys.readouterr().err
+    assert "--account" in err
 
 
 def test_import_missing_file_prints_a_clean_error_not_a_traceback(monkeypatch, capsys):

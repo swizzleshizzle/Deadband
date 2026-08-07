@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from db.instruments import get_multipliers, upsert_instrument
-from ledger.types import AssetClass, Instrument
+from ledger.types import AssetClass, Instrument, instrument_natural_key
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -33,11 +33,21 @@ async def test_upsert_returns_the_same_id_for_the_same_instrument(conn):
 
 
 async def test_differently_formatted_strikes_collapse_to_one_row(conn):
+    # No count-based assertion (absolute or delta) can work here: the shared test
+    # database is not guaranteed empty or free of this exact row (see
+    # tests/db/test_importing.py header comment), and instrument has no FK back to
+    # account, so committed rows from other tests/CLI runs persist independently of
+    # what this test itself does. instrument.natural_key is NOT NULL UNIQUE
+    # (db/schema.sql), so `a == b` alone already proves the collapse: if "500" and
+    # "500.00" produced different keys they would upsert into two different rows
+    # with two different ids, and the equality would fail regardless of how many
+    # other instrument rows already exist. The second assertion pins the mechanism
+    # directly by comparing the derived natural keys themselves, independent of the
+    # database entirely.
     a = await upsert_instrument(conn, option("500"))
     b = await upsert_instrument(conn, option("500.00"))
     assert a == b
-    count = await conn.fetchval("SELECT count(*) FROM instrument")
-    assert count == 1
+    assert instrument_natural_key(option("500")) == instrument_natural_key(option("500.00"))
 
 
 async def test_different_instruments_get_different_ids(conn):

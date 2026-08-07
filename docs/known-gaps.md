@@ -203,10 +203,34 @@ this file is the project's memory.
 
 ## Accepted permanently
 
-- **Cross-batch same-day identical trades still collapse.** Two genuinely distinct
-  identical trades on one day, split across exports that never both contain the pair,
-  dedupe into one. Unfixable without a venue-supplied intra-day ordinal. Documented in
-  `commit_batch`'s docstring.
+- **Cross-batch same-day identical trades still collapse** — *for CSV sources only; see
+  below.* Two genuinely distinct identical trades on one day, split across exports that
+  never both contain the pair, dedupe into one. Unfixable without a venue-supplied
+  intra-day ordinal. Documented in `commit_batch`'s docstring.
+
+  > [!note] Still permanent for Coinbase CSV — API cut-over decided but deferred (2026-08-05)
+  > This was recorded as unfixable because no *export* carries an intra-day ordinal. That
+  > remains true today: the CSV importer is what Coinbase ships, and it carries no ordinal
+  > and no venue fill id, so this gap is currently in force for Coinbase exactly as it is
+  > for Fidelity.
+  >
+  > A path off this exists on paper. The Coinbase Advanced Trade API would return a venue
+  > trade id (`GET /orders/historical/fills`); the schema already has `fill_venue_id_uniq`
+  > and the import path already prefers `(account_id, venue_fill_id)` over `content_hash`
+  > where the venue supplies an id — that path exists and is unused for Coinbase only
+  > because the CSV omits one. Adopting the API (spec A2-16) **would** retire this gap for
+  > Coinbase. But A2-16 is DECIDED and DEFERRED to part 2b, not implemented in this phase —
+  > the API importer does not exist, so nothing has actually retired the gap yet. Treat
+  > this note as a plan, not a status change, until A2-16 ships.
+  >
+  > It remains permanent for **Fidelity** regardless of A2-16's outcome, whose exports
+  > carry no fill id and for which no viable API transport exists (spec A2-15).
+  >
+  > Worth noting how this was found: the gap was accepted as unfixable given the *inputs
+  > then in hand*. It was never re-tested against a different input. "Unfixable" is a
+  > claim about a data source, not about the problem -- and for Coinbase specifically it
+  > is a claim that will stop being true the day A2-16 actually ships, not one that is
+  > false today.
 - **The purity checker is evadable** via `getattr(datetime, 'now')()` or `builtins.open`.
   It guards accidental I/O by implementers, not a motivated adversary.
 - **`localcontext()` inherits `Emax` / `traps` / `rounding`** from the caller; only `prec`

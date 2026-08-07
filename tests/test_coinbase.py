@@ -275,3 +275,233 @@ def test_zero_price_on_non_fiat_cash_is_warned_about():
     assert result.warnings[0].startswith("line 2:")
     # Amount should be 0 (0.01 * 0)
     assert result.cash[0].amount == Decimal("0")
+
+
+# --- Task 5: silent loss must be impossible ---------------------------------
+#
+# The defect that started this whole effort: a real export names its money
+# columns with a currency suffix, the importer read the bare names, missed
+# every one, and _decimal(None) silently returned Decimal("0") for each --
+# dates/quantities/symbols all correct, price and fee zero, no warning.
+# importers/base.zero_price_warning is the shared guard; this pins that
+# Coinbase's fill branch actually calls it, not just Fidelity's.
+
+
+def _coinbase_row_with_zero_price() -> str:
+    header = FIXTURE.splitlines()[0]
+    return (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.50000000,USD,0.00,0.00,0.00,0.00,zero price test\n"
+    )
+
+
+def test_the_zero_price_guard_covers_coinbase_too():
+    """Same defect class, same guard. Coinbase was never audited for it."""
+    result = CoinbaseImporter().parse(_coinbase_row_with_zero_price())
+    assert any("zero price" in w.lower() for w in result.warnings)
+
+
+# --- C2: cash rows had no zero-amount guard ---------------------------------
+#
+# Coinbase's cash branch computes `amount` from Quantity Transacted (and,
+# for non-fiat cash, Spot Price) with no equivalent of the fill branch's
+# zero_price_warning. A blank/zero Quantity Transacted on a deposit-shaped
+# row silently produces a $0.00 cash_movement with no warning at all --
+# unlike the fill branch, which at least gets a "non-positive quantity"
+# warning (and drops the row) for the same input shape.
+
+
+def test_a_zero_quantity_deposit_produces_a_zero_amount_warning():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-02-10T00:00:00Z,Deposit,USD,0,USD,1.00,0,0,0,blank deposit\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.cash) == 1
+    assert result.cash[0].amount == Decimal("0")
+    assert any("zero amount" in w.lower() for w in result.warnings)
+
+
+# --- I4: Coinbase never populated `blocking` at all -------------------------
+#
+# The spec's failure-policy table is venue-neutral; the plan narrowed the
+# money-carrying-unmapped-row blocking policy to Fidelity, so Coinbase's
+# ImportBatch never set blocking, and `--commit` proceeded past an
+# unrecognised transaction type even when it carries real money. The shipped
+# fixture (tests/fixtures/coinbase/transactions.csv) already contains an
+# unmapped "Convert" row with a non-zero Quantity Transacted -- it has always
+# been silently non-blocking.
+
+
+def test_the_shipped_fixtures_unmapped_convert_row_blocks_the_commit():
+    """The Convert row in the real, shipped fixture carries a non-zero
+    Quantity Transacted (0.1 BTC) -- exactly the shape that must refuse the
+    commit rather than let it proceed silently."""
+    result = batch()
+    assert result.blocking, "the shipped fixture's money-carrying Convert row must block"
+    assert any("Convert" in msg for _ref, msg in result.blocking)
+
+
+def test_an_unrecognised_transaction_type_carrying_an_amount_blocks():
+    header = FIXTURE.splitlines()[0]
+    row = (
+        header
+        + "\n2026-03-15T16:45:00Z,Stake,BTC,0.10000000,USD,70000.00,7000.00,7000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "an unrecognised type carrying an amount must block"
+    assert any("Stake" in msg for _ref, msg in result.blocking)
+
+
+def test_an_unrecognised_transaction_type_with_no_quantity_only_warns():
+    """A zero-quantity unrecognised row has no financial content -- blocking
+    on it would make an inert, unrecognised row type (a report footer, say)
+    refuse every import forever, same reasoning as Fidelity's twin guard."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-03-15T16:45:00Z,Stake,BTC,0,USD,70000.00,0,0,0.00,x\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking == ()
+
+
+# --- I4 residual: matched-but-bad-data rows still only warned, never --------
+# --- blocked. `blocking` was populated ONLY by the "unhandled transaction ---
+# --- type" branch; the matched-but-garbled-money paths -- non-finite -------
+# --- quantity/price/fee, non-positive quantity in the fill branch, and -----
+# --- non-finite amount in the cash branch -- appended to `unmapped` and ----
+# --- `warnings` directly and never consulted `blocking` at all. A row that -
+# --- DID match a rule (Buy/Sell/Deposit/...) but carried a garbled or -------
+# --- negative quantity/price/fee/amount therefore dropped a real dollar ----
+# --- figure with only a warning nobody has to read, and --commit proceeded -
+# --- with rc=0. This is the exact defect shape already closed for Fidelity -
+# --- (finding I3) -- see importers/fidelity.py's reject().
+
+
+def test_reviewer_demonstration_row_negative_quantity_with_real_total_blocks():
+    """The reviewer's exact demonstration row: a Buy with a negative quantity
+    and a real $30,000 total. Before the fix this fell into the
+    non-positive-quantity branch, which appended to unmapped/warnings but
+    never to blocking -- the $30,000 fill vanished with a warning nobody has
+    to read, and the import reported success."""
+    header = FIXTURE.splitlines()[0]
+    row = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,-0.50000000,USD,60000.00,30000.00,30000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "a negative-quantity row carrying a real total must block"
+
+
+def test_non_finite_quantity_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,Infinity,USD,61200.00,30600.00,30753.00,153.00,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite quantity carrying a real total must block"
+
+
+def test_non_finite_price_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,Infinity,30600.00,30753.00,153.00,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite price on a real-quantity row must block"
+
+
+def test_non_finite_fee_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = (
+        header
+        + "\n2026-01-15T14:30:00Z,Buy,BTC,0.5,USD,61200.00,30600.00,30753.00,Infinity,x\n"
+    )
+    result = CoinbaseImporter().parse(bad)
+    assert result.fills == ()
+    assert result.blocking, "a non-finite fee on a real-quantity row must block"
+
+
+def test_non_finite_cash_amount_with_money_blocks():
+    header = FIXTURE.splitlines()[0]
+    bad = header + "\n2026-02-10T00:00:00Z,Deposit,USD,Infinity,USD,1.00,0,0,0,x\n"
+    result = CoinbaseImporter().parse(bad)
+    assert result.cash == ()
+    assert result.blocking, "a non-finite cash amount must block"
+
+
+# --- Finding B: the money guard read raw, exact-cased header names ---------
+#
+# _row_carries_money looked up "Quantity Transacted", "Subtotal", and
+# "Total (inclusive of fees and/or spread)" verbatim. importers/fidelity.py
+# normalizes header casing (and strips a trailing parenthetical qualifier)
+# before any lookup; Coinbase did not. If the venue re-cases or renames a
+# column, all three lookups miss, the guard returns False, and a
+# money-carrying row silently stops blocking -- the same shape as the defect
+# that motivated the whole task (money columns renamed with a currency
+# suffix, read as zero, no warning), just on Coinbase's header casing
+# instead of Fidelity's currency suffix.
+
+
+def _with_recased_money_headers(text: str) -> str:
+    """Rewrite the fixture's header row so every money column Coinbase's
+    guard inspects is differently cased than the venue's own documented
+    names, preserving column order so the data rows still align."""
+    lines = text.splitlines()
+    header = lines[0]
+    header = header.replace("Quantity Transacted", "quantity transacted")
+    header = header.replace("Subtotal", "SUBTOTAL")
+    header = header.replace(
+        "Total (inclusive of fees and/or spread)",
+        "TOTAL (Inclusive Of Fees And/Or Spread)",
+    )
+    return "\n".join([header, *lines[1:]]) + "\n"
+
+
+def test_recased_headers_still_parse_fills_and_cash_normally():
+    """Guards against the fix breaking the ordinary path: re-casing the
+    header must not change a single parsed value."""
+    result = CoinbaseImporter().parse(_with_recased_money_headers(FIXTURE))
+    baseline = batch()
+    assert [f.quantity for f in result.fills] == [f.quantity for f in baseline.fills]
+    assert [f.price for f in result.fills] == [f.price for f in baseline.fills]
+    assert [c.amount for c in result.cash] == [c.amount for c in baseline.cash]
+    assert result.fills[0].quantity == Decimal("0.50000000")
+
+
+def test_recased_money_headers_still_block_a_money_carrying_unmapped_row():
+    """Reproduces finding B directly: before normalization, re-casing
+    'Subtotal' and 'Quantity Transacted' makes _row_carries_money's
+    exact-cased lookups miss every one, so an unrecognised-transaction-type
+    row that carries real money (a non-zero Quantity Transacted and Total)
+    silently stops blocking, and --commit would proceed with rc=0."""
+    header = _with_recased_money_headers(FIXTURE).splitlines()[0]
+    row = (
+        header
+        + "\n2026-03-15T16:45:00Z,Stake,BTC,0.10000000,USD,70000.00,7000.00,7000.00,0.00,x\n"
+    )
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, (
+        "a money-carrying unmapped row must still block after header re-casing"
+    )
+    assert any("Stake" in msg for _ref, msg in result.blocking)
+
+
+def test_no_money_unmapped_row_still_warns_without_blocking():
+    """A blank-quantity, blank-subtotal, blank-total unrecognised row has no
+    financial content -- it must still be reported as unmapped (with a
+    warning) but must NOT block, otherwise the fix would make a
+    legitimately-unmappable row (a report footer, a currency-neutral no-op)
+    refuse every import forever -- exactly the trap the Fidelity policy was
+    carefully designed to avoid."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n2026-03-15T16:45:00Z,Stake,BTC,,USD,70000.00,,,0.00,x\n"
+    result = CoinbaseImporter().parse(row)
+    assert len(result.unmapped_rows) == 1
+    assert any("unhandled transaction type" in w for w in result.warnings)
+    assert result.blocking == ()

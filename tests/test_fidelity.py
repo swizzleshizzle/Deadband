@@ -2,7 +2,15 @@ import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from importers.fidelity import FidelityImporter, parse_option_symbol
+from importers.base import OUTFLOW_KINDS
+from importers.fidelity import (
+    RULES,
+    FidelityImporter,
+    Outcome,
+    classify,
+    is_sweep,
+    parse_option_symbol,
+)
 from ledger.types import AssetClass, Side
 
 # Anchored to this test file's own location, not the process cwd — same
@@ -84,6 +92,72 @@ def test_account_number_is_carried_for_routing():
     """A venue with several accounts must route rows to the right one."""
     refs = {f.external_ref for f in batch().fills}
     assert refs == {"X12345678", "X87654321"}
+
+
+# --- Task 4: external_ref is the account NUMBER, never the nickname --------
+#
+# Real exports carry both an "Account" (nickname, e.g. "INDIVIDUAL - TOD") and
+# a separate "Account Number" column. The nickname is neither stable nor
+# unique (two accounts can share one), so routing must key on the number.
+
+MULTI_ACCOUNT_FIXTURE = (
+    "Run Date,Account,Account Number,Action,Symbol,Description,Quantity,"
+    "Price,Commission,Fees,Amount\n"
+    "01/15/2026,Individual,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,"
+    "1,100.00,0.00,0.00,-100.00\n"
+    # Same nickname as the row above, deliberately -- if external_ref were
+    # ever read from the nickname column, both rows would collapse onto the
+    # same ref instead of the two distinct account numbers.
+    "01/16/2026,Individual,A0000002,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+    "MARKET ETF,1,100.00,0.00,0.00,-100.00\n"
+)
+
+
+def test_external_ref_is_the_account_number_not_the_nickname():
+    """Real exports carry BOTH an account nickname and an account number. The
+    number is the identifier; the nickname is not stable and is not unique."""
+    result = FidelityImporter().parse(MULTI_ACCOUNT_FIXTURE)
+    assert {f.external_ref for f in result.fills} == {"A0000001", "A0000002"}
+
+
+def test_refs_seen_includes_an_account_whose_rows_are_entirely_unmapped():
+    """The account contributing nothing but unrecognised actions is exactly
+    the one a fills/cash-derived report can never see -- refs_seen is derived
+    from the raw rows, independent of whether they classified. Fails if
+    refs_seen is built from fills/cash instead of from every row's account
+    number column."""
+    header = (
+        "Run Date,Account Number,Action,Symbol,Description,Quantity,"
+        "Price,Commission,Fees,Amount"
+    )
+    rows = "\n".join(
+        [
+            header,
+            "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+            "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,123.45",
+            "01/17/2026,A0000005,ANOTHER UNRECOGNISED ACTION,BBB,DESC,,,,,67.89",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+
+    assert set(result.refs_seen) == {"A0000001", "A0000005"}
+    # A0000005 contributed zero fills and zero cash -- refs_seen is the ONLY
+    # place it's visible. Guards the guard: if this were false, the assertion
+    # above could pass vacuously off a fills/cash-derived implementation too.
+    assert all(f.external_ref != "A0000005" for f in result.fills)
+    assert all(c.external_ref != "A0000005" for c in result.cash)
+
+
+def test_missing_account_number_column_falls_back_to_none_not_the_nickname():
+    """An export without the Account Number column (e.g. an older export
+    shape) must not silently fall back to the unreliable nickname -- routing
+    on a nickname is exactly the bug this task fixes. Unroutable is the
+    correct, honest outcome."""
+    header = "Run Date,Account,Action,Symbol,Description,Quantity,Price,Commission,Fees,Amount"
+    row = header + "\n06/01/2026,Individual,YOU BOUGHT,AAA,ACME CORP,1,10.00,0.00,0.00,-10.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].external_ref is None
 
 
 # --- "Never drop a row silently" -------------------------------------------
@@ -174,7 +248,25 @@ def test_trailing_disclaimer_line_is_reported_as_unmapped_not_dropped():
 def test_malformed_cash_amount_is_reported_not_fatal():
     """A bad Amount on a cash row (dividend/transfer/interest) must not raise
     and must not take down the rest of the file with it — same defensive
-    pattern already applied to the fill branch's Quantity/Price/Commission/Fees."""
+    pattern already applied to the fill branch's Quantity/Price/Commission/Fees.
+
+    Restated for I3: this row is a MATCHED rule (DIVIDEND RECEIVED) that then
+    fails on a garbled Amount ("N/A") -- exactly the case I3 closes. Before
+    I3's fix this row warned and fell out as unmapped but never reached
+    `blocking` at all, because only "no rule matched" ever consulted
+    _carries_money; the bad-amount path here was one of the five parallel
+    paths that fell out through their own InvalidOperation/non-finite checks
+    instead. _carries_money fails open on InvalidOperation ("N/A" cannot be
+    parsed, so it is treated as "might carry money" rather than silently
+    read as zero), so this row must now also block.
+
+    This does NOT reinstate the original defect being tested here ("one bad
+    row must not abort the whole FILE"): parse() still does not raise, the
+    two good fills still parse, and blocking's job is to refuse the COMMIT
+    (in cli.py, at import time) rather than to raise out of parse() itself --
+    see ImportBatch.blocking's docstring. The original assertions (fill/cash/
+    unmapped/warning counts, and that "bad amount" is the warning text) are
+    kept verbatim; only the new blocking assertion is added."""
     header = FIXTURE.splitlines()[0]
     rows = "\n".join(
         [
@@ -190,6 +282,9 @@ def test_malformed_cash_amount_is_reported_not_fatal():
     assert len(result.unmapped_rows) == 1
     assert len(result.warnings) == 1
     assert "bad amount" in result.warnings[0]
+    assert len(result.blocking) == 1, "a matched rule with a garbled Amount must now block"
+    assert result.blocking[0][0] == "X1"
+    assert "bad amount" in result.blocking[0][1]
 
 
 # --- Fix round 1, item 2: direction comes from the action, not the sign, ---
@@ -373,3 +468,396 @@ def test_lowercase_header_is_parsed_the_same_as_the_standard_header():
     assert len(result.cash) == len(baseline.cash) == 2
     assert result.fills[0].price == baseline.fills[0].price
     assert result.fills[0].quantity == baseline.fills[0].quantity
+
+
+# --- Task 2: the declarative action rule table ------------------------------
+#
+# _CASH_ACTIONS was a dict of four exact prefixes. Real Fidelity action text
+# is compound (action, security name, ticker, settlement type, all
+# concatenated), and the reinvestment decision cannot be made from the action
+# alone: REINVESTMENT means cash when the symbol is a money-market sweep and
+# a fill when it's a real security. classify() is keyed on action AND symbol.
+
+
+def test_reinvestment_of_a_real_security_is_a_fill():
+    """A DRIP purchase is a genuine acquisition with real basis, tagged so that
+    contributed_capital can exclude it."""
+    rule = classify("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA")
+    assert rule is not None
+    assert rule.outcome is Outcome.FILL
+    assert rule.funding_source == "reinvestment"
+    assert rule.side is Side.BUY
+
+
+def test_reinvestment_of_a_sweep_fund_is_internal_not_cash():
+    """The sweep IS cash under A2-9, so the dividend leg already recorded this
+    money. Recording the reinvestment leg too would count it twice."""
+    rule = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
+    assert rule is not None
+    assert rule.outcome is Outcome.INTERNAL
+
+
+def test_the_same_action_verb_resolves_differently_by_symbol():
+    """The whole reason the table is keyed on action AND symbol. An action-only
+    table cannot express this, so this test fails against any such design."""
+    security = classify("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA")
+    sweep = classify("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX")
+    assert security.outcome is not sweep.outcome
+
+
+def test_return_of_capital_is_not_aliased_to_dividend():
+    """A return of capital reduces basis rather than being income. Recording it
+    as a dividend overstates income and leaves basis high."""
+    rule = classify("RETURN OF CAPITAL ACME PFD (AAA) (CASH)", "AAA")
+    assert rule.outcome is Outcome.CASH
+    assert rule.cash_kind == "return_of_capital"
+
+
+def test_foreign_tax_paid_is_an_outflow():
+    rule = classify("FOREIGN TAX PAID ACME ADR (AAA) (CASH)", "AAA")
+    assert rule.outcome is Outcome.CASH
+    assert rule.cash_kind == "tax"
+    assert "tax" in OUTFLOW_KINDS
+
+
+def test_an_unrecognised_action_classifies_as_none():
+    assert classify("SOME BRAND NEW ACTION NOBODY MAPPED", "AAA") is None
+
+
+# One (action, symbol) sample per rule in RULES, using synthetic tickers only,
+# each engineered to be the FIRST matching rule for its sample so the
+# reachability test below can prove no rule is shadowed by an earlier one.
+RULE_COVERAGE_SAMPLES = [
+    ("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX"),  # reinvest_sweep
+    ("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA"),  # reinvest_security
+    ("EXCHANGED TO MONEY MARKET (SPAXX)", "SPAXX"),  # exchange_sweep
+    ("DIVIDEND RECEIVED ACME CORP (AAA) (CASH)", "AAA"),  # dividend_received
+    ("DIVIDENDS ACME CORP (AAA) (CASH)", "AAA"),  # dividends
+    ("INTEREST EARNED ON CASH (AAA)", "AAA"),  # interest
+    ("RETURN OF CAPITAL ACME PFD (AAA) (CASH)", "AAA"),  # return_of_capital
+    ("FOREIGN TAX PAID ACME ADR (AAA) (CASH)", "AAA"),  # foreign_tax
+    ("FEE CHARGED ACCOUNT MAINTENANCE FEE", ""),  # fee_charged
+    ("RECORDKEEPING FEE Q1 2026", ""),  # recordkeeping_fee
+    ("REVENUE CREDIT ACME CORP (AAA)", "AAA"),  # revenue_credit
+    ("ELECTRONIC FUNDS TRANSFER RECEIVED", ""),  # eft_in
+    ("ELECTRONIC FUNDS TRANSFER PAID", ""),  # eft_out
+    ("CASH CONTRIBUTION IRA 2026", ""),  # cash_contribution
+    ("CO CONTR 2026 Q1", ""),  # employer_contribution
+    ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
+    ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+]
+
+
+def test_every_rule_is_reachable():
+    """A rule shadowed by an earlier one is dead code that looks like coverage.
+    Each rule must be the FIRST match for at least one sample, or the table has
+    an ordering bug."""
+    matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
+    assert matched == {r.name for r in RULES}
+
+
+# --- Fix round 1, item 1: end-to-end tests pinning the double-counting ------
+# --- invariant. Every classify()-level test above inspects the Rule object -
+# --- returned by classify() alone; none of them parses a CSV, so the wiring
+# --- between the rule table and parse() -- the thing that actually prevents
+# --- the double count -- was unpinned. A mutant that guts the INTERNAL branch
+# --- in parse() (while leaving RULES and classify() untouched) passed the
+# --- whole suite green and silently doubled every sweep dividend.
+
+
+def test_sweep_dividend_and_its_reinvestment_produce_exactly_one_cash_movement():
+    """The sweep IS cash (A2-9): a sweep dividend appears as two CSV rows (the
+    dividend, then its reinvestment back into the sweep), but that is ONE cash
+    event, not two. Fails if the INTERNAL branch in parse() is ever collapsed
+    into the cash path or reordered so the reinvestment leg gets recorded."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "04/01/2026,X1,DIVIDEND RECEIVED MONEY MARKET (SPAXX) (CASH),SPAXX,"
+            "FIDELITY GOVERNMENT MONEY MARKET,,,,,10.00",
+            "04/01/2026,X1,REINVESTMENT MONEY MARKET (SPAXX) (CASH),SPAXX,"
+            "FIDELITY GOVERNMENT MONEY MARKET,10,1.00,0.00,0.00,-10.00",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.cash) == 1
+    assert len(result.fills) == 0
+    assert result.cash[0].amount == Decimal("10.00")
+
+
+def test_real_security_dividend_and_its_reinvestment_produce_both_legs():
+    """The opposite case: a real security's dividend is cash in, and the DRIP
+    that follows is a genuine acquisition funded by that cash. Both legs must
+    record, or contributed_capital/cost_basis silently lose real data."""
+    header = FIXTURE.splitlines()[0]
+    rows = "\n".join(
+        [
+            header,
+            "04/01/2026,X1,DIVIDEND RECEIVED ACME CORP (AAA) (CASH),AAA,ACME CORP,,,,,5.00",
+            "04/01/2026,X1,REINVESTMENT ACME CORP (AAA) (CASH),AAA,"
+            "ACME CORP,0.5,10.00,0.00,0.00,-5.00",
+        ]
+    )
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.cash) == 1
+    assert len(result.fills) == 1
+    assert result.fills[0].funding_source == "reinvestment"
+
+
+# --- Fix round 1, item 2: the BOUGHT/SOLD branch must anchor on the leading -
+# --- "YOU BOUGHT"/"YOU SOLD" verb, not scan for the bare substring anywhere -
+# --- in the action. This task's entire premise is that the security NAME is
+# --- concatenated into the action field, so a name containing "SOLD" (e.g.
+# --- "SOLDIERS FIELD CAP") would otherwise hijack the row as a phantom sell.
+
+
+def test_action_containing_sold_inside_a_security_name_is_not_hijacked_as_a_sell():
+    header = FIXTURE.splitlines()[0]
+    bad_row = (
+        header
+        + "\n04/01/2026,X1,DIVIDEND RECEIVED SOLDIERS FIELD CAP (AAA) (CASH),AAA,"
+        "SOLDIERS FIELD CAP,,,,,7.50\n"
+    )
+    result = FidelityImporter().parse(bad_row)
+    assert result.fills == ()
+    assert len(result.cash) == 1
+    assert result.cash[0].kind == "dividend"
+    assert result.cash[0].amount == Decimal("7.50")
+
+
+# --- Task 3: sweep membership is explicit, and the staleness guard makes the -
+# --- set's decay visible in both directions. -------------------------------
+
+
+def test_a_sweep_symbol_is_recognised():
+    assert is_sweep("SPAXX") is True
+    assert is_sweep("spaxx") is True   # case-insensitive
+
+
+def test_a_real_security_is_not_a_sweep():
+    assert is_sweep("AAA") is False
+    assert is_sweep("") is False
+    assert is_sweep(None) is False
+
+
+def test_price_is_not_used_to_infer_sweepness():
+    """A real security can trade at exactly 1.00. Inferring from price would
+    silently convert a genuine position into cash -- which is why the set is
+    explicit. This test pins the DESIGN, not just the behaviour."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,PENNY CO,100,1.00,0.00,0.00,-100.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].instrument.symbol == "AAA"
+
+
+def test_a_sweep_symbol_priced_far_from_par_warns():
+    """Sweep funds hold a 1.00 NAV by construction. A deviation means either the
+    set has acquired a non-sweep symbol or a sweep has broken the buck -- both
+    need a human, and neither should pass unremarked."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("sweep" in w.lower() and "SPAXX" in w for w in result.warnings)
+
+
+def test_an_unlisted_symbol_reinvesting_at_par_warns_the_set_may_be_stale():
+    """The direction that actually costs money. An unlisted sweep is treated as a
+    real security, so its reinvestment becomes a fill that spends the dividend --
+    net cash nets to zero and a phantom position appears, silently. The warning is
+    the only thing that surfaces a missing ticker."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,REINVESTMENT MM (NEWSW) (CASH),NEWSW,MM,10,1.00,0.00,0.00,-10.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("NEWSW" in w for w in result.warnings)
+
+
+def test_a_real_security_at_a_dollar_is_still_imported_as_a_security():
+    """The warning must not become classification. A genuine security trading at
+    a dollar stays a security -- a spurious warning is cheap, silently converting
+    a position into cash is not."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,PENNY CO,100,1.00,0.00,0.00,-100.00\n"
+    result = FidelityImporter().parse(row)
+    assert len(result.fills) == 1
+    assert result.fills[0].instrument.symbol == "AAA"
+
+
+# --- Task 5: silent loss must be impossible ---------------------------------
+
+
+def test_an_unmapped_row_carrying_money_blocks_the_commit():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,MYSTERIOUS NEW ACTION,AAA,DESC,,,,,123.45\n"
+    result = FidelityImporter().parse(row)
+    assert result.blocking, "a money-carrying unmapped row must block"
+    # C1: each blocking reason is (external_ref, message) -- attributed to
+    # the row's own account so a caller can drop reasons belonging to an
+    # account registered ignore_on_import, without dropping every reason.
+    assert any(ref == "X1" for ref, _msg in result.blocking)
+    assert any("MYSTERIOUS" in msg for _ref, msg in result.blocking)
+
+
+def test_an_unmapped_row_with_no_financial_content_only_warns():
+    """The trailing disclaimer block is permanently unmapped by design. If it
+    blocked, no real export could ever be committed."""
+    result = FidelityImporter().parse(FIXTURE + "This report is informational only.\n")
+    assert result.blocking == ()
+    assert result.unmapped_rows
+
+
+def test_an_unmapped_row_with_a_valid_date_and_no_money_only_warns():
+    """The disclaimer case above never actually reaches the money-carrying
+    check: its line has no commas, so it fails the *date* parse and is warned
+    about via that branch entirely, before classify() is ever consulted --
+    confirmed directly against _locate_header/DictReader's own output for that
+    line. That means the disclaimer test alone cannot pin the "no financial
+    content warns only" half of the guard: a mutant that blocks every
+    unmapped row unconditionally would leave the disclaimer test green
+    (blocking still empty, for an unrelated reason) despite the guard being
+    broken. This row has a VALID date and an unmapped action, and reaches
+    classify() with quantity/amount both blank, so it genuinely exercises the
+    guard's money check rather than sidestepping it."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,ADMINISTRATIVE NOTICE,AAA,DESC,,,,,\n"
+    result = FidelityImporter().parse(row)
+    assert result.blocking == ()
+    assert result.unmapped_rows
+
+
+def test_a_fill_shaped_row_with_a_zero_price_is_reported():
+    """Downstream of _decimal, a missing column and a genuine zero are
+    indistinguishable. The check must live where they still differ."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,DESC,10,0.00,0.00,0.00,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert any("zero price" in w.lower() for w in result.warnings)
+
+
+# --- C2: cash rows had no zero-amount guard ---------------------------------
+#
+# zero_price_warning was shared across VENUES but never across ROW KINDS.
+# Renaming the fixture's Amount column reproduces the exact silent-zero
+# defect that motivated the whole task, on the cash side: a fully
+# "successful" parse in which every cash figure is silently $0.00.
+
+
+def test_renaming_the_amount_column_zeroes_every_cash_movement_with_a_warning():
+    """Demonstrated bug: rename FIXTURE's Amount column to Net Amount and
+    every cash row's amount silently resolves to Decimal('0') via
+    _decimal(None) -- no warning, dates/actions/symbols all correct. Fails
+    (no "zero amount" warning present) without the guard."""
+    header = FIXTURE.splitlines()[0].replace("Amount", "Net Amount")
+    body = "\n".join(FIXTURE.splitlines()[1:])
+    result = FidelityImporter().parse(header + "\n" + body + "\n")
+
+    baseline = batch()
+    assert len(result.cash) == len(baseline.cash) == 2
+    # Guard the guard: the renamed column really did zero every cash amount.
+    assert all(c.amount == Decimal("0") for c in result.cash)
+
+    zero_amount_warnings = [w for w in result.warnings if "zero amount" in w.lower()]
+    assert len(zero_amount_warnings) == len(result.cash)
+
+
+# --- I3: blocking watched only "no rule matched", not a matched row dropped -
+# --- for a bad quantity or amount. ------------------------------------------
+#
+# _carries_money deliberately fails open (returns True) on InvalidOperation --
+# "failing open on a garbled money field is exactly the silent-loss failure
+# mode this task exists to close" -- but that only protected the "no rule
+# matched" branch. A garbled Amount/Quantity on a row that DID match a rule
+# fell out through build_fill's or the cash branch's own InvalidOperation/
+# zero/non-finite checks, which appended to unmapped + warnings directly and
+# never consulted _carries_money at all.
+
+
+def test_a_bought_row_with_a_blank_quantity_but_a_real_amount_blocks():
+    """A YOU BOUGHT row is a MATCHED rule (not an unhandled action) that then
+    fails build_fill's zero-quantity guard. Before I3's fix this only warned
+    and marked the row unmapped -- blocking stayed empty even though the
+    row's own Amount column still carries a real, non-zero dollar figure."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n06/01/2026,X1,YOU BOUGHT,AAA,DESC,,500.00,0.00,0.00,-5000.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 1
+    assert result.blocking, "a matched rule with a blank quantity but real money must block"
+    assert result.blocking[0][0] == "X1"
+
+
+def test_renaming_the_quantity_column_recreates_the_original_defect_and_now_blocks():
+    """Mutant-gate for I3, from the finding's own demonstration: renaming the
+    fixture's Quantity column to Shares reproduces the original silent-loss
+    defect bit-for-bit at the parser level -- every fill-shaped row's
+    quantity resolves to Decimal('0') via _decimal(None), so all five hit
+    build_fill's zero-quantity guard. Each row's Amount column is
+    untouched by the rename and still carries real money, so all five must
+    now appear in blocking. Before I3's fix this test would see
+    len(blocking) == 0 (fills 0, unmapped 5, blocking ()), matching the
+    finding's "RC = 0" report verbatim."""
+    header = FIXTURE.splitlines()[0].replace("Quantity", "Shares")
+    body = "\n".join(FIXTURE.splitlines()[1:])
+    result = FidelityImporter().parse(header + "\n" + body + "\n")
+
+    assert result.fills == ()
+    assert len(result.unmapped_rows) == 5
+    assert len(result.blocking) == 5
+
+
+# --- Finding A: a bad Run Date silently dropped money -----------------------
+#
+# The top-level date-parse failure branch appended straight to
+# unmapped/warnings and never routed through reject() -- reasoned, when I3
+# closed every OTHER unmapped path, as "no rule can have matched yet, so
+# there's nothing to be inconsistent with." That reasoning is about RULE
+# consistency; it says nothing about money loss. A row whose Run Date fails
+# to parse can still carry a real dollar figure in Amount, and that money
+# was dropped with only a warning nobody has to read -- exactly the silent-
+# loss shape I3 closed for every other path. The money check must not depend
+# on the date having parsed: it reads the raw quantity/amount fields
+# directly, independent of `when`.
+
+
+def test_a_bad_run_date_carrying_money_blocks_the_commit():
+    """The finding's own reproduction: a $4,321.00 dividend row whose date is
+    garbage. Before the fix this fell into the bad-date branch, which never
+    consulted _carries_money at all -- blocking stayed empty and --commit
+    reported success while silently dropping the row's money."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\nNOT-A-DATE,A0000001,DIVIDEND RECEIVED,AAA,DESC,,,,,4321.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("bad date" in w for w in result.warnings)
+    assert result.blocking, "a bad-date row carrying money must block"
+    assert result.blocking[0][0] == "A0000001"
+    assert "bad date" in result.blocking[0][1]
+
+
+def test_a_bad_run_date_with_no_money_only_warns_without_blocking():
+    """The single most important test in this fix: a bad-date row with NO
+    financial content (blank Quantity and blank Amount, same shape as the
+    trailing disclaimer block every real export ends with) must still warn
+    but must NOT block. Get this wrong -- e.g. by making every bad-date row
+    block unconditionally instead of routing through the money-aware
+    reject() -- and every real Fidelity export refuses forever, since every
+    export ends with a disclaimer block whose date also fails to parse."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\nNOT-A-DATE,A0000001,SOME DISCLAIMER TEXT,,,,,,,\n"
+    result = FidelityImporter().parse(row)
+    assert result.cash == ()
+    assert len(result.unmapped_rows) == 1
+    assert any("bad date" in w for w in result.warnings)
+    assert result.blocking == (), "a bad-date row with no money must not block"
+
+
+def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix():
+    """Guards the guard against a regression in the other direction on the
+    REAL disclaimer shape (no commas at all, so most fields come back None
+    from csv.DictReader's restval rather than empty strings) -- not just the
+    synthetic no-money row above."""
+    result = FidelityImporter().parse(FIXTURE + "This report is for informational purposes only.\n")
+    assert result.blocking == ()
+    assert result.unmapped_rows

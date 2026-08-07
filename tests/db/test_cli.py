@@ -4,6 +4,7 @@ itself, not a hand-rolled re-implementation of its transaction pattern."""
 from __future__ import annotations
 
 import argparse
+import pathlib
 from uuid import UUID, uuid4
 
 import pytest
@@ -76,8 +77,20 @@ async def test_a_crash_during_regroup_leaves_no_fills_through_the_real_cli(conn,
     line (so commit_batch and regroup_account run unwrapped) and re-running:
     the assertion below saw 5 instead of 0, i.e. it failed as expected, before
     the wrapper was restored.
+
+    Task 4 amendment: the fixture spans two accounts (X12345678, X87654321),
+    now routed automatically by db.importing.route_batch rather than by a
+    single --account -- both must exist as real accounts (matching the
+    fixture's account-number column) or the whole commit would instead be
+    refused for an unrelated reason (an unknown account ref), never reaching
+    regroup_account at all.
     """
-    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+    acc1 = await create_account(
+        conn, name="T1", venue="fidelity", account_type="cash", external_ref="X12345678"
+    )
+    acc2 = await create_account(
+        conn, name="T2", venue="fidelity", account_type="cash", external_ref="X87654321"
+    )
 
     async def fake_create_pool(*_args, **_kwargs):
         return _FakePool(conn)
@@ -91,14 +104,15 @@ async def test_a_crash_during_regroup_leaves_no_fills_through_the_real_cli(conn,
     args = argparse.Namespace(
         venue="fidelity",
         file="tests/fixtures/fidelity/activity.csv",
-        account=str(acc),
+        account=None,
         commit=True,
     )
 
     with pytest.raises(RuntimeError, match="simulated regroup crash"):
         await cli.cmd_import(args)
 
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc1) == 0
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc2) == 0
 
 
 # --- Final fix wave, item 3: the CLI must be able to bootstrap a database and
@@ -260,6 +274,26 @@ async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monke
     assert row["default_intent"] == "investment"
 
 
+def _coinbase_fixture_without_the_unmapped_convert_row(tmp_path: pathlib.Path) -> str:
+    """The shipped fixture (tests/fixtures/coinbase/transactions.csv, which
+    must not be modified -- see the fix-wave constraints) carries an
+    unmapped "Convert" row that carries real money. Since I4 wired Coinbase's
+    blocking policy, --commit against the real fixture now correctly refuses
+    -- see test_the_shipped_fixtures_unmapped_convert_row_blocks_the_commit
+    in tests/test_coinbase.py. The tests below exist to pin OTHER behaviour
+    (the venue-mismatch guard, --check-duplicates' account fallback) and
+    would otherwise be blocked by an unrelated row; this writes a trimmed
+    copy (real fixture minus its last, Convert, line) to tmp_path so they
+    keep exercising what they were written for."""
+    lines = pathlib.Path("tests/fixtures/coinbase/transactions.csv").read_text().splitlines()
+    assert lines[-1].startswith("2026-03-15T16:45:00Z,Convert,"), (
+        "the shipped fixture's shape changed -- update this trim"
+    )
+    trimmed = tmp_path / "transactions_no_convert.csv"
+    trimmed.write_text("\n".join(lines[:-1]) + "\n")
+    return str(trimmed)
+
+
 # --- Final fix wave, item 4: cmd_import never checked that --account's venue
 # --- matches the importer, so `import coinbase cb.csv --account <a-fidelity-
 # --- account> --commit` succeeded silently and permanently mis-attributed
@@ -267,7 +301,7 @@ async def test_cmd_accounts_add_creates_an_account_and_prints_its_id(conn, monke
 
 
 async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
-    conn, monkeypatch, capsys
+    conn, monkeypatch, capsys, tmp_path
 ):
     """Fails if the venue check is missing (or backwards): rc would be 0 and
     the fidelity account would end up with committed coinbase fills instead
@@ -293,7 +327,7 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
 
     args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=_coinbase_fixture_without_the_unmapped_convert_row(tmp_path),
         account=str(acc),
         commit=True,
     )
@@ -306,7 +340,7 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
-async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys):
+async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys, tmp_path):
     """Positive case for the venue check above: a matching venue must still
     commit normally. Fails if the check is inverted and rejects the correct
     case instead of the mismatched one."""
@@ -319,7 +353,7 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
 
     args = argparse.Namespace(
         venue="coinbase",
-        file="tests/fixtures/coinbase/transactions.csv",
+        file=_coinbase_fixture_without_the_unmapped_convert_row(tmp_path),
         account=str(acc),
         commit=True,
     )
@@ -355,3 +389,468 @@ async def test_regroup_unknown_account_prints_a_clean_error_not_a_traceback(
     assert "error:" in err.lower()
     assert str(bogus) in err
     assert "Traceback" not in err
+
+
+# --- Task 4: --commit routes rows by account through the real CLI -----------
+
+_ROUTING_HEADER = (
+    "Run Date,Account Number,Action,Symbol,Description,Quantity,Price,Commission,Fees,Amount"
+)
+
+
+def _write_routing_csv(tmp_path: pathlib.Path, *rows: str) -> str:
+    path = tmp_path / "routed.csv"
+    path.write_text("\n".join([_ROUTING_HEADER, *rows]) + "\n")
+    return str(path)
+
+
+async def test_commit_refuses_and_writes_nothing_when_a_row_routes_to_an_unknown_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Partial commits are not acceptable -- a silently-skipped account looks
+    like a successful import. One row routes to a known account, the other to
+    an account that doesn't exist; the whole commit must be refused and
+    NOTHING written, including the row that routed fine."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "A0000009" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
+async def test_commit_refuses_and_writes_nothing_when_a_row_carries_money_and_is_unmapped(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Same atomicity guarantee as the unknown-account case above, for
+    ImportBatch.blocking: one row is a normal, known-account fill; the other
+    is an unmapped action carrying real money (a non-zero Amount) that no
+    rule matches. The whole commit must be refused and NOTHING written,
+    including the row that classified fine -- a partial commit here would
+    look like a successful import while quietly dropping money on the floor,
+    which is the exact defect this task exists to make impossible."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000001,MYSTERIOUS NEW ACTION,AAA,DESC,,,,,123.45",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "MYSTERIOUS" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
+async def test_ignored_account_is_skipped_while_its_siblings_import(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """An account with ignore_on_import=True must route SUCCESSFULLY and be
+    skipped -- reported as skipped, not unknown -- while its siblings in the
+    same file still commit normally. Without this, a deliberately-excluded
+    account (e.g. a retirement plan with no instrument identity) would make
+    every import of the file fail permanently."""
+    active = await create_account(
+        conn, name="active", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    plan_account = await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "skipped" in out.lower()
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", active) == 1
+    assert (
+        await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", plan_account) == 0
+    )
+
+
+async def test_commit_state_report_names_an_account_whose_rows_are_entirely_unmapped(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Same defect as the preview-level test in tests/test_cli.py, on the
+    --commit path's own state report: route_batch only ever sees refs that
+    appear on a fill or cash movement, so an account contributing ONLY
+    unrecognised-action rows never reaches it -- absent from by_account,
+    unknown_refs and ignored_refs alike. It must still be named, from
+    batch.refs_seen, or the commit reports success while a real account is
+    silently missing. Not a refusal case -- there is nothing of this
+    account's to write, so the known account must still commit normally."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    # Task 5 amendment: this row must carry NO financial content (blank
+    # Amount, not the 123.45 the pre-task-5 version of this test used) -- an
+    # unmapped row that carries money now REFUSES the whole commit (see
+    # importers/base.py's ImportBatch.blocking), which is a different, correct
+    # outcome this test does not exist to cover. A blank Amount keeps this
+    # test's actual point intact: an account whose rows are entirely
+    # unmapped, but carry no money, must still be named while its known
+    # sibling commits normally.
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000005,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0
+    combined = "".join(capsys.readouterr())
+    assert "A0000005" in combined
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 1
+
+
+# --- Fix round 1: --ignore-on-import needs a CLI path, not just a DB column -
+
+
+async def test_cmd_accounts_add_ignore_on_import_flag_creates_a_skippable_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """--commit refuses on an unknown ref, which is exactly the trap
+    ignore_on_import exists to escape -- but the escape hatch was only
+    reachable from the test suite or hand-written SQL until `accounts add`
+    could set it. Proves the flag end to end: create the account with
+    --ignore-on-import, then import a file referencing it and confirm it
+    routes as skipped, not unknown, while a sibling account still commits."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    add_args = argparse.Namespace(
+        name="Retirement Plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        default_intent="investment",
+        ignore_on_import=True,
+    )
+    rc = await cli.cmd_accounts_add(add_args)
+    assert rc == 0
+    account_id = UUID(capsys.readouterr().out.strip())
+
+    row = await conn.fetchrow("SELECT ignore_on_import FROM account WHERE id = $1", account_id)
+    assert row["ignore_on_import"] is True
+
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/16/2026,A0000003,YOU BOUGHT,VTI,VANGUARD TOTAL STOCK "
+        "MARKET ETF,1,100.00,0.00,0.00,-100.00",
+    )
+    import_args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(import_args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "skipped" in out.lower()
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", account_id) == 0
+
+
+# --- C1: ignore_on_import must be an escape hatch from blocking, not just ---
+# --- from routing. blocking used to be checked BEFORE route_batch ever ran,
+# --- and carried no account attribution at all -- so a money-carrying
+# --- unmapped row belonging to an ignore_on_import account refused the
+# --- ENTIRE import, permanently, exactly the retirement-plan scenario the
+# --- flag exists to escape.
+
+
+async def test_ignored_accounts_money_carrying_unmapped_rows_do_not_block_the_import(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The plan account's only row is an unrecognised action carrying money
+    (a non-zero Amount) -- before the fix this refused the whole commit even
+    though the account is registered ignore_on_import. Its row also
+    contributes NOTHING to fills/cash (every action on it is unrecognised),
+    so its ref never reaches route_batch through fills/cash at all -- this
+    only passes if blocking's own ref is also considered when deciding
+    ignored/unknown/routable, not just fills/cash refs."""
+    active = await create_account(
+        conn, name="active", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000003,MYSTERIOUS PLAN ACTION,,DESC,,,,,123.45",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0, capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", active) == 1
+
+
+# --- Finding F: an UNREGISTERED account contributing only non-financial ----
+# --- unmapped rows was invisible to classification, not just unreported. ---
+#
+# route_batch built its ref set from fills, cash, and blocking only --
+# batch.refs_seen (every ref seen in the raw rows) never fed it. An account
+# whose rows are ALL unmapped and non-financial therefore never reached
+# route_batch's account lookup at all: not unknown_refs, not ignored_refs,
+# nothing -- silently absent from the whole classification and from
+# cli.py's report. The external reviewer proposed making this REFUSE the
+# commit; that was rejected -- it reintroduces the over-block trap A2-6
+# exists to avoid (one stray boilerplate row on an unregistered account
+# refusing every import forever). The fix instead completes the
+# CLASSIFICATION (reported as "unknown") without touching refusal, which
+# stays keyed on money alone.
+
+
+async def test_an_unregistered_account_with_only_non_financial_rows_is_reported_unknown_not_refused(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Two accounts in one file: A0000001 is registered and gets a normal
+    fill. A0000009 is NOT registered, and its only row is an unrecognised
+    action with no quantity and no amount -- no fill, no cash, no blocking
+    reason, so before the fix it was invisible to route_batch entirely.
+    After the fix it must be reported as unknown (not silently absent, not
+    the generic "0 row(s) mapped" message that doesn't say whether the
+    account even exists) -- and the commit must still succeed, since nothing
+    about A0000009's row carries any money at stake."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0, capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "A0000009" in err
+    assert "no matching account" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 1
+
+
+async def test_an_unregistered_account_with_a_money_carrying_row_still_refuses_the_commit(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The other direction, pinned end to end: A0000009 is still
+    unregistered, but this time its unmapped row DOES carry money (a real
+    Amount). The commit must still refuse, and write NOTHING -- not even the
+    known account's otherwise-good row -- exactly as before this fix."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,999.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "unmapped row(s) carry money" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
+# --- Task 6: --check-duplicates is an explicit, opt-in probe on the preview --
+# --- path. Preview's structural no-connection guarantee is proven separately
+# --- in tests/test_cli.py's test_preview_import_never_opens_a_database_
+# --- connection, which passes a Namespace with no check_duplicates attribute
+# --- at all -- these tests instead exercise the flag itself, through a real
+# --- (fake-pooled) connection.
+
+
+async def test_check_duplicates_reports_an_existing_fill_and_writes_nothing(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A fill already committed to the account must be reported as a
+    duplicate by a preview run with --check-duplicates -- and that preview
+    must still refuse to write (still prints "preview only", still leaves
+    the fill table untouched)."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    commit_args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=True, check_duplicates=False
+    )
+    rc = await cli.cmd_import(commit_args)
+    assert rc == 0
+    before = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known)
+    assert before == 1
+
+    preview_args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=False, check_duplicates=True
+    )
+    rc = await cli.cmd_import(preview_args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    assert "duplicate check: 1 fill(s), 0 cash movement(s) already present" in out
+
+    after = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known)
+    assert after == before == 1
+
+
+async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Coinbase carries no per-row account ref, so a preview run with
+    --check-duplicates must fall back to --account for those rows the same
+    way --commit already does (cmd_import's `unrouted` handling)."""
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    fixture_path = _coinbase_fixture_without_the_unmapped_convert_row(tmp_path)
+    commit_args = argparse.Namespace(
+        venue="coinbase",
+        file=fixture_path,
+        account=str(acc),
+        commit=True,
+        check_duplicates=False,
+    )
+    rc = await cli.cmd_import(commit_args)
+    assert rc == 0
+
+    preview_args = argparse.Namespace(
+        venue="coinbase",
+        file=fixture_path,
+        account=str(acc),
+        commit=False,
+        check_duplicates=True,
+    )
+    rc = await cli.cmd_import(preview_args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    assert "duplicate check: 3 fill(s), 2 cash movement(s) already present" in out
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+
+
+# --- Finding C: --check-duplicates could print "0 duplicates" for a file it -
+# --- never actually validated -- an unknown account ref was simply omitted --
+# --- from the probe, the same shape --commit refuses outright for. ----------
+
+
+async def test_check_duplicates_refuses_a_bare_count_when_a_row_routes_to_an_unknown_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Before the fix, a row whose account ref matches no registered account
+    was simply never probed (route_batch's by_account has nothing for it),
+    and --check-duplicates printed a plausible-looking "duplicate check: 0
+    fill(s), 0 cash movement(s)" -- as if the whole file had been checked --
+    while --commit against the identical file refuses outright. The probe
+    must not disagree with --commit about whether the file is even routable:
+    it must refuse (non-zero, no bare count) exactly where --commit would."""
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000009,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=False, check_duplicates=True
+    )
+    rc = await cli.cmd_import(args)
+    assert rc != 0
+
+    captured = capsys.readouterr()
+    assert "A0000009" in captured.err
+    assert "duplicate check:" not in captured.out, (
+        "must not print a count that silently omits the unprobed row"
+    )

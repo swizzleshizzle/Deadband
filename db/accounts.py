@@ -30,12 +30,13 @@ async def create_account(
     default_intent: str = "trade",
     external_ref: str | None = None,
     base_currency: str = "USD",
+    ignore_on_import: bool = False,
 ) -> UUID:
     return await conn.fetchval(
         """
         INSERT INTO account (name, venue, external_ref, account_type,
-                             default_intent, base_currency)
-        VALUES ($1,$2,$3,$4,$5,$6)
+                             default_intent, base_currency, ignore_on_import)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
         RETURNING id
         """,
         name,
@@ -44,6 +45,7 @@ async def create_account(
         account_type,
         default_intent,
         base_currency,
+        ignore_on_import,
     )
 
 
