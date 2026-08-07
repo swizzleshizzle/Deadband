@@ -59,7 +59,7 @@ out as unmapped rows, and real option-symbol parsing with its ×100 multiplier.
 | A2-13 | Action classification is a declarative ordered rule table keyed on **action *and* symbol** | The reinvestment rule (A2-8/A2-9) cannot be expressed by action alone. A pure action→kind table is structurally insufficient, not merely inelegant. |
 | A2-14 | `return_of_capital` is recorded under its own kind but **not yet applied to cost basis** | Applying it is corporate-action-shaped work. Recording it distinctly makes the deferral visible; aliasing it to `dividend` would make it silently wrong. Filed as a known gap. |
 | A2-15 | **Fidelity stays CSV.** Bulk history is repeated custom-range downloads, not a different transport | Researched 2026-08-06. The 90-day cap is per *download*, not a data limit — Activity & Orders accepts a custom range and roughly five years are retained, so full history is ~20 sequential files. Every alternative is worse: OFX/Direct Connect is being retired in favour of a "Fidelity Access" protocol third-party tools do not yet support, was *itself* capped at 90 days, and Fidelity states third-party money-management software voids their lost-funds replacement guarantee. The Realized Gain/Loss export carries per-lot cost basis over arbitrary ranges and is a good **reconciliation and opening-balance** source, but it is FIFO tax lots — D6 chose average cost, so it is not a fills source. Design consequence: the importer must handle repeated, overlapping-range files gracefully, which the existing idempotent dedupe already does. |
-| A2-16 | **Coinbase moves to the Advanced Trade API, replacing CSV import — amending D8** | D8 said "manual and CSV first, API once the schema has proven itself against real trades." That condition is now met: the schema survived a real multi-account export and the correctness work of part 1. The decisive argument is not convenience but **dedupe correctness**. `GET /orders/historical/fills` (`view` scope, genuinely read-only, consistent with §3's permanent no-write-path rule) returns a venue trade id. The schema already has `fill_venue_id_uniq` and §7 already prefers `(account_id, venue_fill_id)` over `content_hash` — a path that exists and is unused for Coinbase purely because the CSV supplies no id. Adopting it retires a gap currently recorded as permanently unfixable (see §10). Credentials live only in the deployment environment, never the repository. |
+| A2-16 | **Coinbase moves to the Advanced Trade API, replacing CSV import — amending D8. DECIDED, but DEFERRED to part 2b: this phase does not implement it. The CSV importer continues to ship and was itself extended in this phase (finding B, header normalization).** | D8 said "manual and CSV first, API once the schema has proven itself against real trades." That condition is now met: the schema survived a real multi-account export and the correctness work of part 1. The decisive argument for the eventual cut-over is not convenience but **dedupe correctness**. `GET /orders/historical/fills` (`view` scope, genuinely read-only, consistent with §3's permanent no-write-path rule) returns a venue trade id. The schema already has `fill_venue_id_uniq` and §7 already prefers `(account_id, venue_fill_id)` over `content_hash` — a path that exists and is unused for Coinbase purely because the CSV supplies no id. Adopting it will retire a gap currently recorded as permanently unfixable for the CSV path (see §10 and `docs/known-gaps.md`) — but has not yet, since the API importer does not exist. Credentials live only in the deployment environment, never the repository, whenever this is built. |
 
 ---
 
@@ -75,8 +75,8 @@ out as unmapped rows, and real option-symbol parsing with its ×100 multiplier.
 - Multi-account routing, ignored accounts, and account-number `external_ref`
 - The declarative action rule table, sweep classification, and DRIP funding source
 - Unknown-money-row blocking, and a shared zero-price guard across both importers
-- Coinbase audit for the same silent-zero defect class, and a **Coinbase Advanced Trade
-  API source** replacing its CSV importer (A2-16), deduping on the venue-supplied fill id
+- Coinbase audit for the same silent-zero defect class (CSV importer; the Advanced
+  Trade API source, A2-16, is DECIDED but DEFERRED — see "Out of scope" below)
 - Preview duplicate reporting (gap #7)
 - `positions` CLI command (gap #12)
 - Residual A-1 gaps: `upsert_instrument` repaint, self-referential corporate action
@@ -96,6 +96,16 @@ out as unmapped rows, and real option-symbol parsing with its ×100 multiplier.
 - Automating the ~20-file Fidelity backfill. The importer must *tolerate* repeated
   overlapping ranges, which idempotent dedupe already delivers; driving the downloads is
   a scripting concern, not a design one
+- **The Coinbase Advanced Trade API source (A2-16).** DECIDED, but DEFERRED to part 2b —
+  not built in this phase. The CSV importer is what Coinbase ships today, and it was
+  itself extended here (finding B: header normalization, matching Fidelity's). Two
+  questions stay open future work rather than settled by this deferral: the actual
+  API cut-over (credentials, fetch/parse/dedupe against `venue_fill_id`), and how to
+  reconcile the two ingest paths once CSV-imported Coinbase history and API-imported
+  history briefly coexist (see `docs/known-gaps.md`'s known gap #6 equivalent, "Two
+  Coinbase ingest paths will briefly coexist," in §10 below). Until the API importer
+  lands, the cross-batch same-day-duplicate limitation (§10, "Accepted permanently" in
+  `docs/known-gaps.md`) remains in force for Coinbase exactly as it does for Fidelity.
 
 ### Acceptance bar
 
@@ -308,23 +318,28 @@ Recorded here so they are deferred rather than forgotten:
    reads high, so the eventual realized gain reads low, for any position receiving one.
 2. **Balance-only accounts are unmodelled** (A2-7). Any aggregate-equity figure will
    omit ignored accounts, which matters when the Dashboard is built.
-3. ~~**Bulk history beyond 90 days is unsolved.**~~ **Settled 2026-08-06** by A2-15 and
-   A2-16. Fidelity: repeated custom-range CSV downloads, roughly twenty for five years,
-   with idempotent dedupe absorbing the overlaps; OFX is a dead end and the Realized
-   Gain/Loss export is lot-level, so it serves reconciliation rather than fills. Coinbase:
-   the Advanced Trade API, which has no window limit at all.
+3. ~~**Bulk history beyond 90 days is unsolved.**~~ **Settled for Fidelity, 2026-08-06**,
+   by A2-15: repeated custom-range CSV downloads, roughly twenty for five years, with
+   idempotent dedupe absorbing the overlaps; OFX is a dead end and the Realized Gain/Loss
+   export is lot-level, so it serves reconciliation rather than fills. **Not settled for
+   Coinbase.** A2-16 (the Advanced Trade API, which has no window limit at all) is
+   DECIDED but DEFERRED to part 2b — it has not been built. Until it lands, Coinbase's
+   only bulk-history path is the CSV export, same as today.
 4. **The sweep symbol set requires maintenance.** The staleness guard makes drift
    visible but does not correct it.
-5. **Coinbase API credentials become an operational dependency** (A2-16). A read-only
-   `view` key is still a credential: it discloses complete position and balance history if
-   leaked. It lives only in the deployment environment, never in this repository, and the
-   importer must fail loudly rather than silently falling back to an unauthenticated or
-   empty result when the key is missing or rejected — a sync that reports success while
+5. **Coinbase API credentials will become an operational dependency once A2-16 ships**
+   (still deferred to part 2b, see #3 above). A read-only `view` key is still a
+   credential: it discloses complete position and balance history if leaked. It must
+   live only in the deployment environment, never in this repository, and the importer
+   must fail loudly rather than silently falling back to an unauthenticated or empty
+   result when the key is missing or rejected — a sync that reports success while
    fetching nothing is the same failure shape as the silent-zero defect that motivated
-   this spec.
-6. **Two Coinbase ingest paths will briefly coexist.** Retiring the CSV importer while
-   historical CSV-imported fills already exist means some Coinbase fills are keyed on
-   `content_hash` and later ones on `venue_fill_id`. A fill imported by both paths would
-   not dedupe against itself. This needs an explicit reconciliation step or a clean
-   cut-over, decided before the API importer runs against a database holding CSV-imported
-   Coinbase history.
+   this spec. Recorded now, ahead of the work, so it isn't rediscovered under time
+   pressure when A2-16 is eventually implemented.
+6. **Two Coinbase ingest paths will briefly coexist, once A2-16 ships** (still deferred
+   to part 2b — not a concern today, since the API importer doesn't exist yet).
+   Retiring the CSV importer while historical CSV-imported fills already exist would mean
+   some Coinbase fills are keyed on `content_hash` and later ones on `venue_fill_id`. A
+   fill imported by both paths would not dedupe against itself. This needs an explicit
+   reconciliation step or a clean cut-over, decided before the (still-unbuilt) API
+   importer would ever run against a database holding CSV-imported Coinbase history.

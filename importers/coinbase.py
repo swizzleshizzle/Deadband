@@ -42,9 +42,12 @@ def _carries_money(raw: str | None) -> bool:
     """True if a raw quantity/subtotal/total field is non-zero -- or is
     present but unparseable, which must be treated as "might carry money"
     rather than silently read as empty. Mirrors importers/fidelity.py's twin:
-    blocking on a false positive costs a human a glance; failing closed on a
-    garbled money field is exactly the silent-loss failure mode this whole
-    task exists to close."""
+    blocking on a false positive costs a human a glance; failing OPEN on a
+    garbled money field (silently reading it as if it were absent/zero and
+    letting the row through unblocked) is exactly the silent-loss failure
+    mode this whole task exists to close. Returning True here -- refusing to
+    treat "unparseable" as "zero" -- is failing CLOSED: it is the
+    mitigation, not the failure mode."""
     try:
         return _decimal(raw) != 0
     except InvalidOperation:
