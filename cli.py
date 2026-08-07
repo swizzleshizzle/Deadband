@@ -152,6 +152,28 @@ async def cmd_import(args) -> int:
         # deliberately never opens a connection on its own, so it structurally
         # cannot answer that without an explicit ask.
         if getattr(args, "check_duplicates", False):
+            # C: rows with no external_ref (e.g. Coinbase) need --account to
+            # be probed at all -- identical to --commit's own `unrouted`
+            # check below. Checked here, before any connection is opened,
+            # for the same reason --commit's version runs before its pool:
+            # whether it's a problem depends only on the parsed file, not on
+            # the database. Before this check existed, such rows were simply
+            # dropped from `targets` below and the probe printed a count
+            # that silently omitted them -- indistinguishable from "this
+            # file has no duplicates" even though it was never checked.
+            unrouted = ImportBatch(
+                fills=tuple(f for f in batch.fills if f.external_ref is None),
+                cash=tuple(c for c in batch.cash if c.external_ref is None),
+            )
+            if (unrouted.fills or unrouted.cash) and not args.account:
+                print(
+                    "error: cannot check duplicates -- this file has row(s) "
+                    "with no account ref to route by; pass --account to say "
+                    "where they go",
+                    file=sys.stderr,
+                )
+                return 2
+
             pool = await create_pool()
             try:
                 async with pool.acquire() as conn:
@@ -159,16 +181,10 @@ async def cmd_import(args) -> int:
                     # find which account(s) each row belongs to -- same
                     # mechanism --commit uses, reused rather than reinvented so
                     # the probe never disagrees with --commit about where a row
-                    # lands. Rows with no external_ref (e.g. Coinbase) need
-                    # --account, exactly like --commit's own `unrouted`
-                    # handling below.
+                    # lands.
                     plan = await route_batch(conn, importer.venue, batch)
                     targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
-                    unrouted = ImportBatch(
-                        fills=tuple(f for f in batch.fills if f.external_ref is None),
-                        cash=tuple(c for c in batch.cash if c.external_ref is None),
-                    )
                     if (unrouted.fills or unrouted.cash) and args.account:
                         account_id = UUID(args.account)
                         existing = targets.get(account_id, ImportBatch())
@@ -176,6 +192,23 @@ async def cmd_import(args) -> int:
                             fills=existing.fills + unrouted.fills,
                             cash=existing.cash + unrouted.cash,
                         )
+
+                    # C: mirror --commit's own refusal exactly (see the
+                    # identical check further below) -- a row that routes to
+                    # an unknown account ref is never probed (it never lands
+                    # in `targets`), so printing a count without checking
+                    # this first would silently omit it while looking
+                    # complete. plan.unknown_refs is money-scoped (see
+                    # db.importing.RoutingPlan's docstring); a non-money
+                    # unknown ref does not stand behind --commit's refusal
+                    # either, so it must not stand behind this one.
+                    if plan.unknown_refs:
+                        print(
+                            "error: cannot check duplicates -- unknown "
+                            f"account ref(s): {', '.join(plan.unknown_refs)}",
+                            file=sys.stderr,
+                        )
+                        return 2
 
                     fill_dupes = cash_dupes = 0
                     for account_id, sub_batch in targets.items():
@@ -280,22 +313,32 @@ async def cmd_import(args) -> int:
                 print(f"  {account_id}: mapped, {n} row(s)")
             for ref in plan.ignored_refs:
                 print(f"  {ref}: ignored (ignore_on_import), skipped")
-            for ref in plan.unknown_refs:
+            # F: plan.reported_unknown_refs is a superset of plan.unknown_refs
+            # -- it also includes a ref that appears ONLY in batch.refs_seen
+            # (an account whose rows are ALL unmapped and non-financial),
+            # which route_batch used to be unable to see at all since it only
+            # looked at fills/cash/blocking. Reporting the fuller set here
+            # does not change what refuses the commit -- that stays keyed on
+            # plan.unknown_refs alone, checked below, unaffected by this.
+            for ref in plan.reported_unknown_refs:
                 print(f"  {ref}: no matching account", file=sys.stderr)
 
-            # route_batch only ever sees refs that appear on a fill or cash
-            # movement (it partitions batch.fills/batch.cash) -- an account
-            # whose rows are ENTIRELY unmapped never contributes one, so it
-            # never reaches route_batch at all and is absent from every list
-            # above. batch.refs_seen (every ref seen in the raw rows) is the
-            # only place such an account is visible; report it explicitly
-            # rather than let a real account silently vanish from the report
-            # while the commit still reports success.
+            # route_batch only ever sees refs that appear on a fill, cash
+            # movement, or blocking reason -- a REGISTERED account whose rows
+            # all warned but produced none of those (an edge route_batch's
+            # own classification doesn't reach) can still fall out here.
+            # batch.refs_seen (every ref seen in the raw rows) is the only
+            # place such an account is visible; report it explicitly rather
+            # than let a real account silently vanish from the report while
+            # the commit still reports success. Refs already reported above
+            # (ignored, or unknown -- F) are excluded so each ref is reported
+            # exactly once.
             covered_refs = (
                 {f.external_ref for f in batch.fills if f.external_ref}
                 | {c.external_ref for c in batch.cash if c.external_ref}
             )
-            for ref in sorted(set(batch.refs_seen) - covered_refs):
+            already_reported = set(plan.ignored_refs) | set(plan.reported_unknown_refs)
+            for ref in sorted(set(batch.refs_seen) - covered_refs - already_reported):
                 print(
                     f"  {ref}: 0 row(s) mapped -- every row for this account "
                     "failed to classify; see warnings above",

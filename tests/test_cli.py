@@ -338,6 +338,47 @@ async def test_pool_is_closed_when_the_command_body_raises(monkeypatch):
     assert fake_pool.closed is True
 
 
+# --- Finding C: --check-duplicates could print "0 duplicates" for rows it --
+# --- never actually probed. ---------------------------------------------------
+#
+# The probe path didn't apply the account/routing validation --commit does:
+# a row with no resolvable target (no --account for a venue with no per-row
+# ref) was simply skipped, and the printed count silently omitted it.
+
+
+async def test_check_duplicates_refuses_when_unrouted_rows_have_no_account_fallback(
+    monkeypatch, capsys
+):
+    """Coinbase carries no per-row account ref; --commit already requires
+    --account for such rows before it ever opens a connection (see
+    test_commit_without_account_is_rejected above). --check-duplicates must
+    apply the identical requirement instead of silently dropping those rows
+    from the probe and printing a count that looks complete but isn't.
+    Proven the same structural way: create_pool blows up if called, so this
+    also pins that the check runs before any connection is opened."""
+
+    async def boom(*_args, **_kwargs):
+        raise AssertionError(
+            "the --account-required check must run before any database "
+            "connection is opened, even under --check-duplicates"
+        )
+
+    monkeypatch.setattr(cli, "create_pool", boom)
+
+    args = argparse.Namespace(
+        venue="coinbase",
+        file="tests/fixtures/coinbase/transactions.csv",
+        account=None,
+        commit=False,
+        check_duplicates=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc != 0
+
+    err = capsys.readouterr().err
+    assert "--account" in err
+
+
 def test_import_missing_file_prints_a_clean_error_not_a_traceback(monkeypatch, capsys):
     """A typo'd path is the most likely first user mistake. Fails if main()
     lets FileNotFoundError propagate — the test itself would error out with an

@@ -608,6 +608,77 @@ async def test_an_ignored_account_routes_successfully_and_is_skipped(conn):
     assert plan.unknown_refs == ()  # ignored is NOT unknown
 
 
+# --- Finding F: refs_seen-only refs (all-unmapped, non-financial rows) were -
+# --- invisible to route_batch's classification entirely. --------------------
+#
+# route_batch built its ref set from fills, cash, and blocking only. An
+# account contributing NOTHING but unmapped, non-financial rows (no fill, no
+# cash, no blocking reason -- refs_seen is the ONLY place such an account is
+# visible at all, see importers/fidelity.py's own refs_seen test) therefore
+# never reached this function's account lookup and could never be classified
+# as unknown or ignored. The external reviewer proposed making this REFUSE
+# the commit -- rejected: that reintroduces the over-block trap A2-6 exists
+# to avoid, where one stray boilerplate row attributed to an unregistered
+# account refuses every import permanently. The fix instead completes the
+# CLASSIFICATION (so reporting can say mapped/ignored/unknown) without
+# extending the REFUSAL, which stays keyed on money (fills/cash/blocking).
+
+
+def _batch_with_refs_seen_only(*refs: str) -> ImportBatch:
+    """No fills, no cash, no blocking -- refs_seen is the only place these
+    refs appear, exactly the "every row on this account failed to classify,
+    and none of them carried money" shape."""
+    return ImportBatch(refs_seen=tuple(refs))
+
+
+async def test_an_unregistered_refs_seen_only_account_is_classified_unknown_not_invisible(conn):
+    """No account is registered for A0000099 at all. Before the fix this ref
+    never reached the account lookup (fills/cash/blocking are all empty), so
+    it was neither unknown_refs nor ignored_refs nor routable -- invisible to
+    every classification. It must now show up as reported-unknown, and
+    critically must NOT show up in unknown_refs (which drives cli.py's
+    refusal) since it carries no money."""
+    plan = await route_batch(conn, "fidelity", _batch_with_refs_seen_only("A0000099"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == (), (
+        "a refs_seen-only ref must never drive refusal -- that's the over-block trap"
+    )
+    assert "A0000099" in plan.reported_unknown_refs
+
+
+async def test_a_registered_ignored_refs_seen_only_account_is_classified_ignored(conn):
+    """The mirror case: the account IS registered, and IS ignore_on_import,
+    but contributed only non-financial unmapped rows. Must classify as
+    ignored (for reporting), not as unknown -- same as an ignored account
+    that does contribute fills/cash."""
+    await create_account(
+        conn,
+        name="plan",
+        venue="fidelity",
+        account_type="cash",
+        external_ref="A0000003",
+        ignore_on_import=True,
+    )
+    plan = await route_batch(conn, "fidelity", _batch_with_refs_seen_only("A0000003"))
+    assert plan.by_account == {}
+    assert plan.unknown_refs == ()
+    assert "A0000003" in plan.ignored_refs
+    assert "A0000003" not in plan.reported_unknown_refs
+
+
+async def test_a_money_carrying_unknown_ref_still_drives_refusal_even_when_also_in_refs_seen(conn):
+    """The other direction, pinned at the route_batch level: a ref that DOES
+    carry money (via a blocking reason) and has no matching account must
+    still land in unknown_refs -- refusal is unaffected by this fix."""
+    batch = ImportBatch(
+        blocking=(("A0000099", "line 2: unhandled action 'X'"),),
+        refs_seen=("A0000099",),
+    )
+    plan = await route_batch(conn, "fidelity", batch)
+    assert plan.unknown_refs == ("A0000099",)
+    assert "A0000099" in plan.reported_unknown_refs
+
+
 async def test_a_null_external_ref_account_is_never_a_wildcard(conn):
     """UNIQUE (venue, external_ref) does not constrain NULLs, so several accounts
     may have none. Treating NULL as a match would make the first such account a

@@ -647,6 +647,87 @@ async def test_ignored_accounts_money_carrying_unmapped_rows_do_not_block_the_im
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", active) == 1
 
 
+# --- Finding F: an UNREGISTERED account contributing only non-financial ----
+# --- unmapped rows was invisible to classification, not just unreported. ---
+#
+# route_batch built its ref set from fills, cash, and blocking only --
+# batch.refs_seen (every ref seen in the raw rows) never fed it. An account
+# whose rows are ALL unmapped and non-financial therefore never reached
+# route_batch's account lookup at all: not unknown_refs, not ignored_refs,
+# nothing -- silently absent from the whole classification and from
+# cli.py's report. The external reviewer proposed making this REFUSE the
+# commit; that was rejected -- it reintroduces the over-block trap A2-6
+# exists to avoid (one stray boilerplate row on an unregistered account
+# refusing every import forever). The fix instead completes the
+# CLASSIFICATION (reported as "unknown") without touching refusal, which
+# stays keyed on money alone.
+
+
+async def test_an_unregistered_account_with_only_non_financial_rows_is_reported_unknown_not_refused(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Two accounts in one file: A0000001 is registered and gets a normal
+    fill. A0000009 is NOT registered, and its only row is an unrecognised
+    action with no quantity and no amount -- no fill, no cash, no blocking
+    reason, so before the fix it was invisible to route_batch entirely.
+    After the fix it must be reported as unknown (not silently absent, not
+    the generic "0 row(s) mapped" message that doesn't say whether the
+    account even exists) -- and the commit must still succeed, since nothing
+    about A0000009's row carries any money at stake."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc == 0, capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "A0000009" in err
+    assert "no matching account" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 1
+
+
+async def test_an_unregistered_account_with_a_money_carrying_row_still_refuses_the_commit(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The other direction, pinned end to end: A0000009 is still
+    unregistered, but this time its unmapped row DOES carry money (a real
+    Amount). The commit must still refuse, and write NOTHING -- not even the
+    known account's otherwise-good row -- exactly as before this fix."""
+    known = await create_account(
+        conn, name="known", venue="fidelity", account_type="cash", external_ref="A0000001"
+    )
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000001,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+        "01/16/2026,A0000009,SOME BRAND NEW ACTION NOBODY MAPPED,AAA,DESC,,,,,999.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(venue="fidelity", file=file_path, account=None, commit=True)
+    rc = await cli.cmd_import(args)
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "unmapped row(s) carry money" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
+
+
 # --- Task 6: --check-duplicates is an explicit, opt-in probe on the preview --
 # --- path. Preview's structural no-connection guarantee is proven separately
 # --- in tests/test_cli.py's test_preview_import_never_opens_a_database_
@@ -735,3 +816,41 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
     assert "preview only" in out
     assert "duplicate check: 3 fill(s), 2 cash movement(s) already present" in out
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+
+
+# --- Finding C: --check-duplicates could print "0 duplicates" for a file it -
+# --- never actually validated -- an unknown account ref was simply omitted --
+# --- from the probe, the same shape --commit refuses outright for. ----------
+
+
+async def test_check_duplicates_refuses_a_bare_count_when_a_row_routes_to_an_unknown_account(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Before the fix, a row whose account ref matches no registered account
+    was simply never probed (route_batch's by_account has nothing for it),
+    and --check-duplicates printed a plausible-looking "duplicate check: 0
+    fill(s), 0 cash movement(s)" -- as if the whole file had been checked --
+    while --commit against the identical file refuses outright. The probe
+    must not disagree with --commit about whether the file is even routable:
+    it must refuse (non-zero, no bare count) exactly where --commit would."""
+    file_path = _write_routing_csv(
+        tmp_path,
+        "01/15/2026,A0000009,YOU BOUGHT,SPY,SPDR S&P 500 ETF TRUST,1,100.00,0.00,0.00,-100.00",
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity", file=file_path, account=None, commit=False, check_duplicates=True
+    )
+    rc = await cli.cmd_import(args)
+    assert rc != 0
+
+    captured = capsys.readouterr()
+    assert "A0000009" in captured.err
+    assert "duplicate check:" not in captured.out, (
+        "must not print a count that silently omits the unprobed row"
+    )

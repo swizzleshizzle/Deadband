@@ -106,8 +106,23 @@ def _cash_dedupe_hashes(account_id: UUID, cash: tuple[CanonicalCash, ...]) -> li
 @dataclass(frozen=True, slots=True)
 class RoutingPlan:
     by_account: dict[UUID, ImportBatch]
+    # Refs with no matching account that ALSO carry money (a fill, a cash
+    # movement, or a blocking reason). This is what cli.py refuses the whole
+    # commit on -- see route_batch's docstring for why it stays narrower than
+    # reported_unknown_refs below.
     unknown_refs: tuple[str, ...]
     ignored_refs: tuple[str, ...]
+    # F: EVERY ref seen anywhere in the batch (money-carrying refs union
+    # batch.refs_seen) that has no matching account -- a strict superset of
+    # unknown_refs. Exists for REPORTING only: a caller (cli.py) can now say
+    # "unknown" about an unregistered account whose rows are ALL unmapped and
+    # non-financial, instead of that account being invisible to
+    # classification entirely. Must NEVER be used to decide refusal -- that
+    # would reintroduce the over-block trap A2-6 exists to avoid, where one
+    # stray boilerplate row attributed to an unregistered account refuses
+    # every import permanently. unknown_refs (money-scoped) is the only field
+    # that may drive a refusal decision.
+    reported_unknown_refs: tuple[str, ...] = ()
 
 
 async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) -> RoutingPlan:
@@ -117,7 +132,8 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
     importers/fidelity.py) is matched against account.external_ref within
     the given venue:
 
-    - No matching account -> the ref goes into `unknown_refs`. Never silently
+    - No matching account -> the ref goes into `unknown_refs` (if it also
+      carries money) and always into `reported_unknown_refs`. Never silently
       merged into another account.
     - A matching account with `ignore_on_import` -> the ref goes into
       `ignored_refs`; its rows are dropped from `by_account` entirely (they
@@ -144,14 +160,28 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
     # "drop blocking reasons whose ref is ignored" check (see cli.py) would
     # have nothing to drop against. Rows this pulls in that have no other
     # fills/cash of their own simply route to an empty ImportBatch below,
-    # which is harmless.
-    refs = sorted(
-        {f.external_ref for f in batch.fills if f.external_ref is not None}
-        | {c.external_ref for c in batch.cash if c.external_ref is not None}
-        | {ref for ref, _msg in batch.blocking if ref is not None}
-    )
+    # which is harmless. This is the set that may drive REFUSAL (see
+    # unknown_refs above) -- it must stay scoped to money-carrying refs only.
+    money_refs = {
+        f.external_ref for f in batch.fills if f.external_ref is not None
+    } | {c.external_ref for c in batch.cash if c.external_ref is not None} | {
+        ref for ref, _msg in batch.blocking if ref is not None
+    }
+
+    # F: batch.refs_seen carries every account ref seen in the RAW rows,
+    # independent of whether the row went on to become a fill, a cash
+    # movement, or a blocking reason (see ImportBatch.refs_seen's docstring).
+    # An account whose rows are ALL unmapped and non-financial contributes
+    # to NONE of fills/cash/blocking, so money_refs alone would never see it
+    # -- it would be invisible to classification entirely, neither unknown
+    # nor ignored, just absent. Included here so it CAN be classified, for
+    # reporting -- but deliberately kept separate from money_refs, which is
+    # the only set allowed to drive refusal (see RoutingPlan.unknown_refs vs
+    # .reported_unknown_refs).
+    all_refs = sorted(money_refs | set(batch.refs_seen))
 
     unknown_refs: list[str] = []
+    reported_unknown_refs: list[str] = []
     ignored_refs: list[str] = []
     # ref -> account id, only for refs that route successfully (known,
     # not ignored). Refs with no entry here are unknown or ignored -- both
@@ -159,7 +189,7 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
     # `refs` is built only from refs that actually appear in the batch).
     routable: dict[str, UUID] = {}
 
-    if refs:
+    if all_refs:
         rows = await conn.fetch(
             """
             SELECT id, external_ref, ignore_on_import
@@ -167,15 +197,17 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
              WHERE venue = $1 AND external_ref = ANY($2::text[])
             """,
             venue,
-            refs,
+            all_refs,
         )
         # UNIQUE (venue, external_ref) means at most one row per ref here.
         by_ref = {r["external_ref"]: r for r in rows}
 
-        for ref in refs:
+        for ref in all_refs:
             row = by_ref.get(ref)
             if row is None:
-                unknown_refs.append(ref)
+                reported_unknown_refs.append(ref)
+                if ref in money_refs:
+                    unknown_refs.append(ref)
             elif row["ignore_on_import"]:
                 ignored_refs.append(ref)
             else:
@@ -206,6 +238,7 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
         by_account=by_account,
         unknown_refs=tuple(unknown_refs),
         ignored_refs=tuple(ignored_refs),
+        reported_unknown_refs=tuple(reported_unknown_refs),
     )
 
 
