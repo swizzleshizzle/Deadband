@@ -33,6 +33,11 @@ class OpenPosition:
     cost_basis: Decimal
     multiplier: Decimal
     # None when the contributing trades do not agree on one direction.
+    # `unvaluable_reason` -- never this field -- is what decides whether the
+    # position can be valued: a group can agree on a single direction (this
+    # is set) while still being unvaluable for another reason (e.g. a NULL
+    # quantity on one contributor), so a non-None direction here is NOT a
+    # signal that pricing is safe. Check `unvaluable_reason` for that.
     direction: Direction | None
     is_estimated: bool
     # None means "this position can be valued against a mark". Any other

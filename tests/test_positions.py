@@ -45,11 +45,51 @@ def test_cost_basis_is_weighted_by_quantity_not_a_plain_average():
 def test_a_null_open_quantity_makes_the_position_unvaluable_rather_than_vanishing():
     """A protected/orphaned trade carries NULL open_quantity. SQL SUM skips
     NULLs, so the naive aggregate silently under-reports the position and
-    nothing says so. The row must appear and name the problem."""
+    nothing says so. The row must appear and name the problem.
+
+    Also pins a deliberate asymmetry: both contributing trades agree on
+    LONG, so `direction` is still `Direction.LONG` even though the position
+    is unvaluable. `unvaluable_reason`, not `direction`, is the valuability
+    gate -- a future caller must not treat "direction is set" as "safe to
+    price." If direction resolution ever gets tied to whether a reason was
+    recorded, this assertion is what catches it.
+    """
     (p,) = aggregate_positions([row(qty="10", basis="20"), row(qty=None, basis=None)])
+    assert p.direction is Direction.LONG
     assert p.unvaluable_reason is not None
     assert "unknown" in p.unvaluable_reason
     assert p.trade_count == 2
+
+
+def test_all_trades_null_still_emits_a_position_not_a_vanished_row():
+    """The sharpest case of 'a zero that looks like a real number': when
+    every contributing trade has NULL quantity, `priced` is empty and the
+    naive path would report a real-looking quantity=0, cost_basis=0 with no
+    indication anything is wrong. The row must still appear, still carry a
+    reason, and the zeros must be recognizable as placeholders rather than
+    a genuinely flat position -- callers are expected to check
+    `unvaluable_reason`, not assume zero quantity means "no position"."""
+    (p,) = aggregate_positions([row(qty=None, basis=None), row(qty=None, basis=None)])
+    assert p.quantity == Decimal("0")
+    assert p.cost_basis == Decimal("0")
+    assert p.unvaluable_reason is not None
+    assert "unknown" in p.unvaluable_reason
+    assert p.trade_count == 2
+
+
+def test_multiple_reasons_are_joined_not_truncated_to_one():
+    """No prior test trips two reasons on the same position, so a
+    regression that keeps only the last (or first) reason -- e.g.
+    `reasons[-1]` in place of `'; '.join(reasons)` -- passes every other
+    test in this file. Trip both the NULL check and mixed-direction at once
+    and pin the full compound string, in the order the checks run: NULL
+    first, then direction."""
+    (p,) = aggregate_positions([
+        row(qty=None, basis=None, direction=Direction.LONG),
+        row(qty="4", basis="20", direction=Direction.SHORT),
+    ])
+    assert p.unvaluable_reason == "open quantity unknown on at least one trade; mixed direction"
+    assert p.direction is None
 
 
 def test_a_spread_contributor_makes_the_position_unvaluable():
