@@ -40,6 +40,22 @@ class CoinbaseAPIImporter:
         warnings: list[str] = []
         unmapped: list[str] = []
         blocking: list[tuple[str | None, str]] = []
+        # trade_id -> the idx of the fill that first claimed it. See the
+        # duplicate check below for why this exists and what it cannot see.
+        seen_trade_ids: dict[str, int] = {}
+
+        def locate(raw: dict, idx: int) -> str:
+            """The one locator prefix every message from this parser uses.
+
+            M3: `zero_price_warning` formats its own `f"line {line_no}: ..."`
+            prefix, which is the CSV importers' idiom. Handing it the JSON
+            array index produced "line 0: BTC ..." from a parser whose every
+            other message says "fill 0 (trade_id=...)" -- two different names
+            for the same coordinate, in the same batch's warning list. The
+            shared guard now takes a locator instead of a line number (see
+            importers/base.py) so both idioms come from one place.
+            """
+            return f"fill {idx} (trade_id={raw.get('trade_id')!r})"
 
         def reject(raw: dict, idx: int, reason: str) -> None:
             """ONE path for every dropped fill, same discipline as
@@ -58,7 +74,7 @@ class CoinbaseAPIImporter:
             byte-identical blocking messages and were indistinguishable in
             a batch with more than one bad row.
             """
-            message = f"fill {idx} (trade_id={raw.get('trade_id')!r}): {reason}"
+            message = f"{locate(raw, idx)}: {reason}"
             warnings.append(message)
             unmapped.append(str(raw))
             blocking.append((None, message))
@@ -133,7 +149,54 @@ class CoinbaseAPIImporter:
                 reject(raw, idx, "non-positive quantity")
                 continue
 
-            warn = zero_price_warning(idx, base, quantity, price)
+            # venue_fill_id IS the dedupe key: db/importing.py routes any fill
+            # that has one onto `fill_venue_id_uniq` (UNIQUE (account_id,
+            # venue_fill_id)) and skips content_hash synthesis entirely, and
+            # db/fills.py's INSERT is ON CONFLICT DO NOTHING. So a bad key is
+            # not a cosmetic problem -- it is a silent, permanent loss of a
+            # real fill, reported to the user as "(N already present)".
+            #
+            # C1: `str(raw.get("trade_id"))` turned a missing trade_id into the
+            # literal string "None", which is truthy. The first such fill in an
+            # account created a row keyed "None"; every later no-trade_id fill,
+            # in this batch or any future batch, then collided with it and was
+            # dropped as a duplicate. Refuse instead.
+            trade_id = str(raw.get("trade_id") or "").strip()
+            if not trade_id:
+                reject(raw, idx, "no trade_id -- the dedupe key would not identify this fill")
+                continue
+
+            # C2: UNVERIFIED ASSUMPTION, MADE SELF-CHECKING (see
+            # docs/known-gaps.md). Coinbase's documentation does not state that
+            # trade_id is unique per fill; entry_id may be the unique one. If
+            # this fires, the dedupe key is wrong and fill_venue_id_uniq would
+            # have silently discarded a real fill. Refuse the batch loudly and
+            # re-key on entry_id.
+            #
+            # We do NOT pre-emptively switch to entry_id or a composite key:
+            # if entry_id turned out to be the unstable field, that would break
+            # idempotency and re-insert the whole history on the next sync --
+            # trading a possible silent loss for a certain silent double-count.
+            # Assert the invariant; let the first real response settle it.
+            #
+            # HONEST LIMIT: this sees repeats only WITHIN one parsed document.
+            # A full sync (no --start) pulls the entire history into one merged
+            # document, so in practice it sees the whole set -- but a windowed
+            # --start/--end sync can straddle a repeat and miss it, and two
+            # repeats landing in two different syncs are invisible here. A
+            # large reduction in exposure, not elimination.
+            if trade_id in seen_trade_ids:
+                reject(
+                    raw,
+                    idx,
+                    f"duplicate trade_id {trade_id!r} (first seen at fill "
+                    f"{seen_trade_ids[trade_id]}) -- trade_id is the dedupe key and "
+                    "must be unique per fill; re-key on entry_id",
+                )
+                continue
+            seen_trade_ids[trade_id] = idx
+
+            warn = zero_price_warning(locate(raw, idx), base, quantity, price)
             if warn is not None:
                 warnings.append(warn)
 
@@ -151,7 +214,7 @@ class CoinbaseAPIImporter:
                     price=price,
                     fee=fee,
                     fee_currency=quote.upper(),
-                    venue_fill_id=str(raw.get("trade_id")),
+                    venue_fill_id=trade_id,
                     venue_order_id=str(raw.get("order_id")) if raw.get("order_id") else None,
                 )
             )

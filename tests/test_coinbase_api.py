@@ -1,4 +1,5 @@
 # tests/test_coinbase_api.py
+import json
 import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -131,6 +132,136 @@ def test_money_fields_never_become_floats():
     f = next(x for x in fills if x.venue_fill_id == "t4")
     assert isinstance(f.quantity, Decimal)
     assert f.quantity == Decimal("1234567890.12345678")
+
+
+# --- C1/C2: the dedupe key must identify exactly one fill -------------------
+#
+# venue_fill_id IS the dedupe key. db/importing.py routes any fill that has one
+# onto fill_venue_id_uniq and skips content_hash synthesis; db/fills.py inserts
+# ON CONFLICT DO NOTHING. So a key that is missing or shared is not a cosmetic
+# problem -- it is a real fill dropped and REPORTED AS A DUPLICATE, which reads
+# to the user as successful deduplication.
+
+
+def _fill(**over) -> str:
+    """One well-formed fill, JSON-encoded in a `fills` array, with overrides.
+
+    Built from a dict rather than by string-substituting the shared FIXTURE so
+    a test can delete a key outright (`trade_id=None`), which is the C1 case
+    and is not expressible as a substitution.
+    """
+    base = {
+        "entry_id": "e9",
+        "trade_id": "t9",
+        "order_id": "o9",
+        "trade_time": "2026-06-01T00:00:00Z",
+        "sequence_timestamp": "2026-06-01T00:00:00.5Z",
+        "price": "100",
+        "size": "1",
+        "size_in_quote": False,
+        "commission": "0.10",
+        "product_id": "BTC-USD",
+        "side": "BUY",
+    }
+    rows = []
+    for spec in over["rows"]:
+        row = dict(base)
+        row.update({k: v for k, v in spec.items() if v is not None})
+        for k, v in spec.items():
+            if v is None:
+                row.pop(k, None)
+        rows.append(row)
+    return json.dumps({"fills": rows, "cursor": ""})
+
+
+def test_a_fill_with_no_trade_id_is_refused_not_recorded_as_the_string_none():
+    """C1. `venue_fill_id=str(raw.get("trade_id"))` made a missing trade_id
+    into the literal string "None", which is TRUTHY. db/importing.py:57's
+    `if cf.venue_fill_id:` therefore took the venue-id branch and skipped
+    content_hash synthesis, so the first such fill created a row keyed "None"
+    and every later no-trade_id fill -- in this batch AND in every future
+    batch, forever, for that account -- collided with it on
+    fill_venue_id_uniq and was dropped by ON CONFLICT DO NOTHING, reported as
+    "(N already present)".
+
+    Two such fills, with different money, are used deliberately: with the bug
+    present both map successfully (this assertion's `fills == ()` goes red)
+    AND both carry the same key, which is the cross-batch trap. Asserting on
+    `blocking` as well as `fills` is what makes the refusal LOUD rather than
+    merely a drop -- cli.py refuses the whole commit on a blocking reason
+    whose ref is None.
+    """
+    text = _fill(rows=[{"trade_id": None, "size": "2"}, {"trade_id": None, "size": "3"}])
+    b = CoinbaseAPIImporter().parse(text)
+    assert b.fills == ()
+    assert len(b.blocking) == 2
+    assert all("no trade_id" in msg for _ref, msg in b.blocking)
+    assert [ref for ref, _ in b.blocking] == [None, None]
+
+
+def test_a_blank_or_whitespace_trade_id_is_refused_too():
+    """`""` and `"   "` are the same defect as a missing key: neither
+    identifies a fill. `str(raw.get("trade_id") or "").strip()` collapses all
+    three to the empty string; a check written as `raw.get("trade_id") is
+    None` would let both of these through to become a "" or "   " dedupe key.
+    """
+    text = _fill(rows=[{"trade_id": ""}, {"trade_id": "   "}])
+    b = CoinbaseAPIImporter().parse(text)
+    assert b.fills == ()
+    assert len(b.blocking) == 2
+
+
+def test_two_fills_sharing_a_trade_id_are_refused_rather_than_silently_collapsed():
+    """C2. The branch simultaneously assumed trade_id is unique, admitted in
+    docs/known-gaps.md that nobody had checked, and contained no code that
+    would notice if the assumption were wrong. Two fills with the same
+    trade_id and DIFFERENT money used to both map cleanly with no warning; on
+    commit the second hit fill_venue_id_uniq and disappeared into
+    fills_skipped.
+
+    The first occurrence is still mapped -- refusing it too would be a second
+    kind of loss -- and the batch as a whole is refused via `blocking`, which
+    cli.py turns into a non-zero exit that writes nothing at all.
+    """
+    text = _fill(
+        rows=[
+            {"trade_id": "dup", "size": "1", "price": "100"},
+            {"trade_id": "dup", "size": "2", "price": "200"},
+        ]
+    )
+    b = CoinbaseAPIImporter().parse(text)
+    assert [f.venue_fill_id for f in b.fills] == ["dup"]
+    assert len(b.blocking) == 1
+    msg = b.blocking[0][1]
+    assert "duplicate trade_id 'dup'" in msg
+    assert "first seen at fill 0" in msg
+    assert "entry_id" in msg
+
+
+def test_distinct_trade_ids_are_not_mistaken_for_duplicates():
+    """The negative twin. A guard that refused every fill would satisfy the
+    two tests above and destroy the importer; this pins that well-formed
+    input is untouched. The whole shipped fixture (4 fills, distinct
+    trade_ids, one legitimately rejected for size_in_quote) is the same
+    statement at larger scale -- every other test in this file would go red.
+    """
+    text = _fill(rows=[{"trade_id": "a"}, {"trade_id": "b"}, {"trade_id": "c"}])
+    b = CoinbaseAPIImporter().parse(text)
+    assert [f.venue_fill_id for f in b.fills] == ["a", "b", "c"]
+    assert b.blocking == ()
+    assert b.warnings == ()
+
+
+def test_a_zero_price_warning_names_the_fill_the_way_every_other_message_does():
+    """M3. zero_price_warning formats its own prefix; handing it the JSON
+    array index produced "line 0: BTC ..." from a parser whose every other
+    message says "fill 0 (trade_id=...)" -- the same coordinate under two
+    names in one batch's warning list.
+    """
+    b = CoinbaseAPIImporter().parse(_fill(rows=[{"trade_id": "zp", "price": "0"}]))
+    assert len(b.warnings) == 1
+    assert b.warnings[0].startswith("fill 0 (trade_id='zp'): BTC has quantity 1 at zero price")
+    assert "line " not in b.warnings[0]
 
 
 def test_an_empty_document_is_empty_not_an_error():
