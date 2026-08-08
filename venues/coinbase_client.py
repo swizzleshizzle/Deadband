@@ -7,6 +7,7 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 
@@ -56,7 +57,10 @@ async def fetch_all_fills(
     *,
     start: datetime | None = None,
     end: datetime | None = None,
-    transport: httpx.BaseTransport | None = None,
+    # M7: AsyncBaseTransport, not BaseTransport -- httpx.AsyncClient takes the
+    # async protocol. httpx.MockTransport happens to satisfy both, so the tests
+    # never noticed the annotation was simply wrong.
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
     """Every fill, following the cursor to exhaustion. Returns JSON text for
     the pure mapper in importers/coinbase_api.py."""
@@ -89,7 +93,20 @@ async def fetch_all_fills(
                     f"Coinbase fills request failed with {r.status_code}: {r.text[:200]}"
                 )
 
-            body = r.json()
+            # I1: json.loads(r.text, parse_float=Decimal), NOT r.json().
+            # r.json() is json.loads with the DEFAULT parse_float, i.e. `float`
+            # -- so an unquoted JSON number is rounded to a C double HERE, in
+            # the transport layer, before the pure mapper ever sees the digits.
+            # importers/coinbase_api.py parses with parse_float=Decimal, and
+            # tests/test_coinbase_api.py guards that with an 18-significant-
+            # figure value -- but it feeds the fixture straight to the mapper,
+            # so the defence existed on the test's path and not on the real
+            # one. Measured: an unquoted "size" of 1234567890.12345678 came
+            # back through this function as 1234567890.1234567, a different
+            # number. Latent rather than live (Coinbase quotes its money fields
+            # today) -- and the whole point of parse_float=Decimal was the day
+            # it stops.
+            body = json.loads(r.text, parse_float=Decimal)
             # A 200 with a missing or non-list `fills` is malformed, not an
             # empty page. `body.get("fills") or []` would silently treat
             # both the same way -- contributing zero rows and, if `cursor`
@@ -119,4 +136,11 @@ async def fetch_all_fills(
                 f"Coinbase pagination exceeded {_MAX_PAGES} pages; refusing to continue"
             )
 
-    return json.dumps({"fills": collected, "cursor": ""})
+    # default=str: json.dumps cannot serialize a Decimal, and the Decimals the
+    # loads() above produced must survive re-serialization without going
+    # through float. str(Decimal) emits every digit, and the value lands in the
+    # document as a QUOTED string -- which importers/coinbase_api.py's
+    # `_decimal` already handles (it does Decimal(str(raw).strip()) for
+    # anything that is not already a Decimal). So the full precision reaches
+    # NUMERIC either way, whether Coinbase quoted the field or not.
+    return json.dumps({"fills": collected, "cursor": ""}, default=str)

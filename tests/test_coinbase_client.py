@@ -1,12 +1,12 @@
 import json
 import os
+from decimal import Decimal
 
 import httpx
 import pytest
 
+from importers.coinbase_api import CoinbaseAPIImporter
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
-
-PEM = None  # set in fixture below
 
 
 @pytest.fixture(autouse=True)
@@ -101,6 +101,50 @@ async def test_a_malformed_200_page_raises_rather_than_being_treated_as_empty():
         await fetch_all_fills(
             CoinbaseCredentials.from_env(), transport=httpx.MockTransport(handler)
         )
+
+
+async def test_an_unquoted_money_number_survives_the_client_with_every_digit():
+    """I1. The mapper parses with `parse_float=Decimal` and
+    tests/test_coinbase_api.py guards that with an 18-significant-figure
+    value -- but that test feeds the fixture DIRECTLY to the mapper, so the
+    defence was proven on a path production never takes. On the real path the
+    client used `r.json()` (json.loads with the default `parse_float`, i.e.
+    `float`) and re-serialized with a plain `json.dumps`, so an unquoted JSON
+    number was rounded to a C double in the transport layer before the pure
+    layer ever saw the digits. Measured before the fix:
+    1234567890.12345678 came back as 1234567890.1234567 -- 17 digits, a
+    different number.
+
+    The response body is built as raw text, not via `json=`, because
+    `httpx.Response(json=...)` would serialize a Python float and lose the
+    precision inside the test's own fixture. `content=` puts the exact bytes
+    Coinbase would put on the wire.
+
+    Asserting on the returned TEXT (not on a re-parse of it) is deliberate:
+    re-parsing here with parse_float=Decimal would be this test performing
+    the very fix it is supposed to be checking for. The digits are either in
+    the string the client returns or they are gone.
+    """
+    body = (
+        '{"fills": [{"trade_id": "t1", "order_id": "o1", '
+        '"trade_time": "2026-06-01T00:00:00Z", "price": "0.00001234", '
+        '"size": 1234567890.12345678, "size_in_quote": false, '
+        '"commission": "1.00", "product_id": "SHIB-USD", "side": "BUY"}], '
+        '"cursor": ""}'
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    text = await fetch_all_fills(
+        CoinbaseCredentials.from_env(), transport=httpx.MockTransport(handler)
+    )
+    assert "1234567890.12345678" in text
+
+    # And the quantity the pure mapper builds from that text is the exact
+    # number -- the end-to-end statement each layer's own test only half-made.
+    fill = CoinbaseAPIImporter().parse(text).fills[0]
+    assert fill.quantity == Decimal("1234567890.12345678")
 
 
 def test_credentials_repr_never_prints_the_private_key():

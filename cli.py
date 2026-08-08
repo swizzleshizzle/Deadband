@@ -110,11 +110,22 @@ async def cmd_accounts_add(args) -> int:
 async def cmd_import(args) -> int:
     importer = get_importer(args.venue)
     batch = importer.parse(pathlib.Path(args.file).read_text())
-    return await _preview_or_commit(importer.account_venue, batch, args)
+    return await _preview_or_commit(importer.account_venue, batch, args, source="csv")
 
 
-async def _preview_or_commit(venue: str, batch: ImportBatch, args) -> int:
+async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: str) -> int:
     """The three-phase body every entry point (`import`, `sync`) shares.
+
+    `source` is the provenance recorded on every fill this call writes
+    (`fill.source`): "csv" from `cmd_import`, "api" from `cmd_sync`. It is
+    keyword-only and has NO default on purpose. commit_batch's own
+    `source: str = "csv"` default is what made every API-synced fill claim it
+    came from a CSV (I2) -- silently, since nothing downstream reads the
+    column yet. `fill.source` is the only column that can answer "which of my
+    Coinbase fills came from the retired CSV path?", which is exactly the
+    question the mixed-provenance refusal below and any future reconciliation
+    have to ask. A default here would let the next entry point reintroduce the
+    same lie by omission; requiring the argument makes the caller state it.
 
     `venue` is always an importer's `.account_venue` (see the Importer
     Protocol in importers/base.py), never its `.venue` identity -- those
@@ -379,10 +390,70 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args) -> int:
                 )
                 return 2
 
+            # I3: refuse a batch that would make an account's fills reachable
+            # by two mutually-blind dedupe paths.
+            #
+            # The two partial unique indexes are disjoint BY CONSTRUCTION:
+            # fill_venue_id_uniq is WHERE venue_fill_id IS NOT NULL,
+            # fill_content_hash_uniq is WHERE content_hash IS NOT NULL, and
+            # db/importing.py gives a fill exactly one of the two keys, never
+            # both. A pre-cut-over CSV Coinbase fill therefore has
+            # (venue_fill_id NULL, content_hash SET); the SAME trade arriving
+            # via `sync` has (venue_fill_id SET, content_hash NULL). Neither
+            # index can see the other. Both rows land, both feed
+            # regroup_account, and the account's position and realized P&L
+            # silently DOUBLE. Nothing else in the system would notice.
+            #
+            # Deliberately generic, not Coinbase-specific: any venue that ever
+            # cuts a CSV path over to an API one has this exact hazard, and
+            # the check costs one SELECT count(*) per target account, on the
+            # commit path only. It runs here -- after route_batch, before
+            # `async with conn.transaction():` -- so it refuses and writes
+            # nothing, and it is unreachable from preview, which opens no
+            # connection at all (a tested invariant).
+            mixed = []
+            for account_id, sub_batch in targets.items():
+                if not any(f.venue_fill_id for f in sub_batch.fills):
+                    continue
+                legacy = await conn.fetchval(
+                    """
+                    SELECT count(*) FROM fill
+                     WHERE account_id = $1
+                       AND content_hash IS NOT NULL
+                       AND venue_fill_id IS NULL
+                    """,
+                    account_id,
+                )
+                if legacy:
+                    mixed.append((account_id, legacy))
+            if mixed:
+                print(
+                    "error: refusing to commit -- this batch's fills carry a venue "
+                    "fill id, but the target account already holds fill(s) that "
+                    "dedupe on content_hash instead:",
+                    file=sys.stderr,
+                )
+                for account_id, legacy in mixed:
+                    print(
+                        f"  {account_id}: {legacy} existing fill(s) with "
+                        "content_hash set and venue_fill_id null",
+                        file=sys.stderr,
+                    )
+                print(
+                    "  The two dedupe indexes are disjoint, so the same trade "
+                    "arriving by both paths would be inserted twice and double "
+                    "the account's position and realized P&L. Remedy: delete the "
+                    "older content_hash-keyed fills for this account (they are "
+                    "the ones with source='csv' and venue_fill_id null) and "
+                    "re-sync, or commit into a fresh account.",
+                    file=sys.stderr,
+                )
+                return 2
+
             fills_inserted = fills_skipped = cash_inserted = trades_regrouped = 0
             async with conn.transaction():
                 for account_id, sub_batch in targets.items():
-                    result = await commit_batch(conn, account_id, sub_batch)
+                    result = await commit_batch(conn, account_id, sub_batch, source=source)
                     fills_inserted += result.fills_inserted
                     fills_skipped += result.fills_skipped
                     cash_inserted += result.cash_inserted
@@ -441,7 +512,11 @@ async def cmd_sync(args) -> int:
         # cmd_sync directly -- not through main()'s asyncio.run wrapper --
         # still gets a hard stop instead of a return code it could ignore.
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        # `from exc` (M2, ruff B904): without it the credentials RuntimeError
+        # is reported as "During handling of the above exception, another
+        # exception occurred", which reads like a bug in the handler rather
+        # than the cause it actually is.
+        raise SystemExit(2) from exc
 
     text = await fetch_all_fills(
         creds,
@@ -453,7 +528,11 @@ async def cmd_sync(args) -> int:
     # importer.account_venue ("coinbase"), not importer.venue
     # ("coinbase-api"): see importers/base.py's Importer.account_venue
     # docstring and _preview_or_commit's docstring above.
-    return await _preview_or_commit(importer.account_venue, batch, args)
+    #
+    # source="api" (I2): these fills came off the REST endpoint, not a CSV.
+    # commit_batch's `source` defaulted to "csv" and nothing overrode it, so
+    # every fill `sync` had ever written claimed CSV provenance.
+    return await _preview_or_commit(importer.account_venue, batch, args, source="api")
 
 
 async def cmd_regroup(args) -> int:
