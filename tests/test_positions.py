@@ -7,11 +7,15 @@ from ledger.types import Direction
 
 I1 = UUID("11111111-1111-1111-1111-111111111111")
 I2 = UUID("22222222-2222-2222-2222-222222222222")
+A1 = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+A2 = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 
 def row(instrument_id=I1, symbol="ZXCO", multiplier="1", direction=Direction.LONG,
-        qty="10", basis="20", estimated=False):
+        qty="10", basis="20", estimated=False, account_id=A1, account_name="Acct1"):
     return TradeRow(
+        account_id=account_id,
+        account_name=account_name,
         instrument_id=instrument_id,
         symbol=symbol,
         multiplier=Decimal(multiplier),
@@ -171,3 +175,61 @@ def test_symbol_collision_is_broken_by_instrument_id_not_insertion_order():
 
 def test_no_rows_is_no_positions_not_an_error():
     assert aggregate_positions([]) == ()
+
+
+def test_two_accounts_holding_one_instrument_produce_two_rows_not_one():
+    """The behaviour this whole change exists for. Before, grouping by
+    instrument alone merged a taxable account's 10 @ 20 with a retirement
+    account's 30 @ 50 into one blended row (quantity 40, basis 42.5) -- a
+    cost basis that answers no question anyone actually has, because the two
+    accounts' bases have different tax consequences. Now each account's
+    holding is its own row, each individually valuable."""
+    ps = aggregate_positions([
+        row(account_id=A1, account_name="Taxable", qty="10", basis="20"),
+        row(account_id=A2, account_name="Retirement", qty="30", basis="50"),
+    ])
+    assert len(ps) == 2
+    by_account = {p.account_id: p for p in ps}
+    assert by_account[A1].quantity == Decimal("10")
+    assert by_account[A1].cost_basis == Decimal("20")
+    assert by_account[A1].trade_count == 1
+    assert by_account[A1].unvaluable_reason is None
+    assert by_account[A2].quantity == Decimal("30")
+    assert by_account[A2].cost_basis == Decimal("50")
+    assert by_account[A2].trade_count == 1
+    assert by_account[A2].unvaluable_reason is None
+
+
+def test_long_in_one_account_and_short_in_another_is_not_mixed_direction():
+    """The manufactured position the old grouping produced: long in a
+    taxable account and short in a retirement account is two ordinary,
+    single-direction positions in reality, not one unvaluable 'mixed
+    direction' row. Grouping by (account, instrument) must let both price
+    normally."""
+    ps = aggregate_positions([
+        row(account_id=A1, direction=Direction.LONG, qty="10", basis="20"),
+        row(account_id=A2, direction=Direction.SHORT, qty="4", basis="50"),
+    ])
+    assert len(ps) == 2
+    for p in ps:
+        assert p.unvaluable_reason is None
+    directions = {p.account_id: p.direction for p in ps}
+    assert directions[A1] is Direction.LONG
+    assert directions[A2] is Direction.SHORT
+
+
+def test_ordering_falls_back_to_account_id_when_symbol_and_account_name_tie():
+    """Account names are not unique either (nothing stops two accounts
+    sharing a name), so a symbol-then-account-name sort key alone still has
+    ties. `str(account_id)` is the tiebreaker that makes the order a total
+    one when both the symbol and the account name collide.
+
+    A1 sorts before A2 as a UUID string, and this inserts A2 first -- the
+    opposite of the expected output order -- so insertion order and the
+    correct (account_id-sorted) order genuinely disagree."""
+    assert str(A1) < str(A2)
+    ps = aggregate_positions([
+        row(account_id=A2, account_name="Same", instrument_id=I1, symbol="DUPE"),
+        row(account_id=A1, account_name="Same", instrument_id=I1, symbol="DUPE"),
+    ])
+    assert [p.account_id for p in ps] == [A1, A2]

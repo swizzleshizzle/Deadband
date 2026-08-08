@@ -305,6 +305,54 @@ async def test_two_orphaned_trades_in_different_accounts_do_not_merge_when_unsco
     assert by_id[id2].trade_count == 1
 
 
+async def test_two_accounts_holding_the_same_instrument_are_two_rows(conn):
+    """The behaviour this task exists for: grouping is now (account_id,
+    instrument_id), not instrument_id alone. Before, one open long in a
+    taxable account and one open short in a retirement account -- both on
+    the SAME instrument -- merged into a single row: a blended cost basis
+    that has no meaning across two accounts with different tax treatment,
+    and a manufactured 'mixed direction' that exists nowhere in reality
+    (each leg is an ordinary, individually valuable position on its own).
+
+    Same instrument via upsert_instrument's natural-key idempotency (see
+    db/instruments.py) -- calling it twice with the same equity symbol
+    returns the same instrument id, so this exercises a genuine shared
+    instrument rather than two coincidentally-identical ones."""
+    acc_a = await create_account(conn, name="Taxable", venue="manual", account_type="cash")
+    acc_b = await create_account(conn, name="Retirement", venue="manual", account_type="cash")
+    inst_a = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRD", quote_currency="USD"),
+    )
+    inst_b = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRD", quote_currency="USD"),
+    )
+    assert inst_a == inst_b  # same natural key -> same row, not a coincidence
+
+    await insert_fills(
+        conn, [_fill(acc_a, inst_a, side=Side.BUY, quantity="10", price="20", ref="sh-a")]
+    )
+    await regroup_account(conn, acc_a)
+    await insert_fills(
+        conn, [_fill(acc_b, inst_b, side=Side.SELL, quantity="4", price="50", ref="sh-b")]
+    )
+    await regroup_account(conn, acc_b)
+
+    ps = await open_positions(conn, None)
+    by_account = {p.account_id: p for p in ps if p.instrument_id == inst_a}
+
+    assert len(by_account) == 2
+    assert by_account[acc_a].account_name == "Taxable"
+    assert by_account[acc_a].quantity == Decimal("10")
+    assert by_account[acc_a].cost_basis == Decimal("20")
+    assert by_account[acc_a].unvaluable_reason is None  # not "mixed direction"
+    assert by_account[acc_b].account_name == "Retirement"
+    assert by_account[acc_b].quantity == Decimal("4")
+    assert by_account[acc_b].cost_basis == Decimal("50")
+    assert by_account[acc_b].unvaluable_reason is None  # not "mixed direction"
+
+
 async def test_an_orphaned_trade_with_a_real_quantity_is_still_unvaluable(conn):
     """A trade can lose its opening fill (the composite FK's
     ON DELETE SET NULL) without ever going through regroup_account's

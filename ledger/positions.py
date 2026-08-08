@@ -14,6 +14,8 @@ from ledger.types import Direction
 class TradeRow:
     """One open trade, as the database hands it over."""
 
+    account_id: UUID
+    account_name: str
     instrument_id: UUID
     symbol: str
     multiplier: Decimal
@@ -27,6 +29,8 @@ class TradeRow:
 
 @dataclass(frozen=True, slots=True)
 class OpenPosition:
+    account_id: UUID
+    account_name: str
     instrument_id: UUID
     symbol: str
     quantity: Decimal
@@ -49,12 +53,21 @@ class OpenPosition:
 
 
 def aggregate_positions(rows: Sequence[TradeRow]) -> tuple[OpenPosition, ...]:
-    grouped: dict[UUID, list[TradeRow]] = {}
+    # Keyed by (account_id, instrument_id), not instrument_id alone: cost
+    # basis is not fungible across accounts (a retirement account's basis
+    # carries no tax consequence; a taxable account's drives the whole tax
+    # position), and blending them across accounts also manufactures a
+    # "mixed direction" position that exists nowhere in reality -- long in
+    # one account and short in another is two ordinary, individually
+    # valuable positions, not one unvaluable one. Mixed direction WITHIN one
+    # account is still real and still falls through to the direction check
+    # below exactly as before.
+    grouped: dict[tuple[UUID, UUID], list[TradeRow]] = {}
     for r in rows:
-        grouped.setdefault(r.instrument_id, []).append(r)
+        grouped.setdefault((r.account_id, r.instrument_id), []).append(r)
 
     out: list[OpenPosition] = []
-    for instrument_id, group in grouped.items():
+    for (account_id, instrument_id), group in grouped.items():
         first = group[0]
         reasons: list[str] = []
 
@@ -87,6 +100,8 @@ def aggregate_positions(rows: Sequence[TradeRow]) -> tuple[OpenPosition, ...]:
 
         out.append(
             OpenPosition(
+                account_id=account_id,
+                account_name=first.account_name,
                 instrument_id=instrument_id,
                 symbol=first.symbol,
                 quantity=quantity,
@@ -101,6 +116,17 @@ def aggregate_positions(rows: Sequence[TradeRow]) -> tuple[OpenPosition, ...]:
             )
         )
 
-    # Symbols are NOT unique (only instrument.natural_key is), so the
-    # instrument id is the tiebreaker that makes this order deterministic.
-    return tuple(sorted(out, key=lambda p: (p.symbol, str(p.instrument_id))))
+    # Symbols are NOT unique (only instrument.natural_key is) and account
+    # names are NOT unique either (nothing stops two accounts sharing a
+    # name) -- so this sorts primarily for a human (symbol, then account
+    # name) but the trailing (account_id, instrument_id) pair is what makes
+    # the order a TOTAL one with no ties: it is exactly the tuple used as
+    # this function's own grouping key above, so any two distinct output
+    # rows necessarily differ in it, however their symbol and account name
+    # compare.
+    return tuple(
+        sorted(
+            out,
+            key=lambda p: (p.symbol, p.account_name, str(p.account_id), str(p.instrument_id)),
+        )
+    )

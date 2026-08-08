@@ -701,8 +701,19 @@ async def cmd_positions(args) -> int:
         # just as plausibly as the real one, and a misread strike is a wrong
         # position, whereas a wide column is only ugly. Anything longer than
         # 21 still overflows, loudly, for the same reason.
+        # Account name, not just id: positions now group by (account,
+        # instrument) rather than instrument alone (a taxable and a
+        # retirement account's cost basis are not fungible), and --account
+        # filters that grouping rather than changing what a row means, so an
+        # unscoped listing can show the same symbol more than once, once per
+        # account -- the account column is what tells those rows apart.
+        # 15 wide, left-justified like the symbol column, and never
+        # truncated for the same reason the symbol column isn't: a
+        # truncated account name can read as a different, shorter-named
+        # account that happens to exist, which is a wrong answer dressed as
+        # a real one, whereas an overflowing column is only ugly.
         print(
-            f"{p.symbol:<21}{estimated}{qty_col:>14} {basis_col:>14} "
+            f"{p.symbol:<21}{estimated} {p.account_name:<15}{qty_col:>14} {basis_col:>14} "
             f"{mark_col:>22} {unreal}"
         )
     if not positions:

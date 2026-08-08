@@ -10,19 +10,29 @@ import asyncpg
 from ledger.positions import OpenPosition, TradeRow, aggregate_positions
 from ledger.types import Direction
 
-# LEFT JOIN, not INNER: a protected trade has opening_fill_id NULL (the
-# composite FK is ON DELETE SET NULL), and an inner join would silently drop
-# it from a listing whose whole job is to show everything the account holds.
+# The fill/instrument LEFT JOINs below are LEFT, not INNER: a protected
+# trade has opening_fill_id NULL (the composite FK is ON DELETE SET NULL),
+# and an inner join would silently drop it from a listing whose whole job is
+# to show everything the account holds.
 _SQL = """
     SELECT t.id,
            t.direction,
            t.open_quantity,
            t.open_cost_basis,
            t.is_estimated,
+           t.account_id AS account_id,
+           a.name       AS account_name,
            i.id     AS instrument_id,
            i.symbol AS symbol,
            i.contract_multiplier AS multiplier
       FROM trade t
+      -- Inner join, not left: trade.account_id is NOT NULL and account is
+      -- never deleted out from under a trade (ON DELETE CASCADE runs the
+      -- other way -- deleting an account deletes its trades, per
+      -- db/schema.sql), so every open trade has exactly one reachable
+      -- account. Unlike the instrument join below, there is no orphaned
+      -- case here to protect against.
+      JOIN account a         ON a.id = t.account_id
       LEFT JOIN fill f       ON f.id = t.opening_fill_id
       LEFT JOIN instrument i ON i.id = f.instrument_id
      WHERE t.status = 'open'
@@ -36,6 +46,8 @@ async def open_positions(
     records = await conn.fetch(_SQL, account_id)
     rows = [
         TradeRow(
+            account_id=r["account_id"],
+            account_name=r["account_name"],
             # A trade with no reachable instrument still has to appear -- but
             # two such trades are not necessarily "the same unknown thing".
             # A shared sentinel here would merge them into one row with a

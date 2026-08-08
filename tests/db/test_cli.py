@@ -1789,7 +1789,7 @@ async def test_positions_an_unmarked_one_shows_a_placeholder_not_a_zero(
     # Asserting the exact fields rather than `"--" in out` keeps this from
     # passing on a row that blanked everything, which is what the
     # unvaluable-position branch does and is a different outcome entirely.
-    assert out.split() == ["NOMK", "3.00", "17.00", "--", "--"]
+    assert out.split() == ["NOMK", "Unmarked", "3.00", "17.00", "--", "--"]
     # Still the real point of the test, and still not vacuous: a placeholder
     # must be visibly different from a genuine zero price, which
     # mark_price_chk permits and which renders "0.00" (see
@@ -1818,8 +1818,9 @@ async def test_positions_a_genuine_zero_mark_is_not_a_placeholder(
     assert "--" not in out
     fields = out.split()
     assert fields[0] == "ZERO"
-    assert fields[3] == "0.00"  # the mark itself, at a real zero
-    assert fields[4].startswith("@")  # ...still carrying its as_of date
+    assert fields[1] == "ZeroMark"
+    assert fields[4] == "0.00"  # the mark itself, at a real zero
+    assert fields[5].startswith("@")  # ...still carrying its as_of date
     assert fields[-1] == "-51.00"  # (0 - 17) * 3 * 1
 
 
@@ -1845,7 +1846,7 @@ async def test_positions_an_unvaluable_one_shows_no_quantity_or_basis(
     assert rc == 0, capsys.readouterr().err
     out = capsys.readouterr().out
 
-    assert out.split()[:4] == ["MIXD", "--", "--", "--"]
+    assert out.split()[:5] == ["MIXD", "Mixed", "--", "--", "--"]
     assert "mixed direction" in out
     assert "14" not in out  # the summed magnitudes
     assert "28.57" not in out  # the long/short blended basis
@@ -1876,8 +1877,9 @@ async def test_positions_bounds_a_repeating_cost_basis_for_display(
 
     fields = line.split()
     assert fields[0] == "XACC"
-    assert fields[1] == "3.00"
-    assert fields[2] == "16.66666667"  # 50/3, bounded -- not 50 digits of it
+    assert fields[1] == "Repeating"
+    assert fields[2] == "3.00"
+    assert fields[3] == "16.66666667"  # 50/3, bounded -- not 50 digits of it
     assert fields[-1] == "25.00"  # (25 - 50/3) * 3, not 28 digits of it
     assert "16.666666666" not in line
     # The whole point of the bound: the row fits a standard terminal.
@@ -1988,3 +1990,58 @@ async def test_positions_the_marks_age_is_shown(conn, monkeypatch, stale_mark_ac
     assert rc == 0, capsys.readouterr().err
     out = capsys.readouterr().out
     assert "2026-07-01" in out or "d ago" in out
+
+
+@pytest_asyncio.fixture
+async def two_accounts_one_instrument(conn):
+    """A taxable and a retirement account, each holding the SAME instrument
+    -- one long, one short -- so the end-to-end path (not just the pure
+    layer or the SQL) is proven to emit two priceable rows rather than one
+    blended, unvaluable one."""
+    acc_tax = await create_account(conn, name="Taxable", venue="manual", account_type="cash")
+    acc_ret = await create_account(conn, name="Retirement", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRD", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc_tax, inst, side=Side.BUY, quantity="10", price="20", ref="sh-tax")],
+    )
+    await regroup_account(conn, acc_tax)
+    await insert_fills(
+        conn,
+        [_position_fill(acc_ret, inst, side=Side.SELL, quantity="4", price="50", ref="sh-ret")],
+    )
+    await regroup_account(conn, acc_ret)
+    return acc_tax, acc_ret
+
+
+async def test_positions_unscoped_shows_one_row_per_account_not_a_blend(
+    conn, monkeypatch, two_accounts_one_instrument, capsys
+):
+    """The behaviour this task exists for, exercised through the actual CLI
+    command with no `--account` filter -- the exact case the owner flagged:
+    without it, one instrument's holdings across every account used to merge
+    into a single row, manufacturing a 'mixed direction' position (long here,
+    short there) that exists nowhere in reality. Now each account's holding
+    is its own row, and both price normally."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=None))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+
+    assert len(lines) == 2
+    assert "mixed direction" not in out
+    tax_line = next(line for line in lines if "Taxable" in line)
+    ret_line = next(line for line in lines if "Retirement" in line)
+    assert tax_line.split()[0] == "SHRD"
+    assert ret_line.split()[0] == "SHRD"
+    assert tax_line.split()[2] == "10.00"  # quantity, not blended with the other leg
+    assert ret_line.split()[2] == "4.00"

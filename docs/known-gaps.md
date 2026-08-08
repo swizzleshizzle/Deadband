@@ -360,10 +360,19 @@ this file is the project's memory.
 > of pruning them.
 
 > [!note] Gap #12, closed — what `positions` actually does
-> `positions` groups an account's open trades per instrument (quantity-weighted average
-> cost basis across trades in the same instrument) and rolls `is_estimated` up with the
-> same `any()` convention as `trade`. Two separate mechanisms decide what a row shows, and
-> they must not be conflated:
+> `positions` groups open trades by **(account, instrument)**, not by instrument alone
+> (quantity-weighted average cost basis across trades sharing both an account and an
+> instrument) and rolls `is_estimated` up with the same `any()` convention as `trade`.
+> `--account` *filters* which rows are shown; it no longer changes what a row means, so an
+> unscoped listing can show one instrument more than once -- once per account holding it --
+> distinguished by an account-name column. This replaced an earlier instrument-only
+> grouping that blended a taxable account's cost basis with a retirement account's (no tax
+> consequence in one, the whole tax position in the other -- a blended figure answers no
+> question either account actually has) and could manufacture a "mixed direction" position
+> that exists nowhere in reality: long in one account and short in another is two ordinary,
+> individually valuable positions, not one unvaluable one. Mixed direction *within* a single
+> account is still real and is still reported exactly as before. Two separate mechanisms
+> decide what a row shows, and they must not be conflated:
 >
 > - **Structurally unvaluable**, decided by `aggregate_positions` (`ledger/positions.py`)
 >   without ever looking at a mark — marks are not even passed to it. It sets
