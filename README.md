@@ -38,6 +38,8 @@ uv run python cli.py accounts                                                   
 uv run python cli.py import fidelity path/to/activity.csv --account <uuid>              # preview only
 uv run python cli.py import fidelity path/to/activity.csv --account <uuid> --commit     # write + regroup
 
+uv run python cli.py sync coinbase --account <uuid> --commit                            # pull fills via API
+
 uv run python cli.py trades --account <uuid>
 ```
 
@@ -46,6 +48,24 @@ and reports what it would do. `--commit` refuses to run if `--account`'s venue d
 match the importer's (e.g. committing a Coinbase export to a Fidelity account), and
 wraps the fill insert and trade regroup in one transaction, so a crash between the two
 can never leave fills without their trades.
+
+### Coinbase fills
+
+Coinbase fills come from the Advanced Trade API, not CSV. `sync coinbase [--account
+<uuid>] [--start …] [--end …] [--commit]` requires `COINBASE_API_KEY` and
+`COINBASE_API_SECRET` in the environment — a CDP API key scoped to **`view` only**; it
+never needs `trade` or `transfer`. If either variable is absent, or Coinbase rejects the
+key, `sync` **raises**, naming the missing variable, rather than returning zero fills —
+a sync that reports success while fetching nothing is worse than one that fails loudly.
+
+A read-only key still discloses your complete position and balance history. It belongs
+only in the deployment environment and must never be committed to this repository or
+placed in `.env.example`.
+
+The Coinbase CSV importer no longer produces fills — it reports each trade row and
+points you at `sync coinbase` instead. CSV import remains the only path for Coinbase's
+non-trade cash movements (deposits, withdrawals, transfers, rewards and staking income,
+interest); the Advanced Trade API has no endpoint for any of those.
 
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
 tests; set it to run them too).

@@ -186,6 +186,58 @@ before any further work quotes a plan row.
 
 ---
 
+## Found during A2 part 2b1: Coinbase API import (2026-08-08)
+
+### Coinbase non-trade cash still requires a manual CSV export
+
+The Advanced Trade API surface has no endpoint for deposits, withdrawals, transfers,
+rewards income, staking income, or interest — only fills. Verified against Coinbase's
+REST endpoint index on 2026-08-08. A2-16's claim that the API "replaces the CSV importer"
+holds only for fills (see the update above); every non-trade cash movement still has to
+arrive via a CSV export, through the Coinbase CSV importer's cash path (it emits no fills
+any more, but still emits cash rows).
+
+A Coinbase App API v2 `transactions` source would close this — but that is a separate,
+unbuilt integration with a different base URL, different auth, and a different data
+shape, not an extension of the Advanced Trade client this phase built.
+
+> [!warning] UNVERIFIED — the fill dedupe key may not be unique. This is the gap in this document most likely to lose money.
+> `importers/coinbase_api.py` keys every Coinbase fill on the API response's `trade_id`,
+> because the spec (A2-16) says "the API supplies a venue trade id." But the same
+> response also carries an `entry_id` field, and Coinbase's own documentation does not
+> state which of the two — if either — is guaranteed unique per fill.
+>
+> If `trade_id` can repeat across two genuinely distinct fills, `fill_venue_id_uniq`
+> (`UNIQUE (account_id, venue_fill_id)`) will not reject the second one as a duplicate —
+> from the schema's point of view it *is* the first one. One of the two real fills would
+> then disappear from the ledger silently: no error, no warning, no log line. That is a
+> money-losing failure mode, not a cosmetic one.
+>
+> This could not be checked here: **no Coinbase CDP credentials exist on this machine**,
+> so `fetch_all_fills()` has never been run against a real account, and the assumption
+> has never been tested against a real response.
+>
+> **The check, so whoever has credentials can settle it in one command:**
+>
+> ```python
+> fills = <parse the string fetch_all_fills() returns, into a list of fill dicts>
+> len(fills)                                   # total fills returned
+> len({f["trade_id"] for f in fills})          # distinct trade_id
+> len({f["entry_id"] for f in fills})          # distinct entry_id
+> ```
+>
+> If all three numbers agree, `trade_id` is safe as the dedupe key over that sample (not
+> a proof for all time, but strong evidence, and stronger the more fills the account has).
+> If the `trade_id` count is lower than the total, `trade_id` **can** repeat, the current
+> dedupe key is wrong, and `fill_venue_id_uniq` is silently losing fills right now for any
+> account with enough volume to hit a repeat.
+>
+> Do not downgrade this to a routine follow-up. It is the one place this subsystem could
+> lose money silently, and it stays open until someone with credentials runs the check
+> above and records the result.
+
+---
+
 ## Carried into A-2 part 2 and beyond
 
 Recorded here rather than only in an execution ledger, because ledgers are scratch and
@@ -271,6 +323,29 @@ this file is the project's memory.
   > claim about a data source, not about the problem -- and for Coinbase specifically it
   > is a claim that will stop being true the day A2-16 actually ships, not one that is
   > false today.
+  >
+  > **Update 2026-08-08 — A2-16 shipped, for fills only.** The Coinbase API importer
+  > (`importers/coinbase_api.py`, driven by `deadband sync coinbase`) now exists. Every
+  > Coinbase fill imported from here forward is keyed on the venue's own `trade_id`
+  > (`venue_fill_id`), not `content_hash`, so the collision described above is no longer
+  > reachable for new Coinbase fills.
+  >
+  > This also **closes spec §10 gap 6** — but it closed differently than the
+  > spec anticipated. The spec worried about a wholesale cut-over: retiring the CSV
+  > importer while historical CSV-imported fills already existed, needing either an
+  > explicit reconciliation step or a decision about which key wins. What actually shipped
+  > splits the cut-over **by row kind, not wholesale**. Fills now come only from the API,
+  > keyed on `venue_fill_id`. Cash movements still come only from the CSV importer, keyed
+  > on `content_hash` — the CSV importer no longer emits fills at all, it reports each
+  > trade row and points at `sync coinbase` instead. No fill is reachable by two paths, so
+  > the hazard the spec was worried about is gone with **no reconciliation code written**,
+  > because there is nothing to reconcile. A2-16's claim that the API "replaces the CSV
+  > importer" is therefore true for fills and **false for cash** — see the new gap below.
+  >
+  > **Spec §10 gap 5 (Coinbase API credentials) is now LIVE**, not a future concern:
+  > `COINBASE_API_KEY` and `COINBASE_API_SECRET` are a real operational dependency the
+  > moment `sync coinbase` is run against a live account, not a thing to plan for later.
+  > See the README's "Coinbase fills" section for the operational contract.
 - **The purity checker is evadable** via `getattr(datetime, 'now')()` or `builtins.open`.
   It guards accidental I/O by implementers, not a motivated adversary.
 - **`localcontext()` inherits `Emax` / `traps` / `rounding`** from the caller; only `prec`
