@@ -1425,7 +1425,7 @@ async def test_marks_set_refuses_an_as_of_just_outside_the_future_tolerance(
 # --- cmd_positions -----------------------------------------------------------
 
 
-def _position_fill(acc, inst, *, side, quantity, price, ref):
+def _position_fill(acc, inst, *, side, quantity, price, ref, estimated=False):
     """Same shape as tests/db/test_positions.py's own `_fill` helper --
     reused conceptually, not imported, since that module keeps it private
     and this file already owns its Fill-building conventions (see the marks
@@ -1442,7 +1442,46 @@ def _position_fill(acc, inst, *, side, quantity, price, ref):
         fee_currency="USD",
         source=FillSource.MANUAL,
         venue_fill_id=ref,
-        is_estimated=False,
+        is_estimated=estimated,
+    )
+
+
+async def _second_open_trade_on(conn, acc, inst, *, direction, quantity, basis, ref):
+    """Add a SECOND open trade on an instrument that already has one.
+
+    regroup_account never produces this shape -- it merges every open fill on
+    one instrument into a single trade -- so the fill is inserted and the
+    trade row written directly, the same way the `spread_account` fixture
+    above reaches into trade state that regroup would never leave behind.
+
+    It is nonetheless a real database state: an unregrouped import, a manual
+    trade (`grouping_mode = 'manual'`), or a partially applied regroup all
+    leave two open trades on one instrument, and `aggregate_positions` groups
+    strictly by instrument, so the two land in one position. That is the only
+    way to reach the compound arithmetic (a summed quantity, a weighted basis
+    across both) the fabricated-figure and precision findings are about.
+
+    The fill is real and anchors `opening_fill_id`, so the LEFT JOIN in
+    db/positions.py resolves the instrument normally -- this is NOT the
+    orphaned-trade path.
+    """
+    fill = _position_fill(
+        acc, inst, side=Side.BUY, quantity=quantity, price=basis, ref=ref
+    )
+    await insert_fills(conn, [fill])
+    await conn.execute(
+        """
+        INSERT INTO trade (account_id, direction, status, opening_fill_id,
+                           opened_at, open_quantity, open_cost_basis,
+                           grouping_mode)
+        VALUES ($1, $2, 'open', $3, $4, $5, $6, 'manual')
+        """,
+        acc,
+        direction,
+        fill.id,
+        fill.executed_at,
+        Decimal(quantity),
+        Decimal(basis),
     )
 
 
@@ -1531,6 +1570,166 @@ async def stale_mark_account(conn):
     return acc
 
 
+@pytest_asyncio.fixture
+async def mixed_direction_account(conn):
+    """One instrument holding an open long of 10 @ 20 and an open short of
+    4 @ 50 -- the exact shape the final review captured rendering as
+    `ZXCO 14 28.571428...`. 14 is the sum of magnitudes: not the net (6), not
+    either leg, not gross exposure in any direction; 28.57 averages a long
+    basis with a short one."""
+    acc = await create_account(conn, name="Mixed", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="MIXD", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="10", price="20", ref="pos-mx1")],
+    )
+    await regroup_account(conn, acc)
+    await _second_open_trade_on(
+        conn, acc, inst, direction="short", quantity="4", basis="50", ref="pos-mx2"
+    )
+    # Marked, deliberately: the row must refuse to price itself because of
+    # the mixed direction, not merely because no mark happens to exist.
+    await set_mark(conn, inst, Decimal("30"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def repeating_basis_account(conn):
+    """Two open longs, 1 @ 10 and 2 @ 20, marked at 25.
+
+    The weighted average basis is 50/3, which does not terminate, so the
+    ctx.prec = 50 division in aggregate_positions produced a 50-digit cost
+    basis and a 28-digit unrealized straight out of `str()`."""
+    acc = await create_account(conn, name="Repeating", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="XACC", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="1", price="10", ref="pos-rp1")],
+    )
+    await regroup_account(conn, acc)
+    await _second_open_trade_on(
+        conn, acc, inst, direction="long", quantity="2", basis="20", ref="pos-rp2"
+    )
+    await set_mark(conn, inst, Decimal("25"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def zero_marked_account(conn):
+    """A position marked at a GENUINE zero. `mark_price_chk` permits price 0
+    (a worthless expiring option, a delisted shell), so "no mark" and "marked
+    at zero" are different facts that must not render alike.
+
+    Same 3 @ 17 shape as `unmarked_account`, so the two tests differ in
+    exactly one thing: whether a mark exists."""
+    acc = await create_account(conn, name="ZeroMark", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZERO", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="3", price="17", ref="pos-z1")],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("0"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def option_and_equity_account(conn):
+    """One account holding a 21-character OCC option contract (2 @ 2.50,
+    multiplier 100, marked 3.10) and an ordinary equity (5 @ 12, marked 18).
+
+    Both halves are load-bearing. The option pins the contract multiplier
+    end-to-end -- (3.10 - 2.50) * 2 * 100 == 120.00, versus 1.20 if the
+    multiplier is dropped anywhere in the chain. The equity beside it pins
+    the column layout: at the old `{:<10}` symbol width the 21-character
+    contract pushed every later field on its own row out of alignment with
+    its neighbour's."""
+    acc = await create_account(conn, name="OptEq", venue="manual", account_type="cash")
+    opt = await upsert_instrument(
+        conn,
+        Instrument(
+            id=None,
+            asset_class=AssetClass.OPTION,
+            # 21 characters, the OCC maximum: 6-char padded root, 6-digit
+            # expiry, right, 8-digit strike.
+            symbol="ZXCO  261218C00050000",
+            quote_currency="USD",
+            underlying="ZXCO",
+            strike=Decimal("50"),
+            expiry=datetime(2026, 12, 18, tzinfo=UTC).date(),
+            option_right="call",
+            contract_multiplier=Decimal("100"),
+        ),
+    )
+    eq = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="EQTY", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            _position_fill(acc, opt, side=Side.BUY, quantity="2", price="2.50", ref="pos-op1"),
+            _position_fill(acc, eq, side=Side.BUY, quantity="5", price="12", ref="pos-eq1"),
+        ],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, opt, Decimal("3.10"), datetime.now(UTC))
+    await set_mark(conn, eq, Decimal("18"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def short_position_account(conn):
+    """An open SHORT of 10 @ 20, marked at 15 -- a gain of +50 for a short,
+    and a loss of -50 if the direction is dropped on the way to
+    unrealized_pnl. Opened with a SELL and no prior long, which is how
+    group_fills detects a short (tests/test_grouping.py)."""
+    acc = await create_account(conn, name="Short", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRT", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.SELL, quantity="10", price="20", ref="pos-sh1")],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("15"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def estimated_position_account(conn):
+    """A marked position whose only fill is flagged estimated -- 4 @ 11,
+    marked 14, so the P&L is a real 12.00 computed from a guessed price."""
+    acc = await create_account(conn, name="Est", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ESTM", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            _position_fill(
+                acc, inst, side=Side.BUY, quantity="4", price="11", ref="pos-es1",
+                estimated=True,
+            )
+        ],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("14"), datetime.now(UTC))
+    return acc
+
+
 def _positions_args(*, account=None):
     """Namespace helper for cmd_positions. Kept separate from this file's
     `_args` (marks' symbol/price/as_of shape) rather than overloading it --
@@ -1553,6 +1752,10 @@ async def test_positions_shows_unrealized_where_a_mark_exists(
     out = capsys.readouterr().out
     assert "ZXCO" in out
     assert "63.00" in out  # (24.50 - 18.20) * 10 * 1
+    # This fill is NOT estimated, so the "~" marker must be absent. Paired
+    # with test_positions_an_estimated_position_is_flagged below: without a
+    # negative case, printing the marker unconditionally would be green.
+    assert "~" not in out
 
 
 async def test_positions_an_unmarked_one_shows_a_placeholder_not_a_zero(
@@ -1566,8 +1769,181 @@ async def test_positions_an_unmarked_one_shows_a_placeholder_not_a_zero(
     rc = await cli.cmd_positions(_positions_args(account=str(unmarked_account)))
     assert rc == 0, capsys.readouterr().err
     out = capsys.readouterr().out
-    assert "--" in out
+    # The whole row, field by field: the position is real (a quantity and a
+    # basis are shown) and only the two mark-dependent columns are blank.
+    # Asserting the exact fields rather than `"--" in out` keeps this from
+    # passing on a row that blanked everything, which is what the
+    # unvaluable-position branch does and is a different outcome entirely.
+    assert out.split() == ["NOMK", "3.00", "17.00", "--", "--"]
+    # Still the real point of the test, and still not vacuous: a placeholder
+    # must be visibly different from a genuine zero price, which
+    # mark_price_chk permits and which renders "0.00" (see
+    # test_positions_a_genuine_zero_mark_is_not_a_placeholder). The fixture's
+    # 3 and 17 are chosen so no other field can contain the substring --
+    # a quantity of 10 would render "10.00" and satisfy this by accident.
     assert "0.00" not in out
+
+
+async def test_positions_a_genuine_zero_mark_is_not_a_placeholder(
+    conn, monkeypatch, zero_marked_account, capsys
+):
+    """Positive twin of the test above. `mark_price_chk` permits price 0, so
+    "unmarked" and "marked at zero" are different facts about a position and
+    a reader must be able to tell them apart. Rendering both as "--" would
+    hide a total loss; rendering both as "0.00" would invent one."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(zero_marked_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "--" not in out
+    fields = out.split()
+    assert fields[0] == "ZERO"
+    assert fields[3] == "0.00"  # the mark itself, at a real zero
+    assert fields[4].startswith("@")  # ...still carrying its as_of date
+    assert fields[-1] == "-51.00"  # (0 - 17) * 3 * 1
+
+
+async def test_positions_an_unvaluable_one_shows_no_quantity_or_basis(
+    conn, monkeypatch, mixed_direction_account, capsys
+):
+    """Final-review finding (Important 1). A long 10 @ 20 and a short 4 @ 50
+    on one instrument used to render `MIXD 14 28.571428...`: 14 is the sum of
+    magnitudes -- not the net 6, not either leg, not gross exposure in any
+    direction -- and 28.57 averages a long basis with a short one. The
+    `n/a (mixed direction)` disclaimer sits four fields to the right, where it
+    reads as "we can't price this", not "the 14 is meaningless too".
+
+    The row must still be LISTED, with its reason. Blanking the two fabricated
+    columns is the opposite of hiding it."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(mixed_direction_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+
+    assert out.split()[:4] == ["MIXD", "--", "--", "--"]
+    assert "mixed direction" in out
+    assert "14" not in out  # the summed magnitudes
+    assert "28.57" not in out  # the long/short blended basis
+    assert "30" not in out  # nor the mark, which is real but unusable here
+
+
+async def test_positions_bounds_a_repeating_cost_basis_for_display(
+    conn, monkeypatch, repeating_basis_account, capsys
+):
+    """Final-review finding (Important 2). 1 @ 10 plus 2 @ 20 weights to 50/3,
+    which does not terminate, so the ctx.prec = 50 division reached `str()` as
+    a 50-digit cost basis and a 28-digit unrealized -- correct numbers, but
+    asserting a precision the inputs never had and wrapping the branch's
+    headline row off a standard terminal.
+
+    Quantized at the render site only: the stored `open_cost_basis` and what
+    `aggregate_positions` computes are untouched."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(repeating_basis_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    (line,) = out.splitlines()
+
+    fields = line.split()
+    assert fields[0] == "XACC"
+    assert fields[1] == "3.00"
+    assert fields[2] == "16.66666667"  # 50/3, bounded -- not 50 digits of it
+    assert fields[-1] == "25.00"  # (25 - 50/3) * 3, not 28 digits of it
+    assert "16.666666666" not in line
+    # The whole point of the bound: the row fits a standard terminal.
+    assert len(line) <= 100, line
+
+
+async def test_positions_applies_the_contract_multiplier_end_to_end(
+    conn, monkeypatch, option_and_equity_account, capsys
+):
+    """Final-review finding (Important 3): every fixture on this branch was an
+    equity, so `multiplier=Decimal(1)` in either db/positions.py or
+    ledger/positions.py survived all 464 tests. On this option contract that
+    mutation turns 120.00 into 1.20 -- the 100x error that matters most.
+
+    Also finding M3: the 21-character OCC symbol must not shift its own row's
+    columns out of line with the equity row beside it."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(option_and_equity_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 2
+    eq_line = next(line for line in lines if line.startswith("EQTY"))
+    opt_line = next(line for line in lines if line.startswith("ZXCO  261218C00050000"))
+
+    assert opt_line.split()[-1] == "120.00"  # (3.10 - 2.50) * 2 * 100
+    assert eq_line.split()[-1] == "30.00"  # (18 - 12) * 5 * 1
+    # M3: same column, both rows. At the old 10-wide symbol field the
+    # 21-character contract pushed its own row 11 characters right.
+    assert opt_line.index("120.00") == eq_line.index("30.00")
+
+
+async def test_positions_values_a_short_in_the_right_direction(
+    conn, monkeypatch, short_position_account, capsys
+):
+    """Final-review finding (Important 4): SHORT never reached unrealized_pnl
+    through this branch, so hardcoding Direction.LONG at the call site was
+    green. ledger/pnl.py gates the formula; nothing gated the wiring.
+
+    Short 10 @ 20 marked at 15 is a gain of +50, and exactly -50 if the
+    direction is dropped -- so the assertion is on the whole field, not a
+    substring ("50.00" is inside "-50.00")."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(short_position_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert out.split()[0] == "SHRT"
+    assert out.split()[-1] == "50.00"
+
+
+async def test_positions_an_estimated_position_is_flagged(
+    conn, monkeypatch, estimated_position_account, capsys
+):
+    """Final-review finding (Important 4): `is_estimated=True` appeared
+    nowhere below the pure layer, so both db/positions.py's read and the "~"
+    marker were ungated -- deleting the marker outright was green. It is the
+    only signal separating a P&L computed from a real fill from one computed
+    against a guessed price."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(estimated_position_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "~" in out
+    # Attached to the symbol, not floating loose somewhere in the row.
+    assert out.split()[:2] == ["ESTM", "~"]
+    assert out.split()[-1] == "12.00"  # (14 - 11) * 4 * 1
 
 
 async def test_positions_an_unvaluable_one_is_listed_with_its_reason(

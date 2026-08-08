@@ -55,8 +55,26 @@ async def open_positions(
             # future caller (e.g. Task 3's mark lookup) that fetches marks
             # for these instrument_ids will simply find no matching mark row
             # -- a safe miss, not a silent collision.
-            instrument_id=r["instrument_id"] or r["id"],
-            symbol=r["symbol"] or "(unknown instrument)",
+            #
+            # `is not None`, never truthiness, and the same test the two
+            # quantity fields below use. A UUID is always truthy so `or`
+            # happens to work here today, but the two spellings sitting side
+            # by side invite someone to "simplify" the quantity lines to
+            # `r["open_quantity"] or None` -- which would turn a genuine
+            # Decimal(0) into "unknown". One spelling, everywhere, so that
+            # edit never looks like a tidy-up.
+            instrument_id=(
+                r["instrument_id"] if r["instrument_id"] is not None else r["id"]
+            ),
+            # Keyed off the instrument's reachability, NOT off the symbol's
+            # own truthiness: `instrument.symbol` is TEXT NOT NULL with no
+            # non-empty check, and an empty-string symbol on a perfectly
+            # reachable instrument would otherwise be labelled "(unknown
+            # instrument)" while its quantity, basis and mark were still
+            # priced normally -- a row that contradicts itself.
+            symbol=(
+                r["symbol"] if r["instrument_id"] is not None else "(unknown instrument)"
+            ),
             multiplier=r["multiplier"] if r["multiplier"] is not None else Decimal(1),
             direction=Direction(r["direction"]),
             # When the instrument is unreachable, quantity/cost_basis are

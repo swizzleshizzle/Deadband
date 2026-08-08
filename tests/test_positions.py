@@ -109,6 +109,27 @@ def test_conflicting_directions_are_not_netted():
     assert p.unvaluable_reason == "mixed direction"
 
 
+def test_the_contract_multiplier_is_carried_onto_the_position():
+    """Final-review finding (Important 3): every fixture in this file
+    defaulted `multiplier="1"`, no test varied it, and no test asserted
+    `p.multiplier` -- so replacing `multiplier=first.multiplier` in
+    aggregate_positions with a hardcoded `Decimal(1)` was green across the
+    whole suite. On a 100-multiplier option contract that mutant is a 100x
+    understatement of unrealized P&L, the single largest silent error this
+    module can produce.
+
+    Two contributors, so this also pins that the multiplier is taken from the
+    group rather than invented: they share an instrument, and an instrument
+    has exactly one contract multiplier."""
+    (p,) = aggregate_positions([
+        row(multiplier="100", qty="2", basis="2.50"),
+        row(multiplier="100", qty="3", basis="3.00"),
+    ])
+    assert p.multiplier == Decimal("100")
+    assert p.quantity == Decimal("5")
+    assert p.unvaluable_reason is None
+
+
 def test_estimated_rolls_up_with_any_not_all():
     (p,) = aggregate_positions([row(estimated=False), row(estimated=True)])
     assert p.is_estimated is True

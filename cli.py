@@ -580,6 +580,57 @@ async def cmd_trades(args) -> int:
     return 0
 
 
+# Display-only scale bounds for `deadband positions`. NOTHING below this
+# comment changes what ledger/ computes or what the database stores -- the
+# pure layer keeps its full 50-digit precision and the numerics keep theirs;
+# only the string handed to print() is bounded.
+#
+# Why a bound is needed at all: `cost_basis` is a division (weighted notional
+# / quantity) evaluated at ctx.prec = 50, so an ordinary two-lot position
+# whose weighted average does not terminate (1 @ 10 + 2 @ 20) renders a
+# 50-digit basis and, downstream, a 28-digit unrealized. Those digits assert a
+# precision the inputs never had and wrap the row off a normal terminal.
+#
+# Why 8 dp and not 2: a 2-dp display quantum would print a satoshi-scale
+# crypto price or quantity as "0.00" -- a silently wrong number, which is the
+# outcome this project ranks worst. 8 dp covers every price and quantity scale
+# the importers actually produce.
+_DISPLAY_QUANT = Decimal("1E-8")
+
+# ...and a floor, so a genuine zero renders "0.00" rather than "0". The
+# unmarked-position placeholder is "--"; a real zero has to be visibly a
+# number, since mark_price_chk permits a genuine 0 price.
+_DISPLAY_MIN_DP = 2
+
+
+def _fmt_decimal(value: Decimal) -> str:
+    """Render a Decimal for a positions row: bounded scale, no exponent.
+
+    Trailing zeros beyond two decimal places are trimmed, so an exact 25
+    prints "25.00" and not "25.00000000".
+
+    Two escape hatches, both deliberately preferring a wide-but-true column
+    over a narrow-but-false one:
+
+    * a value too large to quantize (InvalidOperation) is printed in full;
+    * a non-zero value that would round to zero at 8 dp is printed in full,
+      because "0.00" for a position that is not flat is exactly the silent
+      lie the bound exists to avoid.
+    """
+    try:
+        q = value.quantize(_DISPLAY_QUANT)
+    except InvalidOperation:  # magnitude too large for the display scale
+        return str(value)
+    if q == 0:
+        # `value != 0` means rounding, not the value, produced the zero.
+        return str(value) if value != 0 else "0.00"
+    text = format(q, "f")
+    if "." in text:
+        whole, _, frac = text.rstrip("0").partition(".")
+        text = f"{whole}.{frac.ljust(_DISPLAY_MIN_DP, '0')}"
+    return text
+
+
 async def cmd_positions(args) -> int:
     pool = await create_pool()
     try:
@@ -606,25 +657,52 @@ async def cmd_positions(args) -> int:
         # position listing is this project's recurring silent-loss shape.
         if p.unvaluable_reason is not None:
             unreal, mark_col = f"n/a ({p.unvaluable_reason})", "--"
+            # The quantity and cost basis go to "--" too, not just the mark
+            # and unrealized columns. For a mixed-direction group `quantity`
+            # is the sum of MAGNITUDES (long 10 + short 4 = 14: not the net,
+            # not either leg, not gross exposure in any direction) and
+            # `cost_basis` averages a long basis with a short one. For an
+            # "open quantity unknown" group it is a partial sum over only the
+            # priced contributors. Both are fabricated figures in the two
+            # columns a reader parses first, and the "n/a (reason)"
+            # disclaimer sits four fields to their right where it reads as
+            # "we can't price this", not "the 14 is meaningless too".
+            #
+            # The row itself is still printed -- a position missing from a
+            # position listing is this project's recurring silent-loss shape.
+            # Blanking the numbers is the opposite of hiding the row: it
+            # leaves the symbol, the reason, and nothing that could be
+            # mistaken for a holding.
+            qty_col = basis_col = "--"
         elif mark is None:
             # Absent from `marks`, not a zero -- db.marks.latest_marks never
             # reports a zero for an unmarked instrument (mark_price_chk
             # permits a genuine 0.00, so a placeholder must be visibly
             # different from that, not just "0.00" again).
             unreal, mark_col = "--", "--"
+            qty_col, basis_col = _fmt_decimal(p.quantity), _fmt_decimal(p.cost_basis)
         else:
             price, as_of = mark
-            unreal = str(
+            unreal = _fmt_decimal(
                 unrealized_pnl(p.quantity, p.cost_basis, price, p.multiplier, p.direction)
             )
             # The mark's age rides along in the same column as its price: a
             # month-old mark must never render identically to one from a
             # minute ago, so the as_of date is always shown, not just the
             # price.
-            mark_col = f"{price} @{as_of:%Y-%m-%d}"
+            mark_col = f"{_fmt_decimal(price)} @{as_of:%Y-%m-%d}"
+            qty_col, basis_col = _fmt_decimal(p.quantity), _fmt_decimal(p.cost_basis)
         estimated = " ~" if p.is_estimated else "  "
+        # 21, not 10: an OCC option symbol is up to 21 characters
+        # ("SPY   260821C00500000"), and at width 10 every later column on an
+        # option row shifted right by whatever the symbol overflowed by.
+        # Deliberately widened rather than truncated -- a truncated contract
+        # symbol names a DIFFERENT contract (a different strike or expiry)
+        # just as plausibly as the real one, and a misread strike is a wrong
+        # position, whereas a wide column is only ugly. Anything longer than
+        # 21 still overflows, loudly, for the same reason.
         print(
-            f"{p.symbol:<10}{estimated}{p.quantity:>14} {p.cost_basis:>12} "
+            f"{p.symbol:<21}{estimated}{qty_col:>14} {basis_col:>14} "
             f"{mark_col:>22} {unreal}"
         )
     if not positions:
@@ -818,7 +896,18 @@ def main() -> int:
     group = p_marks_set.add_mutually_exclusive_group(required=True)
     group.add_argument("--symbol", help="instrument symbol; refused if it is ambiguous")
     group.add_argument("--natural-key", help="exact instrument natural key")
-    p_marks_set.add_argument("--price", required=True)
+    # The unit matters and is not guessable: for an option the correct input
+    # is the per-share premium (2.50), not the per-contract cost (250). The
+    # contract multiplier is applied downstream by unrealized_pnl, so entering
+    # the per-contract figure produces a silently 100x wrong unrealized P&L.
+    p_marks_set.add_argument(
+        "--price",
+        required=True,
+        help=(
+            "price per unit, excluding the contract multiplier, "
+            "in the instrument's quote currency"
+        ),
+    )
     p_marks_set.add_argument(
         "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
     )

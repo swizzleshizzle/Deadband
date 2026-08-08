@@ -135,12 +135,85 @@ async def two_accounts(conn):
     return acc_a, acc_b
 
 
+@pytest_asyncio.fixture
+async def option_account(conn):
+    """One open long of 2 option contracts, contract_multiplier 100.
+
+    Every other fixture in this file (and in tests/db/test_cli.py) uses
+    AssetClass.EQUITY, whose multiplier is 1 -- so nothing distinguished
+    "read the column" from "assume 1"."""
+    acc = await create_account(conn, name="Option", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(
+            id=None,
+            asset_class=AssetClass.OPTION,
+            symbol="ZXCO  261218C00050000",
+            quote_currency="USD",
+            underlying="ZXCO",
+            strike=Decimal("50"),
+            expiry=datetime(2026, 12, 18, tzinfo=UTC).date(),
+            option_right="call",
+            contract_multiplier=Decimal("100"),
+        ),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="2", price="2.50", ref="opt1")]
+    )
+    await regroup_account(conn, acc)
+    return acc
+
+
+@pytest_asyncio.fixture
+async def estimated_fill_account(conn):
+    """One open position whose only fill is flagged estimated.
+
+    `estimated=False` is this file's default and was never overridden, so
+    db/positions.py's `is_estimated=r["is_estimated"]` could be replaced with
+    a hardcoded False and stay green."""
+    acc = await create_account(conn, name="Estimated", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ESTM", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_fill(acc, inst, side=Side.BUY, quantity="6", price="11", ref="es1", estimated=True)],
+    )
+    await regroup_account(conn, acc)
+    return acc
+
+
 async def test_an_open_trade_appears_as_a_position(conn, seeded_account):
     """Seed via the same path production uses -- commit fills, regroup --
     so this test breaks if the persistence of open_quantity regresses."""
     ps = await open_positions(conn, seeded_account)
     assert [p.symbol for p in ps] == ["ZXCO"]
     assert ps[0].quantity == Decimal("10")
+
+
+async def test_the_instruments_contract_multiplier_reaches_the_position(conn, option_account):
+    """Final-review finding (Important 3): db/positions.py reads
+    `i.contract_multiplier`, but every fixture on this branch was an equity,
+    where that column is 1 -- so `multiplier=Decimal(1)` in place of the read
+    survived all 464 tests. On this option it is the difference between an
+    unrealized P&L of 120 and one of 1.20."""
+    ps = await open_positions(conn, option_account)
+    assert len(ps) == 1
+    assert ps[0].multiplier == Decimal("100")
+    assert ps[0].quantity == Decimal("2")
+    assert ps[0].cost_basis == Decimal("2.50")
+    assert ps[0].unvaluable_reason is None
+
+
+async def test_an_estimated_fill_marks_the_position_estimated(conn, estimated_fill_account):
+    """Final-review finding (Important 4): `is_estimated` was False in every
+    fixture below the pure layer, so the read in db/positions.py was ungated.
+    It is the only signal separating a P&L computed from a real fill from one
+    computed against a guessed price."""
+    ps = await open_positions(conn, estimated_fill_account)
+    assert len(ps) == 1
+    assert ps[0].is_estimated is True
 
 
 async def test_a_closed_trade_is_not_a_position(conn, closed_trade_account):
@@ -156,6 +229,32 @@ async def test_a_trade_whose_opening_fill_was_deleted_is_reported_not_dropped(
     ps = await open_positions(conn, orphaned_trade_account)
     assert len(ps) == 1
     assert ps[0].unvaluable_reason is not None
+
+
+async def test_an_empty_symbol_is_not_labelled_an_unknown_instrument(conn):
+    """Final-review finding (M5): the fallback used to be
+    `r["symbol"] or "(unknown instrument)"`, keyed off the symbol's own
+    truthiness. `instrument.symbol` is TEXT NOT NULL with no non-empty check,
+    so a reachable instrument with an empty symbol -- a thin importer or a
+    hand-inserted row -- got labelled "(unknown instrument)" while its
+    quantity, basis and mark were still priced normally: a row that
+    contradicts itself. Reachability is what decides the label."""
+    acc = await create_account(conn, name="EmptySym", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="2", price="9", ref="es1")]
+    )
+    await regroup_account(conn, acc)
+
+    ps = await open_positions(conn, acc)
+
+    assert len(ps) == 1
+    assert ps[0].symbol == ""
+    assert ps[0].instrument_id == inst  # reachable, so not keyed on the trade id
+    assert ps[0].unvaluable_reason is None  # and still perfectly valuable
 
 
 async def test_positions_are_scoped_to_the_account_asked_for(conn, two_accounts):
