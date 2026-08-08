@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
@@ -24,7 +24,13 @@ _MAX_PAGES = 1000
 @dataclass(frozen=True, slots=True)
 class CoinbaseCredentials:
     api_key: str
-    private_key_pem: str
+    # repr=False: the default dataclass __repr__ would print the full PEM.
+    # This value is a private key for a PUBLIC repository's runtime -- a
+    # stray `print(creds)`, an unhandled exception with locals captured by a
+    # debugger, or a crash reporter serializing frame variables would leak
+    # it verbatim otherwise. Withholding it from repr costs nothing at every
+    # legitimate call site, since nothing here ever needs to print it.
+    private_key_pem: str = field(repr=False)
 
     @classmethod
     def from_env(cls) -> CoinbaseCredentials:
@@ -84,7 +90,21 @@ async def fetch_all_fills(
                 )
 
             body = r.json()
-            collected.extend(body.get("fills") or [])
+            # A 200 with a missing or non-list `fills` is malformed, not an
+            # empty page. `body.get("fills") or []` would silently treat
+            # both the same way -- contributing zero rows and, if `cursor`
+            # is also absent, ending the loop as if the fetch had completed
+            # -- which is exactly the gap-5 shape (success reported, data
+            # missing) this task exists to prevent. A legitimately empty
+            # page is `{"fills": []}` with a valid (possibly absent)
+            # terminating cursor; that must still succeed, so the check is
+            # on shape (is it a list?) not on truthiness (is it non-empty?).
+            if not isinstance(body, dict) or not isinstance(body.get("fills"), list):
+                raise RuntimeError(
+                    "Coinbase returned a 200 response without a well-formed 'fills' "
+                    f"list: {r.text[:200]}"
+                )
+            collected.extend(body["fills"])
             cursor = body.get("cursor") or ""
             if not cursor:
                 break

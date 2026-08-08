@@ -3,6 +3,8 @@ import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from importers.coinbase_api import CoinbaseAPIImporter
 from ledger.types import AssetClass, Side
 
@@ -133,3 +135,28 @@ def test_money_fields_never_become_floats():
 
 def test_an_empty_document_is_empty_not_an_error():
     assert CoinbaseAPIImporter().parse('{"fills": [], "cursor": ""}').fills == ()
+
+
+def test_a_document_missing_the_fills_key_raises_rather_than_being_treated_as_empty():
+    """`document.get("fills") or []` would fold a document with NO `fills`
+    key at all into the same zero-rows result as a genuinely empty account
+    (see test_an_empty_document_is_empty_not_an_error, which keeps
+    `{"fills": []}` working as the real empty case). A missing key means
+    something upstream is truncated or shaped wrong -- e.g. the venue
+    client's own JSON, malformed -- and a parse that returns an empty,
+    successful-looking ImportBatch for that is exactly the 'sync reports
+    success having fetched nothing' shape spec §10 gap 5 names. It must
+    raise instead."""
+    with pytest.raises(ValueError, match="fills"):
+        CoinbaseAPIImporter().parse('{"cursor": ""}')
+
+
+def test_a_non_list_fills_value_raises_rather_than_being_treated_as_empty():
+    """Same defect, different malformed shape: `fills` present but not a
+    list (e.g. a server error body accidentally matching the field name).
+    `or []` only guards against a falsy `fills` (None, missing) -- a
+    truthy non-list value like a string or dict would sail past it into
+    `enumerate()`, which either explodes confusingly or, for a dict,
+    iterates its keys as if they were fill records."""
+    with pytest.raises(ValueError, match="fills"):
+        CoinbaseAPIImporter().parse('{"fills": "not-a-list", "cursor": ""}')

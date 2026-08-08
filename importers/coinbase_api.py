@@ -61,7 +61,20 @@ class CoinbaseAPIImporter:
         # as a float and silently lose precision on the way to NUMERIC.
         document = json.loads(text, parse_float=Decimal)
 
-        for idx, raw in enumerate(document.get("fills") or []):
+        # A document with no `fills` key at all is malformed -- not an empty
+        # batch. `document.get("fills") or []` treated both the same way,
+        # silently producing zero rows and an ImportBatch that looks like a
+        # complete, successful parse of a document that was actually
+        # truncated or shaped wrong upstream. `{"fills": []}` is the
+        # legitimate empty case and must still parse to zero fills with no
+        # error, so the check is on shape (is `fills` a list?), not on
+        # truthiness (is it non-empty?).
+        if not isinstance(document, dict) or not isinstance(document.get("fills"), list):
+            raise ValueError(
+                "Coinbase fills document is malformed: missing or non-list 'fills' key"
+            )
+
+        for idx, raw in enumerate(document["fills"]):
             # size_in_quote flips the MEANING of `size` from base units to
             # quote currency. There is no conversion available from the fill
             # alone, and guessing produces a position wrong by the price --
