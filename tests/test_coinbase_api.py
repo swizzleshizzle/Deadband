@@ -49,6 +49,53 @@ def test_size_in_quote_blocks_rather_than_recording_a_wrong_quantity():
     assert "size_in_quote" in b.blocking[0][1]
 
 
+# Two rows that fail for the SAME reason (size_in_quote) and both carry no
+# trade_id at all -- the case where trade_id alone cannot tell them apart, so
+# the fill's position in the document (`idx`) is the only thing that can.
+_TWO_UNIDENTIFIABLE_BAD_ROWS = """
+{
+  "fills": [
+    {"trade_time": "2026-05-01T00:00:00Z", "sequence_timestamp": "2026-05-01T00:00:00Z",
+     "price": "1", "size": "1", "size_in_quote": true, "commission": "0",
+     "product_id": "BTC-USD", "side": "BUY"},
+    {"trade_time": "2026-05-02T00:00:00Z", "sequence_timestamp": "2026-05-02T00:00:00Z",
+     "price": "2", "size": "2", "size_in_quote": true, "commission": "0",
+     "product_id": "ETH-USD", "side": "SELL"}
+  ],
+  "cursor": ""
+}
+"""
+
+
+def test_blocking_messages_distinguish_two_rows_that_fail_the_same_way():
+    """`reject()` accepted `idx` from every call site but never used it, so
+    two different malformed rows that both lack a trade_id -- the case where
+    trade_id cannot disambiguate them -- produced byte-identical blocking
+    messages. With more than one bad row in a batch, a human reading
+    `blocking` could not tell which row was which. `idx`, embedded in the
+    message, is what fixes that: it is the JSON analogue of the CSV
+    importers' `line N`."""
+    b = CoinbaseAPIImporter().parse(_TWO_UNIDENTIFIABLE_BAD_ROWS)
+    messages = [msg for _, msg in b.blocking]
+    assert len(messages) == 2
+    assert messages[0] != messages[1]
+    assert "fill 0" in messages[0]
+    assert "fill 1" in messages[1]
+
+
+def test_product_id_whitespace_is_stripped_like_side_is():
+    """`side` is read with `.strip()` two lines above where `product_id` is
+    parsed; product_id previously was not -- an invariant applied correctly
+    in one place and not its twin. Incidental whitespace around product_id
+    would otherwise pollute the instrument's symbol/quote_currency (e.g.
+    symbol " BTC" instead of "BTC") rather than being normalized away or
+    causing a rejection."""
+    padded = FIXTURE.replace('"product_id": "BTC-USD"', '"product_id": " BTC-USD "')
+    f = next(x for x in CoinbaseAPIImporter().parse(padded).fills if x.venue_fill_id == "t1")
+    assert f.instrument.symbol == "BTC"
+    assert f.instrument.quote_currency == "USD"
+
+
 def test_money_fields_never_become_floats():
     """Coinbase quotes its money fields today. If it ever stops for one of
     them, parse_float=Decimal is what keeps a float out of the pipeline.
