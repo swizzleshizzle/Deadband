@@ -187,8 +187,22 @@ class ImportBatch:
     blocking: tuple[tuple[str | None, str], ...] = ()
 
 
+def _locator(where: int | str) -> str:
+    """Render a row coordinate for a warning message.
+
+    An `int` is a CSV line number and renders as `line N` -- the idiom every
+    CSV importer here uses. A `str` is a locator the caller has already
+    formatted for its own row shape: importers/coinbase_api.py parses a JSON
+    array, where the coordinate is `fill 3 (trade_id='t4')`, not a line.
+    Passing the array index to the int form produced "line 0: BTC ..." from a
+    parser whose every other message said "fill 0 (trade_id=...)" -- the same
+    row named two different ways in one batch's warning list (M3).
+    """
+    return f"line {where}" if isinstance(where, int) else where
+
+
 def zero_price_warning(
-    line_no: int, symbol: str, quantity: Decimal, price: Decimal
+    where: int | str, symbol: str, quantity: Decimal, price: Decimal
 ) -> str | None:
     """A fill-shaped row (real quantity) priced at zero is almost always a
     parse failure, not a free trade.
@@ -208,11 +222,11 @@ def zero_price_warning(
     copy it.
     """
     if quantity != 0 and price == 0:
-        return f"line {line_no}: {symbol} has quantity {quantity} at zero price"
+        return f"{_locator(where)}: {symbol} has quantity {quantity} at zero price"
     return None
 
 
-def zero_amount_warning(line_no: int, kind: str, amount: Decimal) -> str | None:
+def zero_amount_warning(where: int | str, kind: str, amount: Decimal) -> str | None:
     """A cash movement recorded at zero amount is almost always a parse
     failure, not a genuine zero-dollar cash event.
 
@@ -230,14 +244,35 @@ def zero_amount_warning(line_no: int, kind: str, amount: Decimal) -> str | None:
     importers/fidelity.py and importers/coinbase.py), same rationale as
     zero_price_warning: the guard can never drift between venues, and a
     venue added later gets it by construction.
+
+    `where` follows zero_price_warning's convention exactly (see `_locator`).
+    It has no non-CSV caller today; taking the same parameter shape anyway is
+    deliberate, because "an invariant applied correctly in one place and not
+    in its twin" is the defect shape this file's docstrings keep naming.
     """
     if amount == 0:
-        return f"line {line_no}: {kind} cash movement has zero amount"
+        return f"{_locator(where)}: {kind} cash movement has zero amount"
     return None
 
 
 class Importer(Protocol):
     venue: str
+    # The account.venue this importer's rows belong to -- what a caller must
+    # route/match against when deciding which registered account a parsed
+    # batch may commit into. For every CSV importer this equals `venue`: the
+    # importer's own identity IS the venue whose accounts it feeds. It
+    # differs from `venue` only when an importer's own name is a TRANSPORT,
+    # not a venue -- the coinbase-api case: "coinbase-api" identifies the
+    # Advanced Trade API as a distinct parser from the CSV importer (they
+    # dedupe on different keys, see importers/registry.py), but there is no
+    # "coinbase-api" account anywhere -- every real account is registered
+    # under the plain "coinbase" venue, whether its fills arrived via CSV or
+    # API. A caller that compares against `venue` instead of `account_venue`
+    # here reintroduces exactly the bug this field exists to make
+    # structurally impossible to repeat: see cli.py's _preview_or_commit,
+    # which uses account_venue for every importer, and its docstring for the
+    # sync-coinbase incident that motivated adding this field.
+    account_venue: str
 
     def parse(self, text: str) -> ImportBatch:
         """Map a venue export to canonical rows. Never writes anything."""

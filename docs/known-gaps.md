@@ -186,6 +186,107 @@ before any further work quotes a plan row.
 
 ---
 
+## Found during A2 part 2b1: Coinbase API import (2026-08-08)
+
+### UNVERIFIED: the Coinbase fill dedupe key may not be unique
+
+This is the gap in this document most likely to lose money. It has its own heading
+because it previously sat buried inside the cash-export gap below, where a heading skim
+or a generated table of contents could not see it — and it is the only record that the
+"confirm `trade_id` is unique" task was never actually run.
+
+> [!warning] UNVERIFIED — the fill dedupe key may not be unique.
+> `importers/coinbase_api.py` keys every Coinbase fill on the API response's `trade_id`,
+> because the spec (A2-16) says "the API supplies a venue trade id." But the same
+> response also carries an `entry_id` field, and Coinbase's own documentation does not
+> state which of the two — if either — is guaranteed unique per fill.
+>
+> If `trade_id` can repeat across two genuinely distinct fills, `fill_venue_id_uniq`
+> (`UNIQUE (account_id, venue_fill_id)`) will not reject the second one as a duplicate —
+> from the schema's point of view it *is* the first one. One of the two real fills would
+> then disappear from the ledger silently: no error, no warning, no log line. That is a
+> money-losing failure mode, not a cosmetic one.
+>
+> This could not be checked here: **no Coinbase CDP credentials exist on this machine**,
+> so `fetch_all_fills()` has never been run against a real account, and the assumption
+> has never been tested against a real response.
+>
+> **Partially mitigated 2026-08-08 (finding C2).** The importer now refuses the whole
+> batch if two fills in one parsed document share a `trade_id`, naming both positions and
+> telling the reader to re-key on `entry_id`. So the assumption is now self-checking
+> rather than merely written down. **This is a reduction in exposure, not a closure:** the
+> check sees repeats only *within one parsed document*. A full sync (no `--start`) pulls
+> the whole history into a single merged document and therefore sees the entire set, but a
+> windowed `--start`/`--end` sync can straddle a repeat, and a repeat split across two
+> separate syncs is invisible to it. The key is deliberately NOT switched to `entry_id`
+> pre-emptively: if `entry_id` were the unstable field, that would break idempotency and
+> re-insert the entire history on the next sync — trading a possible silent loss for a
+> certain silent double-count.
+>
+> **The check, so whoever has credentials can settle it in one command:**
+>
+> ```python
+> fills = <parse the string fetch_all_fills() returns, into a list of fill dicts>
+> len(fills)                                   # total fills returned
+> len({f["trade_id"] for f in fills})          # distinct trade_id
+> len({f["entry_id"] for f in fills})          # distinct entry_id
+> ```
+>
+> If all three numbers agree, `trade_id` is safe as the dedupe key over that sample (not
+> a proof for all time, but strong evidence, and stronger the more fills the account has).
+> If the `trade_id` count is lower than the total, `trade_id` **can** repeat, the current
+> dedupe key is wrong, and `fill_venue_id_uniq` is silently losing fills right now for any
+> account with enough volume to hit a repeat.
+>
+> Do not downgrade this to a routine follow-up. It stays open until someone with
+> credentials runs the check above and records the result.
+
+### One `size_in_quote` fill disables `sync --commit` for that account, permanently
+
+`importers/coinbase_api.py` refuses a fill whose `size_in_quote` flag is set: the flag
+flips the meaning of `size` from base units to quote currency, and no conversion is
+available from the fill alone, so recording it as a quantity would produce a position
+wrong by a factor of the price. Refusing rather than guessing is the right call. The
+consequence is not obvious, though, and needs saying out loud:
+
+**Symptom.** `deadband sync coinbase --commit` exits 2 with
+`refusing to commit -- unmapped row(s) carry money and no rule matched them`, naming a
+fill with `size_in_quote`. It does this **every time**, and nothing else commits either —
+the refusal is all-or-nothing by design (a partial commit that silently drops a
+money-carrying row is the defect that policy exists to prevent). Preview is unaffected.
+
+**Why it is unbounded.** A `size_in_quote` fill is not exotic: it is what Coinbase's
+retail "buy $50 of BTC" market order produces. One such fill anywhere in an account's
+history is enough, and since the CSV importer no longer emits fills at all, there is no
+second route — **that fill cannot enter the ledger by any path this system offers**, and
+neither can any fill synced alongside it.
+
+**Workaround.** Two (or more) windowed syncs that straddle the bad fill, e.g.
+`deadband sync coinbase --end 2026-05-13 --commit` and
+`deadband sync coinbase --start 2026-05-14 --commit`. Everything outside the window
+commits normally; the `size_in_quote` fill itself stays out of the ledger, and its money
+is simply missing from the account until this is fixed properly.
+
+**Real fix, unbuilt.** Convert with the fill's own `price`: base quantity ≈
+`size / price`, minus whatever fee convention Coinbase applies. That needs verification
+against a real `size_in_quote` response before it can be trusted, and no credentials
+exist here — same blocker as the dedupe-key gap above.
+
+### Coinbase non-trade cash still requires a manual CSV export
+
+The Advanced Trade API surface has no endpoint for deposits, withdrawals, transfers,
+rewards income, staking income, or interest — only fills. Verified against Coinbase's
+REST endpoint index on 2026-08-08. A2-16's claim that the API "replaces the CSV importer"
+holds only for fills (see the update above); every non-trade cash movement still has to
+arrive via a CSV export, through the Coinbase CSV importer's cash path (it emits no fills
+any more, but still emits cash rows).
+
+A Coinbase App API v2 `transactions` source would close this — but that is a separate,
+unbuilt integration with a different base URL, different auth, and a different data
+shape, not an extension of the Advanced Trade client this phase built.
+
+---
+
 ## Carried into A-2 part 2 and beyond
 
 Recorded here rather than only in an execution ledger, because ledgers are scratch and
@@ -271,6 +372,51 @@ this file is the project's memory.
   > claim about a data source, not about the problem -- and for Coinbase specifically it
   > is a claim that will stop being true the day A2-16 actually ships, not one that is
   > false today.
+  >
+  > **Update 2026-08-08 — A2-16 shipped, for fills only.** The Coinbase API importer
+  > (`importers/coinbase_api.py`, driven by `deadband sync coinbase`) now exists. Every
+  > Coinbase fill imported from here forward is keyed on the venue's own `trade_id`
+  > (`venue_fill_id`), not `content_hash`, so the collision described above is no longer
+  > reachable for new Coinbase fills.
+  >
+  > This also **closes spec §10 gap 6** — but it closed differently than the
+  > spec anticipated. The spec worried about a wholesale cut-over: retiring the CSV
+  > importer while historical CSV-imported fills already existed, needing either an
+  > explicit reconciliation step or a decision about which key wins. What actually shipped
+  > splits the cut-over **by row kind, not wholesale**. Fills now come only from the API,
+  > keyed on `venue_fill_id`. Cash movements still come only from the CSV importer, keyed
+  > on `content_hash` — the CSV importer no longer emits fills at all, it reports each
+  > trade row and points at `sync coinbase` instead. A2-16's claim that the API "replaces
+  > the CSV importer" is therefore true for fills and **false for cash** — see the new gap
+  > below.
+  >
+  > **Correction 2026-08-08 (review finding I3).** This entry previously said "No fill is
+  > reachable by two paths, so the hazard the spec was worried about is gone with no
+  > reconciliation code written, because there is nothing to reconcile." That is true only
+  > of a database with **no pre-cut-over Coinbase fills in it** — which was verified for
+  > this owner's database (0 fills) at the time and is stated unconditionally nowhere else.
+  > For anyone else's database it was false and dangerous:
+  >
+  > The two partial unique indexes are disjoint by construction — `fill_venue_id_uniq` is
+  > `WHERE venue_fill_id IS NOT NULL`, `fill_content_hash_uniq` is
+  > `WHERE content_hash IS NOT NULL` — and `db/importing.py` gives each fill exactly one of
+  > the two keys. A CSV-imported Coinbase fill has `venue_fill_id NULL, content_hash SET`;
+  > the *same trade* re-arriving via `sync` has `venue_fill_id SET, content_hash NULL`.
+  > Neither index sees the other. Both rows land, both feed `regroup_account`, and the
+  > account's position and realized P&L **double**, silently.
+  >
+  > `cli.py`'s commit path now refuses this: before opening the write transaction, a batch
+  > whose fills carry a `venue_fill_id` is rejected if the target account already holds
+  > fills with `content_hash IS NOT NULL AND venue_fill_id IS NULL`, with a message naming
+  > the remedy. It is venue-neutral — any future CSV-to-API cut-over inherits it — and it
+  > costs one `SELECT count(*)` per target account on the commit path only. It is a
+  > **refusal, not a reconciliation**: closing the gap properly still needs a real
+  > migration that matches old rows to new ones and keeps one of each.
+  >
+  > **Spec §10 gap 5 (Coinbase API credentials) is now LIVE**, not a future concern:
+  > `COINBASE_API_KEY` and `COINBASE_API_SECRET` are a real operational dependency the
+  > moment `sync coinbase` is run against a live account, not a thing to plan for later.
+  > See the README's "Coinbase fills" section for the operational contract.
 - **The purity checker is evadable** via `getattr(datetime, 'now')()` or `builtins.open`.
   It guards accidental I/O by implementers, not a motivated adversary.
 - **`localcontext()` inherits `Emax` / `traps` / `rounding`** from the caller; only `prec`

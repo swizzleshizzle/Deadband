@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import pathlib
 import sys
+from datetime import UTC, datetime
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
@@ -15,6 +16,7 @@ from db.pool import create_pool
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
+from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
 async def cmd_migrate(_args) -> int:
@@ -108,7 +110,39 @@ async def cmd_accounts_add(args) -> int:
 async def cmd_import(args) -> int:
     importer = get_importer(args.venue)
     batch = importer.parse(pathlib.Path(args.file).read_text())
+    return await _preview_or_commit(importer.account_venue, batch, args, source="csv")
 
+
+async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: str) -> int:
+    """The three-phase body every entry point (`import`, `sync`) shares.
+
+    `source` is the provenance recorded on every fill this call writes
+    (`fill.source`): "csv" from `cmd_import`, "api" from `cmd_sync`. It is
+    keyword-only and has NO default on purpose. commit_batch's own
+    `source: str = "csv"` default is what made every API-synced fill claim it
+    came from a CSV (I2) -- silently, since nothing downstream reads the
+    column yet. `fill.source` is the only column that can answer "which of my
+    Coinbase fills came from the retired CSV path?", which is exactly the
+    question the mixed-provenance refusal below and any future reconciliation
+    have to ask. A default here would let the next entry point reintroduce the
+    same lie by omission; requiring the argument makes the caller state it.
+
+    `venue` is always an importer's `.account_venue` (see the Importer
+    Protocol in importers/base.py), never its `.venue` identity -- those
+    two differ for `coinbase-api`, whose own identity is a TRANSPORT
+    ("coinbase-api" vs. the CSV importer) rather than the venue accounts are
+    registered under (every real account is "coinbase"). This function only
+    ever needs "which registered account venue does this batch route/match
+    against", so taking `account_venue` directly (rather than `venue` plus a
+    caller-side literal) makes it structurally impossible for a caller to
+    pass the wrong one -- which is exactly the shape of the bug that
+    motivated adding `account_venue` at all: `cmd_sync` used to pass the
+    literal "coinbase" here itself, alongside `get_importer("coinbase-api")`
+    a few lines away, with nothing forcing the two to agree as venues were
+    added. Keeping this one function (rather than a second copy of the
+    preview/commit body for `sync`) is what the plan's "no second, parallel
+    write path" constraint requires.
+    """
     print(f"parsed {len(batch.fills)} fills, {len(batch.cash)} cash movements")
     for w in batch.warnings:
         print(f"  warning: {w}", file=sys.stderr)
@@ -182,7 +216,7 @@ async def cmd_import(args) -> int:
                     # mechanism --commit uses, reused rather than reinvented so
                     # the probe never disagrees with --commit about where a row
                     # lands.
-                    plan = await route_batch(conn, importer.venue, batch)
+                    plan = await route_batch(conn, venue, batch)
                     targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
                     if (unrouted.fills or unrouted.cash) and args.account:
@@ -250,7 +284,7 @@ async def cmd_import(args) -> int:
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            plan = await route_batch(conn, importer.venue, batch)
+            plan = await route_batch(conn, venue, batch)
 
             # Same "refuse the whole batch, write nothing" shape as the
             # unknown-ref refusal below. See ImportBatch.blocking's
@@ -295,10 +329,10 @@ async def cmd_import(args) -> int:
                 # account belonging to a different venue — that would permanently
                 # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
                 # path to undo it.
-                if account["venue"] != importer.venue:
+                if account["venue"] != venue:
                     print(
                         f"error: account {account_id} is a {account['venue']!r} account; "
-                        f"refusing to commit a {importer.venue!r} import to it",
+                        f"refusing to commit a {venue!r} import to it",
                         file=sys.stderr,
                     )
                     return 2
@@ -356,10 +390,70 @@ async def cmd_import(args) -> int:
                 )
                 return 2
 
+            # I3: refuse a batch that would make an account's fills reachable
+            # by two mutually-blind dedupe paths.
+            #
+            # The two partial unique indexes are disjoint BY CONSTRUCTION:
+            # fill_venue_id_uniq is WHERE venue_fill_id IS NOT NULL,
+            # fill_content_hash_uniq is WHERE content_hash IS NOT NULL, and
+            # db/importing.py gives a fill exactly one of the two keys, never
+            # both. A pre-cut-over CSV Coinbase fill therefore has
+            # (venue_fill_id NULL, content_hash SET); the SAME trade arriving
+            # via `sync` has (venue_fill_id SET, content_hash NULL). Neither
+            # index can see the other. Both rows land, both feed
+            # regroup_account, and the account's position and realized P&L
+            # silently DOUBLE. Nothing else in the system would notice.
+            #
+            # Deliberately generic, not Coinbase-specific: any venue that ever
+            # cuts a CSV path over to an API one has this exact hazard, and
+            # the check costs one SELECT count(*) per target account, on the
+            # commit path only. It runs here -- after route_batch, before
+            # `async with conn.transaction():` -- so it refuses and writes
+            # nothing, and it is unreachable from preview, which opens no
+            # connection at all (a tested invariant).
+            mixed = []
+            for account_id, sub_batch in targets.items():
+                if not any(f.venue_fill_id for f in sub_batch.fills):
+                    continue
+                legacy = await conn.fetchval(
+                    """
+                    SELECT count(*) FROM fill
+                     WHERE account_id = $1
+                       AND content_hash IS NOT NULL
+                       AND venue_fill_id IS NULL
+                    """,
+                    account_id,
+                )
+                if legacy:
+                    mixed.append((account_id, legacy))
+            if mixed:
+                print(
+                    "error: refusing to commit -- this batch's fills carry a venue "
+                    "fill id, but the target account already holds fill(s) that "
+                    "dedupe on content_hash instead:",
+                    file=sys.stderr,
+                )
+                for account_id, legacy in mixed:
+                    print(
+                        f"  {account_id}: {legacy} existing fill(s) with "
+                        "content_hash set and venue_fill_id null",
+                        file=sys.stderr,
+                    )
+                print(
+                    "  The two dedupe indexes are disjoint, so the same trade "
+                    "arriving by both paths would be inserted twice and double "
+                    "the account's position and realized P&L. Remedy: delete the "
+                    "older content_hash-keyed fills for this account (they are "
+                    "the ones with source='csv' and venue_fill_id null) and "
+                    "re-sync, or commit into a fresh account.",
+                    file=sys.stderr,
+                )
+                return 2
+
             fills_inserted = fills_skipped = cash_inserted = trades_regrouped = 0
             async with conn.transaction():
                 for account_id, sub_batch in targets.items():
-                    result = await commit_batch(conn, account_id, sub_batch)
+                    result = await commit_batch(conn, account_id, sub_batch, source=source)
                     fills_inserted += result.fills_inserted
                     fills_skipped += result.fills_skipped
                     cash_inserted += result.cash_inserted
@@ -378,6 +472,67 @@ async def cmd_import(args) -> int:
         f"{cash_inserted} cash movements, {trades_regrouped} trades regrouped"
     )
     return 0
+
+
+def _parse_sync_bound(raw: str | None) -> datetime | None:
+    """--start/--end are ISO-8601 strings on the CLI; fetch_all_fills wants a
+    datetime and calls .astimezone(UTC) on whichever it's given. A bound
+    with no offset is anchored to UTC here rather than left for
+    astimezone() to silently treat as the local zone -- the venue API's own
+    sequence_timestamp is UTC, so reinterpreting a bare bound as local time
+    would shift the requested window with no error at all."""
+    if raw is None:
+        return None
+    dt = datetime.fromisoformat(raw)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+async def cmd_sync(args) -> int:
+    """Fetch fills from a venue API and run them through the exact same
+    preview/commit body `cmd_import` uses (`_preview_or_commit`) -- `sync`
+    differs from `import` only in where the text comes from (an API call
+    instead of a file on disk). Never grows its own write path.
+
+    No `if args.venue != "coinbase"` guard here: argparse's own
+    `choices=["coinbase"]` on the `venue` positional (main(), below) is the
+    only thing that ever needs to reject an unknown sync venue, and it does
+    so before cmd_sync is even called -- a second, hand-written check here
+    could only ever agree with argparse's `choices` or silently drift out of
+    sync with it, never usefully disagree. When a second venue is added,
+    branch here on `args.venue` to pick its client/importer; until then
+    there is nothing else for this function to check.
+    """
+    try:
+        creds = CoinbaseCredentials.from_env()
+    except RuntimeError as exc:
+        # Fail loud: absent or rejected credentials must surface as an
+        # error and a non-zero exit, never as a request that silently runs
+        # unauthenticated and reports "0 fills found" (spec §10 gap 5).
+        # Raised as SystemExit (rather than returned) so a caller driving
+        # cmd_sync directly -- not through main()'s asyncio.run wrapper --
+        # still gets a hard stop instead of a return code it could ignore.
+        print(f"error: {exc}", file=sys.stderr)
+        # `from exc` (M2, ruff B904): without it the credentials RuntimeError
+        # is reported as "During handling of the above exception, another
+        # exception occurred", which reads like a bug in the handler rather
+        # than the cause it actually is.
+        raise SystemExit(2) from exc
+
+    text = await fetch_all_fills(
+        creds,
+        start=_parse_sync_bound(args.start),
+        end=_parse_sync_bound(args.end),
+    )
+    importer = get_importer("coinbase-api")
+    batch = importer.parse(text)
+    # importer.account_venue ("coinbase"), not importer.venue
+    # ("coinbase-api"): see importers/base.py's Importer.account_venue
+    # docstring and _preview_or_commit's docstring above.
+    #
+    # source="api" (I2): these fills came off the REST endpoint, not a CSV.
+    # commit_batch's `source` defaulted to "csv" and nothing overrode it, so
+    # every fill `sync` had ever written claimed CSV provenance.
+    return await _preview_or_commit(importer.account_venue, batch, args, source="api")
 
 
 async def cmd_regroup(args) -> int:
@@ -474,6 +629,16 @@ def main() -> int:
         ),
     )
     p_import.set_defaults(fn=cmd_import)
+
+    p_sync = sub.add_parser("sync", help="fetch from a venue API and import")
+    p_sync.add_argument("venue", choices=["coinbase"])
+    p_sync.add_argument(
+        "--account", required=True, help="account UUID: the API carries no per-row account ref"
+    )
+    p_sync.add_argument("--start", help="ISO-8601 lower bound on sequence_timestamp")
+    p_sync.add_argument("--end", help="ISO-8601 upper bound on sequence_timestamp")
+    p_sync.add_argument("--commit", action="store_true", help="write to the database")
+    p_sync.set_defaults(fn=cmd_sync)
 
     p_regroup = sub.add_parser("regroup")
     p_regroup.add_argument("--account", required=True)

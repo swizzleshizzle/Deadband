@@ -186,7 +186,13 @@ async def test_preview_import_never_opens_a_database_connection(monkeypatch, cap
     assert rc == 0
 
     out = capsys.readouterr().out
-    assert "parsed 3 fills, 2 cash movements" in out
+    # §10 gap 6, closed 2026-08-08: Coinbase fills come only from the API
+    # now. The shipped fixture used here has two Buy/Sell rows plus a
+    # Deposit and a Rewards Income row -- 0 fills, 2 cash movements -- where
+    # it used to parse to 3 fills. This assertion used to be the CSV path's
+    # only proof that its Buy/Sell rows became fills at all; it's the CLI
+    # twin of tests/test_coinbase.py's test_buys_and_sells_are_reported_not_mapped_to_fills.
+    assert "parsed 0 fills, 2 cash movements" in out
     assert "preview only" in out
 
 

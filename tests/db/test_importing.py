@@ -86,21 +86,34 @@ async def test_overlapping_batch_inserts_only_the_new_rows(conn):
 
 
 async def test_reimporting_the_same_export_file_is_idempotent(conn):
-    """End-to-end through a real importer: coinbase fills carry no venue_fill_id,
-    so this only dedupes if commit_batch synthesizes a content_hash for each one.
-    Fails if that synthesis regresses — a second import would insert 3 more fills
-    instead of 0."""
+    """§10 gap 6, closed 2026-08-08: this used to be an end-to-end proof,
+    through the real importer, that re-importing a Coinbase export didn't
+    double-count FILLS -- Coinbase fills carry no venue_fill_id, so that
+    only worked if commit_batch synthesized a content_hash for each one.
+    Coinbase fills come only from the API now; this CSV path parses to
+    zero of them, so there is nothing left for that synthesis to dedupe.
+
+    What survives is the guarantee the test name actually promises:
+    re-importing the same file must not double-count CASH either. Cash
+    dedupes on its own content_hash (see commit_batch's `ON CONFLICT DO
+    NOTHING` on cash_movement) -- a mechanism this test never exercised
+    before because the Coinbase fixture's fills always dominated the
+    assertions. Fails if that cash dedup regresses: a second import would
+    insert 2 more cash rows instead of 0."""
     acc = await create_account(conn, name="T", venue="coinbase", account_type="cash")
     text = pathlib.Path("tests/fixtures/coinbase/transactions.csv").read_text()
     batch = CoinbaseImporter().parse(text)
+    assert batch.fills == ()  # gap 6: nothing left here to dedupe by content_hash
 
     first = await commit_batch(conn, acc, batch, source="csv")
     second = await commit_batch(conn, acc, batch, source="csv")
 
-    assert first.fills_inserted == 3
+    assert first.fills_inserted == 0
+    assert first.cash_inserted == 2
     assert second.fills_inserted == 0
-    assert second.fills_skipped == 3
-    assert await _fill_count(conn, acc) == 3
+    assert second.fills_skipped == 0
+    assert second.cash_inserted == 0
+    assert await _fill_count(conn, acc) == 0
     assert await _cash_count(conn, acc) == 2
 
 
@@ -386,14 +399,20 @@ async def test_occurrence_key_normalizes_symbol_case_like_content_hash(conn):
 # --- whole import — the two good rows around it must still commit. ----------
 
 
-async def test_coinbase_import_with_a_blank_quantity_row_commits_the_good_rows(conn):
-    """Before the fix, Coinbase had no zero-quantity guard: the blank-quantity
-    row became a CanonicalFill with quantity 0, which parsed and previewed
-    fine, then raised ValueError out of Fill.__post_init__ inside commit_batch
-    — and since commit_batch has no per-row try/except, that exception
-    propagated and took the two good rows down with it (0 fills committed,
-    not 2). Fails if the importer's parse() stops filtering the bad row: this
-    test would then raise ValueError instead of asserting."""
+async def test_coinbase_import_with_a_blank_quantity_row_commits_without_crashing(conn):
+    """Before the zero-quantity guard existed, this blank-quantity row became
+    a CanonicalFill with quantity 0, which parsed and previewed fine, then
+    raised ValueError out of Fill.__post_init__ inside commit_batch — and
+    since commit_batch has no per-row try/except, that exception propagated
+    and took the two good rows down with it (0 fills committed, not 2).
+
+    §10 gap 6, closed 2026-08-08: that whole failure mode is gone now, not
+    patched further — no Buy/Sell row, blank quantity or garbled or clean,
+    ever becomes a CanonicalFill anymore, so there is nothing left for
+    commit_batch to crash on. Fails if the importer's parse() ever starts
+    building a fill for a trade row again: this test would then either see
+    a non-empty batch.fills or raise ValueError out of commit_batch instead
+    of asserting."""
     header = (
         "Timestamp,Transaction Type,Asset,Quantity Transacted,Spot Price Currency,"
         "Spot Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),"
@@ -408,14 +427,14 @@ async def test_coinbase_import_with_a_blank_quantity_row_commits_the_good_rows(c
         ]
     )
     batch = CoinbaseImporter().parse(rows + "\n")
-    assert len(batch.fills) == 2
-    assert len(batch.unmapped_rows) == 1
+    assert batch.fills == ()
+    assert batch.unmapped_rows == ()
 
     acc = await create_account(conn, name="T", venue="coinbase", account_type="cash")
     result = await commit_batch(conn, acc, batch, source="csv")
 
-    assert result.fills_inserted == 2
-    assert await _fill_count(conn, acc) == 2
+    assert result.fills_inserted == 0
+    assert await _fill_count(conn, acc) == 0
 
 
 # --- Blocker pass, item 3: Coinbase guarded quantity == 0 but not a negative
@@ -426,11 +445,17 @@ async def test_coinbase_import_with_a_blank_quantity_row_commits_the_good_rows(c
 # --- item 1's blank-quantity row. ---------------------------------------------
 
 
-async def test_coinbase_import_with_a_negative_quantity_row_commits_the_good_rows(conn):
-    """Fails if the importer's parse() stops filtering the negative-quantity
-    row (i.e. the guard regresses from `quantity <= 0` back to
-    `quantity == 0`): this test would then raise ValueError out of
-    Fill.__post_init__ instead of asserting."""
+async def test_coinbase_import_with_a_negative_quantity_row_commits_without_crashing(conn):
+    """Before the negative-quantity guard existed (`quantity <= 0`, not
+    `quantity == 0` — Coinbase, unlike Fidelity, never abs()'s the parsed
+    quantity), this row survived parse() and preview, then raised
+    ValueError out of Fill.__post_init__ inside commit_batch, taking the
+    two good rows down with it.
+
+    §10 gap 6, closed 2026-08-08: same reasoning as the blank-quantity
+    twin above — no Buy/Sell row builds a CanonicalFill anymore, negative
+    quantity or not, so there is nothing left to crash. Fails if the
+    importer's parse() ever starts building a fill for a trade row again."""
     header = (
         "Timestamp,Transaction Type,Asset,Quantity Transacted,Spot Price Currency,"
         "Spot Price at Transaction,Subtotal,Total (inclusive of fees and/or spread),"
@@ -445,14 +470,14 @@ async def test_coinbase_import_with_a_negative_quantity_row_commits_the_good_row
         ]
     )
     batch = CoinbaseImporter().parse(rows + "\n")
-    assert len(batch.fills) == 2
-    assert len(batch.unmapped_rows) == 1
+    assert batch.fills == ()
+    assert batch.unmapped_rows == ()
 
     acc = await create_account(conn, name="T", venue="coinbase", account_type="cash")
     result = await commit_batch(conn, acc, batch, source="csv")
 
-    assert result.fills_inserted == 2
-    assert await _fill_count(conn, acc) == 2
+    assert result.fills_inserted == 0
+    assert await _fill_count(conn, acc) == 0
 
 
 # --- Task 1: funding_source round-trips through the database ---------------

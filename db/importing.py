@@ -275,9 +275,16 @@ async def commit_batch(
     conn: asyncpg.Connection,
     account_id: UUID,
     batch: ImportBatch,
-    source: str = "csv",
+    source: str,
 ) -> CommitResult:
-    """Residual limitation, written down rather than left to be discovered: the
+    """`source` has NO default (I2). It used to default to "csv", and cli.py's
+    shared commit path never overrode it -- so every fill written by `deadband
+    sync coinbase` was recorded as CSV-provenance, which is the one thing
+    `fill.source` exists to be able to distinguish. Every caller now states it;
+    a wrong value has to be typed, rather than inherited from a default that
+    was only ever right for the first caller written.
+
+    Residual limitation, written down rather than left to be discovered: the
     occurrence index (see below) only disambiguates repeats that appear
     together in the SAME call to commit_batch. Two genuinely distinct same-day
     identical trades split across two separate exports that are never both

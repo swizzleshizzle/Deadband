@@ -1,0 +1,37 @@
+{
+  "fills": [
+    {
+      "entry_id": "e1", "trade_id": "t1", "order_id": "o1",
+      "trade_time": "2026-05-11T14:03:21.512Z",
+      "sequence_timestamp": "2026-05-11T14:03:21.998Z",
+      "trade_type": "FILL", "price": "61250.44", "size": "0.0125",
+      "size_in_quote": false, "commission": "3.83",
+      "product_id": "BTC-USD", "side": "BUY", "liquidity_indicator": "TAKER"
+    },
+    {
+      "entry_id": "e2", "trade_id": "t2", "order_id": "o2",
+      "trade_time": "2026-05-12T09:15:02.100Z",
+      "sequence_timestamp": "2026-05-12T09:15:02.640Z",
+      "trade_type": "FILL", "price": "2410.10", "size": "1.4",
+      "size_in_quote": false, "commission": "0.00",
+      "product_id": "ETH-USD", "side": "SELL", "liquidity_indicator": "MAKER"
+    },
+    {
+      "entry_id": "e3", "trade_id": "t3", "order_id": "o3",
+      "trade_time": "2026-05-13T18:40:00.000Z",
+      "sequence_timestamp": "2026-05-13T18:40:00.220Z",
+      "trade_type": "FILL", "price": "0.9998", "size": "500",
+      "size_in_quote": true, "commission": "0.50",
+      "product_id": "USDC-USD", "side": "BUY", "liquidity_indicator": "TAKER"
+    },
+    {
+      "entry_id": "e4", "trade_id": "t4", "order_id": "o4",
+      "trade_time": "2026-05-14T10:00:00.000Z",
+      "sequence_timestamp": "2026-05-14T10:00:00.500Z",
+      "trade_type": "FILL", "price": "0.00001234", "size": "1234567890.12345678",
+      "size_in_quote": false, "commission": "1.00",
+      "product_id": "SHIB-USD", "side": "BUY", "liquidity_indicator": "TAKER"
+    }
+  ],
+  "cursor": ""
+}

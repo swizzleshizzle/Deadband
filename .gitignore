@@ -33,4 +33,11 @@ htmlcov/
 *.sql.gz
 *.dump
 
+# Agent/effort working notes: plans, execution ledgers, review and fix reports.
+# `.superpowers/sdd/` ignores itself, but nothing covered the parent, so a
+# `git add -A` would have committed the loose reports at `.superpowers/*.md`
+# into a PUBLIC repo. Scratch by nature; the durable record belongs in
+# docs/known-gaps.md and in commit messages.
+/.superpowers/
+
 .DS_Store

@@ -1,0 +1,227 @@
+# importers/coinbase_api.py
+"""Coinbase Advanced Trade fills JSON → canonical rows. Pure — no I/O, no clock."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+
+from importers.base import CanonicalFill, ImportBatch, zero_price_warning
+from ledger.types import AssetClass, Instrument, Side
+
+_SIDES = {"BUY": Side.BUY, "SELL": Side.SELL}
+
+
+def _decimal(raw: object) -> Decimal:
+    if isinstance(raw, Decimal):
+        return raw
+    return Decimal(str(raw).strip() or "0")
+
+
+def _when(raw: str) -> datetime:
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+
+
+class CoinbaseAPIImporter:
+    venue = "coinbase-api"
+    # "coinbase-api" is a TRANSPORT identity (this parser vs. the CSV one),
+    # not an account venue -- no account is ever registered under it. Every
+    # real Coinbase account is registered under the plain "coinbase" venue
+    # regardless of whether its fills arrived via CSV or this API, so
+    # account_venue is deliberately co-located here, right next to `venue`,
+    # so the mapping between the two is visible in one place rather than
+    # left for a caller to get right on its own (see importers/base.py's
+    # Importer.account_venue docstring for the incident this fixes).
+    account_venue = "coinbase"
+
+    def parse(self, text: str) -> ImportBatch:
+        fills: list[CanonicalFill] = []
+        warnings: list[str] = []
+        unmapped: list[str] = []
+        blocking: list[tuple[str | None, str]] = []
+        # trade_id -> the idx of the fill that first claimed it. See the
+        # duplicate check below for why this exists and what it cannot see.
+        seen_trade_ids: dict[str, int] = {}
+
+        def locate(raw: dict, idx: int) -> str:
+            """The one locator prefix every message from this parser uses.
+
+            M3: `zero_price_warning` formats its own `f"line {line_no}: ..."`
+            prefix, which is the CSV importers' idiom. Handing it the JSON
+            array index produced "line 0: BTC ..." from a parser whose every
+            other message says "fill 0 (trade_id=...)" -- two different names
+            for the same coordinate, in the same batch's warning list. The
+            shared guard now takes a locator instead of a line number (see
+            importers/base.py) so both idioms come from one place.
+            """
+            return f"fill {idx} (trade_id={raw.get('trade_id')!r})"
+
+        def reject(raw: dict, idx: int, reason: str) -> None:
+            """ONE path for every dropped fill, same discipline as
+            importers/fidelity.py's reject(). An API row always carries
+            money -- it is a trade execution -- so unlike the CSV importers
+            there is no 'no financial content' branch that only warns.
+
+            Every message embeds BOTH `idx` (the fill's position in the
+            document's `fills` array -- the direct JSON analogue of the CSV
+            importers' `line N`) and `trade_id` (the venue's identifier for
+            the row, when present). idx locates the row in the document;
+            trade_id identifies it at the venue -- a garbled or missing
+            trade_id is exactly the case idx exists to disambiguate. Before
+            this, `idx` was accepted by every call site and never used, so
+            two different malformed rows lacking a trade_id produced
+            byte-identical blocking messages and were indistinguishable in
+            a batch with more than one bad row.
+            """
+            message = f"{locate(raw, idx)}: {reason}"
+            warnings.append(message)
+            unmapped.append(str(raw))
+            blocking.append((None, message))
+
+        if not text.strip():
+            return ImportBatch()
+
+        # parse_float=Decimal: an unquoted JSON number would otherwise arrive
+        # as a float and silently lose precision on the way to NUMERIC.
+        document = json.loads(text, parse_float=Decimal)
+
+        # A document with no `fills` key at all is malformed -- not an empty
+        # batch. `document.get("fills") or []` treated both the same way,
+        # silently producing zero rows and an ImportBatch that looks like a
+        # complete, successful parse of a document that was actually
+        # truncated or shaped wrong upstream. `{"fills": []}` is the
+        # legitimate empty case and must still parse to zero fills with no
+        # error, so the check is on shape (is `fills` a list?), not on
+        # truthiness (is it non-empty?).
+        if not isinstance(document, dict) or not isinstance(document.get("fills"), list):
+            raise ValueError(
+                "Coinbase fills document is malformed: missing or non-list 'fills' key"
+            )
+
+        for idx, raw in enumerate(document["fills"]):
+            # size_in_quote flips the MEANING of `size` from base units to
+            # quote currency. There is no conversion available from the fill
+            # alone, and guessing produces a position wrong by the price --
+            # so refuse, loudly, rather than record something plausible.
+            if raw.get("size_in_quote"):
+                reject(
+                    raw,
+                    idx,
+                    "size_in_quote is set, so `size` is denominated in the quote "
+                    "currency, not the base asset -- refusing to record it as a "
+                    "quantity",
+                )
+                continue
+
+            side = _SIDES.get(str(raw.get("side", "")).strip().upper())
+            if side is None:
+                reject(raw, idx, f"unknown side {raw.get('side')!r}")
+                continue
+
+            # .strip(): product_id is otherwise the one field read without
+            # normalizing incidental whitespace, while `side` two lines above
+            # is -- an invariant applied correctly in one place and not its
+            # twin, the exact defect shape docs/known-gaps.md names. Leaving
+            # it unstripped would let " BTC-USD" or "BTC-USD " (or a
+            # trailing/leading space that survives the split) through to
+            # base/quote unnoticed, polluting the instrument's symbol or
+            # quote_currency rather than rejecting the row.
+            product = str(raw.get("product_id") or "").strip()
+            base, _, quote = product.partition("-")
+            if not base or not quote:
+                reject(raw, idx, f"unparseable product_id {product!r}")
+                continue
+
+            try:
+                quantity = _decimal(raw.get("size"))
+                price = _decimal(raw.get("price"))
+                fee = _decimal(raw.get("commission"))
+                when = _when(str(raw.get("trade_time")))
+            except (InvalidOperation, ValueError) as exc:
+                reject(raw, idx, f"unparseable ({exc})")
+                continue
+
+            if not all(v.is_finite() for v in (quantity, price, fee)):
+                reject(raw, idx, "non-finite number")
+                continue
+            if quantity <= 0:
+                reject(raw, idx, "non-positive quantity")
+                continue
+
+            # venue_fill_id IS the dedupe key: db/importing.py routes any fill
+            # that has one onto `fill_venue_id_uniq` (UNIQUE (account_id,
+            # venue_fill_id)) and skips content_hash synthesis entirely, and
+            # db/fills.py's INSERT is ON CONFLICT DO NOTHING. So a bad key is
+            # not a cosmetic problem -- it is a silent, permanent loss of a
+            # real fill, reported to the user as "(N already present)".
+            #
+            # C1: `str(raw.get("trade_id"))` turned a missing trade_id into the
+            # literal string "None", which is truthy. The first such fill in an
+            # account created a row keyed "None"; every later no-trade_id fill,
+            # in this batch or any future batch, then collided with it and was
+            # dropped as a duplicate. Refuse instead.
+            trade_id = str(raw.get("trade_id") or "").strip()
+            if not trade_id:
+                reject(raw, idx, "no trade_id -- the dedupe key would not identify this fill")
+                continue
+
+            # C2: UNVERIFIED ASSUMPTION, MADE SELF-CHECKING (see
+            # docs/known-gaps.md). Coinbase's documentation does not state that
+            # trade_id is unique per fill; entry_id may be the unique one. If
+            # this fires, the dedupe key is wrong and fill_venue_id_uniq would
+            # have silently discarded a real fill. Refuse the batch loudly and
+            # re-key on entry_id.
+            #
+            # We do NOT pre-emptively switch to entry_id or a composite key:
+            # if entry_id turned out to be the unstable field, that would break
+            # idempotency and re-insert the whole history on the next sync --
+            # trading a possible silent loss for a certain silent double-count.
+            # Assert the invariant; let the first real response settle it.
+            #
+            # HONEST LIMIT: this sees repeats only WITHIN one parsed document.
+            # A full sync (no --start) pulls the entire history into one merged
+            # document, so in practice it sees the whole set -- but a windowed
+            # --start/--end sync can straddle a repeat and miss it, and two
+            # repeats landing in two different syncs are invisible here. A
+            # large reduction in exposure, not elimination.
+            if trade_id in seen_trade_ids:
+                reject(
+                    raw,
+                    idx,
+                    f"duplicate trade_id {trade_id!r} (first seen at fill "
+                    f"{seen_trade_ids[trade_id]}) -- trade_id is the dedupe key and "
+                    "must be unique per fill; re-key on entry_id",
+                )
+                continue
+            seen_trade_ids[trade_id] = idx
+
+            warn = zero_price_warning(locate(raw, idx), base, quantity, price)
+            if warn is not None:
+                warnings.append(warn)
+
+            fills.append(
+                CanonicalFill(
+                    instrument=Instrument(
+                        id=None,
+                        asset_class=AssetClass.CRYPTO_SPOT,
+                        symbol=base.upper(),
+                        quote_currency=quote.upper(),
+                    ),
+                    executed_at=when,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    fee=fee,
+                    fee_currency=quote.upper(),
+                    venue_fill_id=trade_id,
+                    venue_order_id=str(raw.get("order_id")) if raw.get("order_id") else None,
+                )
+            )
+
+        return ImportBatch(
+            fills=tuple(fills),
+            warnings=tuple(warnings),
+            unmapped_rows=tuple(unmapped),
+            blocking=tuple(blocking),
+        )

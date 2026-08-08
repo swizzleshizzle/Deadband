@@ -343,7 +343,14 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
 async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys, tmp_path):
     """Positive case for the venue check above: a matching venue must still
     commit normally. Fails if the check is inverted and rejects the correct
-    case instead of the mismatched one."""
+    case instead of the mismatched one.
+
+    §10 gap 6, closed 2026-08-08: used to assert 3 committed fills (this
+    trimmed fixture's two Buys and one Sell). Coinbase fills come only from
+    the API now, so this venue-matching commit inserts zero fills -- the
+    trade rows are reported and skipped, not blocked (there's no unmapped
+    or blocking row left once the Convert line is trimmed) -- and the two
+    cash rows (Deposit, Rewards Income) still commit normally."""
     acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
 
     async def fake_create_pool(*_a, **_kw):
@@ -359,7 +366,285 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     )
     rc = await cli.cmd_import(args)
     assert rc == 0
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+    assert (
+        await conn.fetchval("SELECT count(*) FROM cash_movement WHERE account_id = $1", acc) == 2
+    )
+
+
+# --- Task 5: `deadband sync coinbase` must reuse this exact venue-match/
+# --- routing check, not a parallel copy of it -- and the check must not
+# --- mistake the PARSING importer's own identity ("coinbase-api") for the
+# --- venue accounts are registered under ("coinbase"). Before cmd_sync
+# --- passed "coinbase" (not get_importer("coinbase-api").venue) into the
+# --- shared preview/commit body, this would refuse every real account with
+# --- "account ... is a 'coinbase' account; refusing to commit a
+# --- 'coinbase-api' import to it" -- sync could never commit anything, ever,
+# --- against any account a user could actually create.
+# ---
+# --- Review follow-up: that fix relocated the literal "coinbase" from
+# --- cmd_sync's own body into a caller-supplied argument, which still left
+# --- four places (argparse choices, a now-dead venue check, get_importer's
+# --- name, and the _preview_or_commit call) that had to agree with nothing
+# --- forcing them to. Importer.account_venue (importers/base.py) makes the
+# --- importer itself the one source of truth: cmd_sync now passes
+# --- importer.account_venue, never a literal. The two tests below pin that
+# --- routing/matching genuinely reads account_venue rather than a
+# --- resurrected literal -- see the mutation note on the second test. ------
+
+
+async def test_sync_commits_fills_to_a_real_coinbase_venue_account(conn, monkeypatch, capsys):
+    """End-to-end proof that `sync coinbase --commit` reaches a real account:
+    fetch (faked) -> parse -> the shared preview/commit body -> insert. Fails
+    if cmd_sync compares the account's venue against the coinbase-api
+    importer's own `.venue` ("coinbase-api") instead of the plain "coinbase"
+    accounts are actually registered under -- that mismatch would print the
+    "refusing to commit" error below and rc would be 2, with zero fills
+    inserted, for every account this test (or a real user) could construct."""
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_fetch(creds, **kw):
+        import json
+
+        return json.dumps(
+            {
+                "fills": [
+                    {
+                        "trade_id": "sync-t1",
+                        "order_id": "sync-o1",
+                        "trade_time": "2026-06-01T00:00:00Z",
+                        "price": "100.00",
+                        "size": "2",
+                        "size_in_quote": False,
+                        "commission": "0.10",
+                        "product_id": "BTC-USD",
+                        "side": "BUY",
+                    }
+                ],
+                "cursor": "",
+            }
+        )
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "fetch_all_fills", fake_fetch)
+    monkeypatch.setenv("COINBASE_API_KEY", "k")
+    monkeypatch.setenv("COINBASE_API_SECRET", "pem")
+
+    args = argparse.Namespace(
+        venue="coinbase", account=str(acc), start=None, end=None, commit=True
+    )
+    rc = await cli.cmd_sync(args)
+
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+    # I2: the fill must record where it actually came from. commit_batch's
+    # `source` used to default to "csv" and cli.py's shared commit path never
+    # overrode it, so every API-synced fill claimed CSV provenance -- and
+    # fill.source is the ONLY column that can answer "which of my Coinbase
+    # fills came from the retired CSV path?", which is exactly what the
+    # mixed-provenance refusal below and any future reconciliation must ask.
+    # This test previously asserted the row existed and never looked at it.
+    assert (
+        await conn.fetchval("SELECT source FROM fill WHERE account_id = $1", acc) == "api"
+    )
+
+
+async def test_sync_refuses_to_commit_to_an_account_of_a_different_venue(
+    conn, monkeypatch, capsys
+):
+    """Negative twin of the test above: account_venue routing must still
+    REFUSE a genuine mismatch, not just permit the matching case. Fails if
+    the account-venue check is ever dropped entirely rather than merely
+    switched to the wrong attribute -- rc would be 0 and the fidelity
+    account would end up with a Coinbase fill committed to it, with no CLI
+    path to undo it.
+
+    Mutation gate for the review finding this pair of tests exists to close:
+    with `CoinbaseAPIImporter.account_venue` temporarily set back to
+    "coinbase-api" (the importer's own identity, the pre-fix behaviour),
+    this test still passes (a mismatch is still refused -- for the wrong
+    reason, "fidelity" != "coinbase-api" instead of "fidelity" !=
+    "coinbase", but still refused) while
+    test_sync_commits_fills_to_a_real_coinbase_venue_account above goes red
+    (rc == 2, zero fills, "account ... is a 'coinbase' account; refusing to
+    commit a 'coinbase-api' import to it" -- the exact pre-fix failure).
+    Verified by hand: with account_venue reverted, this test passed and the
+    positive twin failed with rc == 2 and zero fills, exactly as described."""
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_fetch(creds, **kw):
+        import json
+
+        return json.dumps(
+            {
+                "fills": [
+                    {
+                        "trade_id": "sync-mismatch-t1",
+                        "order_id": "sync-mismatch-o1",
+                        "trade_time": "2026-06-01T00:00:00Z",
+                        "price": "100.00",
+                        "size": "2",
+                        "size_in_quote": False,
+                        "commission": "0.10",
+                        "product_id": "BTC-USD",
+                        "side": "BUY",
+                    }
+                ],
+                "cursor": "",
+            }
+        )
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "fetch_all_fills", fake_fetch)
+    monkeypatch.setenv("COINBASE_API_KEY", "k")
+    monkeypatch.setenv("COINBASE_API_SECRET", "pem")
+
+    args = argparse.Namespace(
+        venue="coinbase", account=str(acc), start=None, end=None, commit=True
+    )
+    rc = await cli.cmd_sync(args)
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "fidelity" in err
+    assert "coinbase" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+
+
+# --- I3: an account holding pre-cut-over CSV fills (content_hash-keyed, no
+# --- venue_fill_id) must never take a venue_fill_id-keyed batch on top. The
+# --- two partial unique indexes are disjoint BY CONSTRUCTION --
+# --- fill_venue_id_uniq is WHERE venue_fill_id IS NOT NULL,
+# --- fill_content_hash_uniq is WHERE content_hash IS NOT NULL -- so the same
+# --- trade arriving by both paths is invisible to both indexes, both rows
+# --- land, both feed regroup_account, and position and realized P&L double.
+# --- Nothing else in the system would notice. -------------------------------
+
+
+async def _sync_args_and_fetch(monkeypatch, conn, acc, *, trade_id):
+    """Wire cmd_sync to this test's connection and a one-fill fake fetch."""
+    import json
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_fetch(creds, **kw):
+        return json.dumps(
+            {
+                "fills": [
+                    {
+                        "trade_id": trade_id,
+                        "order_id": "o-" + trade_id,
+                        "trade_time": "2026-06-01T00:00:00Z",
+                        "price": "100.00",
+                        "size": "2",
+                        "size_in_quote": False,
+                        "commission": "0.10",
+                        "product_id": "BTC-USD",
+                        "side": "BUY",
+                    }
+                ],
+                "cursor": "",
+            }
+        )
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "fetch_all_fills", fake_fetch)
+    monkeypatch.setenv("COINBASE_API_KEY", "k")
+    monkeypatch.setenv("COINBASE_API_SECRET", "pem")
+    return argparse.Namespace(
+        venue="coinbase", account=str(acc), start=None, end=None, commit=True
+    )
+
+
+async def test_sync_refuses_an_account_that_already_holds_csv_keyed_fills(
+    conn, monkeypatch, capsys
+):
+    """The account already has one CSV-imported Coinbase fill -- exactly the
+    shape commit_batch produces for a fill with no venue id: content_hash
+    SET, venue_fill_id NULL. `sync --commit` must refuse rather than add a
+    second, independently-keyed row for what may be the same trade.
+
+    Committed through cmd_import (the real CSV path) rather than by an
+    INSERT, so the pre-existing row's key shape is whatever the production
+    code actually writes, not whatever this test assumes it writes.
+    """
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from db.importing import commit_batch
+    from importers.base import CanonicalFill, ImportBatch
+    from ledger.types import AssetClass, Instrument, Side
+
+    legacy = CanonicalFill(
+        instrument=Instrument(
+            id=None,
+            asset_class=AssetClass.CRYPTO_SPOT,
+            symbol="BTC",
+            quote_currency="USD",
+        ),
+        executed_at=datetime(2026, 6, 1, tzinfo=UTC),
+        side=Side.BUY,
+        quantity=Decimal("2"),
+        price=Decimal("100.00"),
+        fee=Decimal("0.10"),
+        fee_currency="USD",
+    )
+    await commit_batch(conn, acc, ImportBatch(fills=(legacy,)), source="csv")
+    assert (
+        await conn.fetchval(
+            "SELECT count(*) FROM fill WHERE account_id = $1 AND content_hash IS NOT NULL "
+            "AND venue_fill_id IS NULL",
+            acc,
+        )
+        == 1
+    )
+
+    args = await _sync_args_and_fetch(monkeypatch, conn, acc, trade_id="mixed-t1")
+    rc = await cli.cmd_sync(args)
+
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "content_hash" in err
+    assert str(acc) in err
+    # Refused means WROTE NOTHING: the legacy fill is still the only one.
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+
+
+async def test_sync_stays_silent_on_an_account_with_no_csv_keyed_fills(
+    conn, monkeypatch, capsys
+):
+    """The negative twin, and the one that matters most: a guard that refused
+    unconditionally would satisfy the test above while breaking `sync` for
+    every clean account -- which is every account anyone would create today.
+
+    Two consecutive syncs, not one: the second proves the guard does not
+    start firing once the account holds API-keyed fills of its own. Those
+    rows have venue_fill_id SET and content_hash NULL, so they must not match
+    the `content_hash IS NOT NULL AND venue_fill_id IS NULL` predicate -- a
+    guard written with the two conditions swapped, or with either dropped,
+    would pass on the first sync and refuse on the second.
+    """
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    args = await _sync_args_and_fetch(monkeypatch, conn, acc, trade_id="clean-t1")
+    rc = await cli.cmd_sync(args)
+    assert rc == 0, capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+
+    args = await _sync_args_and_fetch(monkeypatch, conn, acc, trade_id="clean-t2")
+    rc = await cli.cmd_sync(args)
+    assert rc == 0, capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 2
 
 
 # --- Item 7: cmd_regroup must surface an unknown account the same clean way
@@ -783,7 +1068,15 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 ):
     """Coinbase carries no per-row account ref, so a preview run with
     --check-duplicates must fall back to --account for those rows the same
-    way --commit already does (cmd_import's `unrouted` handling)."""
+    way --commit already does (cmd_import's `unrouted` handling).
+
+    §10 gap 6, closed 2026-08-08: used to assert "3 fill(s) ... already
+    present" and 3 committed fills. Coinbase fills come only from the API
+    now, so the prior --commit of this trimmed fixture inserted zero fills
+    -- there is nothing for the duplicate probe to find on the fill side.
+    The cash side is unaffected and still the thing worth pinning here: 2
+    cash movements were already committed, so the probe must still report
+    them as already present."""
     acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
 
     async def fake_create_pool(*_a, **_kw):
@@ -814,8 +1107,8 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 
     out = capsys.readouterr().out
     assert "preview only" in out
-    assert "duplicate check: 3 fill(s), 2 cash movement(s) already present" in out
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+    assert "duplicate check: 0 fill(s), 2 cash movement(s) already present" in out
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
 # --- Finding C: --check-duplicates could print "0 duplicates" for a file it -

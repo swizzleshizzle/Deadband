@@ -40,6 +40,17 @@ FORBIDDEN_IMPORTS = {
     "http",
     "time",
     "importlib",
+    # I5: first-party packages, not third-party ones -- and the only entries
+    # here that the AST scan could not otherwise reach. `venues/` opens
+    # sockets and `db/` opens database connections; both are, by definition,
+    # everything the pure packages must not do. Without these two names a pure
+    # module could write `from venues.coinbase_client import fetch_all_fills`
+    # and the guard would stay green: httpx arrives TRANSITIVELY, at import
+    # time, and an AST scan of importers/*.py never sees it. `venues` is new
+    # on this branch and is the most tempting thing for a future Coinbase
+    # importer to reach for -- same venue name, one parse() call away.
+    "venues",
+    "db",
 }
 # Deliberately NOT forbidden — legitimate in pure code:
 # csv, io (io.StringIO is in-memory, not I/O), hashlib, datetime, decimal,
@@ -168,6 +179,14 @@ _SUBPROCESS_CALL = "import subprocess\nsubprocess.run([])\n"
 
 _DYNAMIC_IMPORT = "import importlib\nimportlib.import_module('asyncpg')\n"
 
+# I5: the transitive-I/O evasion. Neither of these names httpx or asyncpg
+# anywhere, so the pre-fix FORBIDDEN_IMPORTS (third-party + stdlib only) let
+# both through -- while importing either one at runtime pulls a socket or a
+# connection pool into the pure layer.
+_IO_VIA_FIRST_PARTY_VENUES = "from venues.coinbase_client import fetch_all_fills\n"
+
+_IO_VIA_FIRST_PARTY_DB = "import db.importing\n"
+
 _CLEAN_SAMPLE = (
     "from dataclasses import dataclass\n"
     "from decimal import Decimal\n"
@@ -208,6 +227,14 @@ def test_checker_catches_subprocess_call():
 
 def test_checker_catches_dynamic_import():
     assert purity_violations(_DYNAMIC_IMPORT)
+
+
+def test_checker_catches_io_reached_through_the_first_party_venues_package():
+    assert purity_violations(_IO_VIA_FIRST_PARTY_VENUES)
+
+
+def test_checker_catches_io_reached_through_the_first_party_db_package():
+    assert purity_violations(_IO_VIA_FIRST_PARTY_DB)
 
 
 def test_checker_is_quiet_on_clean_source():
