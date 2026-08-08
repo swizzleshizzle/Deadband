@@ -13,16 +13,14 @@ from importers.base import (
     ImportBatch,
     normalize_field,
     zero_amount_warning,
-    zero_price_warning,
 )
-from ledger.types import AssetClass, Instrument, Side
 
-_FILL_TYPES = {
-    "buy": Side.BUY,
-    "advanced trade buy": Side.BUY,
-    "sell": Side.SELL,
-    "advanced trade sell": Side.SELL,
-}
+# Trade-row transaction types this importer RECOGNISES but, since the
+# gap-6 cut-over below, deliberately does not map to fills. Kept as a set
+# (not the Side-keyed dict this used to be) because nothing downstream of
+# `kind in _FILL_TYPES` reads a value anymore -- see the warning in the
+# branch below for why these rows are reported instead of silently dropped.
+_FILL_TYPES = {"buy", "advanced trade buy", "sell", "advanced trade sell"}
 
 _CASH_TYPES = {
     "deposit": "deposit",
@@ -110,7 +108,9 @@ class CoinbaseImporter:
         # account number) -- every entry's ref is therefore always None.
         blocking: list[tuple[str | None, str]] = []
 
-        def reject(row: dict[str, str], raw_row: dict[str, str], line_no: int, message: str) -> None:
+        def reject(
+            row: dict[str, str], raw_row: dict[str, str], line_no: int, message: str
+        ) -> None:
             """ONE path for every row parse() drops as unmapped -- top-level
             parse failure, non-finite quantity/price/fee, non-positive
             quantity, non-finite cash amount, and "unhandled transaction
@@ -155,69 +155,34 @@ class CoinbaseImporter:
                 ).astimezone(UTC)
                 quantity = _decimal(row.get("quantity transacted", ""))
                 price = _decimal(row.get("spot price at transaction", ""))
-                fee = _decimal(row.get("fees and/or spread", ""))
+                # "Fees and/or Spread" is deliberately NOT parsed here anymore.
+                # It was read only to populate a fill's `fee` -- the only
+                # branch that ever consumed it -- and that branch is gone
+                # (gap 6: fills come from the API now). Cash movements never
+                # used it. Parsing a field with no reader left would be dead
+                # work, and validating it would fail closed on garbage a
+                # cash-only import has no reason to care about.
             except (ValueError, InvalidOperation) as exc:
                 reject(row, raw_row, line_no, f"line {line_no}: could not parse row ({exc})")
                 continue
 
             if kind in _FILL_TYPES:
-                # Decimal("NaN")/Decimal("Infinity") are valid constructions, so they
-                # are not caught by the `except InvalidOperation` above. This check
-                # MUST run before any ordering comparison (`<=`, `<`, `>`, `>=`)
-                # touches quantity/price/fee: `Decimal("NaN") <= 0` itself raises
-                # InvalidOperation (NaN is unordered, per IEEE 754), which would
-                # escape this loop's own try/except (that one only wraps the parse
-                # above) and abort the entire file instead of costing one row. Left
-                # unchecked otherwise, Infinity survives Fill.__post_init__'s
-                # `quantity > 0` check and the DB's `quantity > 0` CHECK, becoming a
-                # live allocation. fee is included here too: Fill.__post_init__ never
-                # validates fee at all, and Postgres NUMERIC (PG14+) happily stores
-                # Infinity, so a non-finite fee has no other guard anywhere on its
-                # way to the DB.
-                if not quantity.is_finite() or not price.is_finite() or not fee.is_finite():
-                    reject(row, raw_row, line_no, f"line {line_no}: non-finite number, skipped")
-                    continue
-
-                # A blank/zero Quantity Transacted parses fine (as Decimal("0")) and
-                # would otherwise become a CanonicalFill that survives preview, then
-                # raises inside Fill.__post_init__ during commit — taking the whole
-                # batch down with it, not just this row. Fidelity's twin importer
-                # guards this by taking abs(quantity) before the equality check, so
-                # only exactly-zero rows reach it; Coinbase's Quantity Transacted is
-                # used as-is (never abs()'d), so a negative value here reaches
-                # Fill.__post_init__'s `quantity <= 0` check unguarded too — hence
-                # `<= 0`, not `== 0`. This ordering comparison is now safe because
-                # the finiteness check above already ran and skipped any NaN.
-                if quantity <= 0:
-                    reject(row, raw_row, line_no, f"line {line_no}: non-positive quantity, skipped")
-                    continue
-
-                # Same defect class as Fidelity's twin (see
-                # importers.base.zero_price_warning's docstring): a real
-                # quantity priced at zero is almost always a parse failure --
-                # e.g. a currency-suffixed money column the importer's bare
-                # header names missed -- not a free trade. Report it, but
-                # still record the fill.
-                warn = zero_price_warning(line_no, asset, quantity, price)
-                if warn is not None:
-                    warnings.append(warn)
-
-                fills.append(
-                    CanonicalFill(
-                        instrument=Instrument(
-                            id=None,
-                            asset_class=AssetClass.CRYPTO_SPOT,
-                            symbol=asset,
-                            quote_currency=currency,
-                        ),
-                        executed_at=when,
-                        side=_FILL_TYPES[kind],
-                        quantity=quantity,
-                        price=price,
-                        fee=fee,
-                        fee_currency=currency,
-                    )
+                # §10 gap 6, closed 2026-08-08: Coinbase fills are imported
+                # from the Advanced Trade API (`deadband sync coinbase`),
+                # keyed on the venue's own trade id. Mapping them here too
+                # would give one fill two dedupe keys -- content_hash from
+                # this path, venue_fill_id from that one -- so a fill
+                # imported by both would not dedupe against itself.
+                #
+                # Reported, never silently skipped: a trade row vanishing
+                # without a word is the same silent-loss shape as the defect
+                # that started this effort. It does NOT block, because a
+                # cash-only Coinbase CSV import is now the intended use.
+                warnings.append(
+                    f"line {line_no}: {kind!r} is a trade row -- Coinbase fills are "
+                    "imported via `deadband sync coinbase` (coinbase-api), not from CSV"
                 )
+                continue
             elif kind in _CASH_TYPES:
                 # Canonical convention (see importers.base.OUTFLOW_KINDS): amount is
                 # always positive, direction lives in `kind` alone. Coinbase's raw
