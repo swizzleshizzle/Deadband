@@ -29,19 +29,37 @@ _SQL = """
        AND ($1::uuid IS NULL OR t.account_id = $1)
 """
 
-# A trade with no reachable instrument still has to appear. It is grouped
-# under this sentinel so the aggregator's own "unknown" path renders it,
-# rather than the query silently deciding it does not exist.
-_UNKNOWN_INSTRUMENT = UUID("00000000-0000-0000-0000-000000000000")
-
-
 async def open_positions(
     conn: asyncpg.Connection, account_id: UUID | None = None
 ) -> tuple[OpenPosition, ...]:
     records = await conn.fetch(_SQL, account_id)
     rows = [
         TradeRow(
-            instrument_id=r["instrument_id"] or _UNKNOWN_INSTRUMENT,
+            # A trade with no reachable instrument still has to appear -- but
+            # two such trades are not necessarily "the same unknown thing".
+            # A shared sentinel here would merge them into one row with a
+            # summed quantity and a cost basis averaged across instruments
+            # that have nothing to do with each other (an equity and an
+            # option, or the same symbol in two different accounts): not
+            # wrong-ish, meaningless, and worse because the row *looks*
+            # populated. Falling back to the trade's OWN id instead gives
+            # each orphaned trade its own grouping key, so none of them merge.
+            #
+            # This is a deliberate lie of type -- a trade id standing in
+            # where an instrument id belongs -- but it never leaks past this
+            # module: nothing here (or in ledger/positions.py) uses
+            # `instrument_id` to look up an instrument or a mark directly,
+            # and every row built this way also has open_quantity/
+            # open_cost_basis NULL (the only path to a NULL joined instrument
+            # is opening_fill_id IS NULL, which db/trades.py's protection
+            # step always nulls those two columns alongside), so
+            # `aggregate_positions` always sets `unvaluable_reason` on it. A
+            # future caller (e.g. Task 3's mark lookup) that fetches marks
+            # for these instrument_ids will simply find no matching mark row
+            # -- trade ids and instrument ids are drawn from the same
+            # gen_random_uuid() space but are never cross-inserted, so this
+            # is a safe miss, not a silent collision.
+            instrument_id=r["instrument_id"] or r["id"],
             symbol=r["symbol"] or "(unknown instrument)",
             multiplier=r["multiplier"] if r["multiplier"] is not None else Decimal(1),
             direction=Direction(r["direction"]),

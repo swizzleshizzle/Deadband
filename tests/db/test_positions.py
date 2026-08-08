@@ -70,32 +70,42 @@ async def closed_trade_account(conn):
     return acc
 
 
-@pytest_asyncio.fixture
-async def orphaned_trade_account(conn):
-    """An open trade that gets protected (per db/trades.py's protection path):
-    give it notes so regroup preserves it as manual, then delete its opening
-    fill and regroup again. The composite FK nulls opening_fill_id, and the
-    protection UPDATE nulls open_quantity/open_cost_basis alongside it, while
-    leaving status='open' untouched -- exactly the "unreachable instrument,
-    still holds exposure" case this query exists to catch."""
-    acc = await create_account(conn, name="Orphan", venue="manual", account_type="cash")
+async def _make_orphaned_trade(conn, acc, *, symbol, ref) -> object:
+    """Create one open trade in `acc` on its own fresh instrument, then
+    protect it (per db/trades.py's protection path): give it notes so regroup
+    preserves it as manual, delete its opening fill, and regroup again. The
+    composite FK nulls opening_fill_id, and the protection UPDATE nulls
+    open_quantity/open_cost_basis alongside it, while leaving status='open'
+    untouched -- exactly the "unreachable instrument, still holds exposure"
+    case this query exists to catch. Returns the trade's id, since two
+    orphaned trades must never collapse into one row and the id is the key
+    that proves it. Parameterized (rather than baked into a single fixture)
+    so a test can create more than one of these, in the same account or in
+    different ones."""
     inst = await upsert_instrument(
         conn,
-        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ORPH", quote_currency="USD"),
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"),
     )
-    fill = _fill(acc, inst, side=Side.BUY, quantity="5", price="10", ref="or1")
+    fill = _fill(acc, inst, side=Side.BUY, quantity="5", price="10", ref=ref)
     await insert_fills(conn, [fill])
     await regroup_account(conn, acc)
-    trade = (await list_trades(conn, acc))[0]
+    trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == fill.id)
     assert trade["status"] == "open"
 
     await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
     await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
     await regroup_account(conn, acc)
 
-    protected = (await list_trades(conn, acc))[0]
+    protected = next(t for t in await list_trades(conn, acc) if t["id"] == trade["id"])
     assert protected["opening_fill_id"] is None
     assert protected["status"] == "open"
+    return trade["id"]
+
+
+@pytest_asyncio.fixture
+async def orphaned_trade_account(conn):
+    acc = await create_account(conn, name="Orphan", venue="manual", account_type="cash")
+    await _make_orphaned_trade(conn, acc, symbol="ORPH", ref="or1")
     return acc
 
 
@@ -153,3 +163,42 @@ async def test_positions_are_scoped_to_the_account_asked_for(conn, two_accounts)
     assert {p.symbol for p in await open_positions(conn, a)} != {
         p.symbol for p in await open_positions(conn, b)
     }
+
+
+async def test_two_orphaned_trades_in_the_same_account_are_two_rows(conn):
+    """A shared sentinel for 'unknown instrument' would merge these into one
+    row with a summed quantity and a cost basis averaged across two
+    instruments that have nothing to do with each other -- meaningless, and
+    worse than dropping the trade because the row looks like real
+    information. Each orphaned trade must keep its own identity."""
+    acc = await create_account(conn, name="TwoOrphans", venue="manual", account_type="cash")
+    id1 = await _make_orphaned_trade(conn, acc, symbol="ORP1", ref="oa1")
+    id2 = await _make_orphaned_trade(conn, acc, symbol="ORP2", ref="oa2")
+
+    ps = await open_positions(conn, acc)
+
+    assert len(ps) == 2
+    assert {p.instrument_id for p in ps} == {id1, id2}
+    assert all(p.trade_count == 1 for p in ps)
+    assert all(p.unvaluable_reason is not None for p in ps)
+
+
+async def test_two_orphaned_trades_in_different_accounts_do_not_merge_when_unscoped(conn):
+    """The case Task 5's unscoped `deadband positions` (no --account) will
+    actually hit: two orphaned trades that belong to different accounts must
+    still not merge just because open_positions(conn, None) has no account
+    filter to separate them. Scoped to the two trade ids this test itself
+    created -- an unscoped call can see other committed data in this shared
+    database, so this does not assert on the total row count."""
+    acc_a = await create_account(conn, name="OrphanA", venue="manual", account_type="cash")
+    acc_b = await create_account(conn, name="OrphanB", venue="manual", account_type="cash")
+    id1 = await _make_orphaned_trade(conn, acc_a, symbol="ORPA", ref="ob1")
+    id2 = await _make_orphaned_trade(conn, acc_b, symbol="ORPB", ref="ob2")
+
+    by_id = {p.instrument_id: p for p in await open_positions(conn, None)}
+
+    assert id1 in by_id
+    assert id2 in by_id
+    assert by_id[id1] is not by_id[id2]
+    assert by_id[id1].trade_count == 1
+    assert by_id[id2].trade_count == 1
