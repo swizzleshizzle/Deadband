@@ -343,7 +343,14 @@ async def test_import_refuses_to_commit_to_an_account_of_a_different_venue(
 async def test_import_commits_when_account_venue_matches(conn, monkeypatch, capsys, tmp_path):
     """Positive case for the venue check above: a matching venue must still
     commit normally. Fails if the check is inverted and rejects the correct
-    case instead of the mismatched one."""
+    case instead of the mismatched one.
+
+    §10 gap 6, closed 2026-08-08: used to assert 3 committed fills (this
+    trimmed fixture's two Buys and one Sell). Coinbase fills come only from
+    the API now, so this venue-matching commit inserts zero fills -- the
+    trade rows are reported and skipped, not blocked (there's no unmapped
+    or blocking row left once the Convert line is trimmed) -- and the two
+    cash rows (Deposit, Rewards Income) still commit normally."""
     acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
 
     async def fake_create_pool(*_a, **_kw):
@@ -359,7 +366,10 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     )
     rc = await cli.cmd_import(args)
     assert rc == 0
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+    assert (
+        await conn.fetchval("SELECT count(*) FROM cash_movement WHERE account_id = $1", acc) == 2
+    )
 
 
 # --- Item 7: cmd_regroup must surface an unknown account the same clean way
@@ -783,7 +793,15 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 ):
     """Coinbase carries no per-row account ref, so a preview run with
     --check-duplicates must fall back to --account for those rows the same
-    way --commit already does (cmd_import's `unrouted` handling)."""
+    way --commit already does (cmd_import's `unrouted` handling).
+
+    §10 gap 6, closed 2026-08-08: used to assert "3 fill(s) ... already
+    present" and 3 committed fills. Coinbase fills come only from the API
+    now, so the prior --commit of this trimmed fixture inserted zero fills
+    -- there is nothing for the duplicate probe to find on the fill side.
+    The cash side is unaffected and still the thing worth pinning here: 2
+    cash movements were already committed, so the probe must still report
+    them as already present."""
     acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
 
     async def fake_create_pool(*_a, **_kw):
@@ -814,8 +832,8 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 
     out = capsys.readouterr().out
     assert "preview only" in out
-    assert "duplicate check: 3 fill(s), 2 cash movement(s) already present" in out
-    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 3
+    assert "duplicate check: 0 fill(s), 2 cash movement(s) already present" in out
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
 # --- Finding C: --check-duplicates could print "0 duplicates" for a file it -
