@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+import pytest_asyncio
 
 import cli
 from db.accounts import create_account
+from db.instruments import upsert_instrument
+from db.marks import latest_marks
+from ledger.types import AssetClass, Instrument
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -1147,3 +1153,148 @@ async def test_check_duplicates_refuses_a_bare_count_when_a_row_routes_to_an_unk
     assert "duplicate check:" not in captured.out, (
         "must not print a count that silently omits the unprobed row"
     )
+
+
+# --- A2 part2b2, Task 4: `deadband marks set` -------------------------------
+#
+# Task 3's review flagged a gap latest_marks/set_mark themselves cannot close:
+# nothing rejected a future-dated mark, and the clock is deliberately absent
+# from db/marks.py and ledger/. This CLI command is the only layer that can
+# see "now", so the future-date guard lives here (cli.cmd_marks_set), not in
+# the db layer.
+
+
+def _equity(symbol: str, quote_currency: str = "USD") -> Instrument:
+    return Instrument(
+        id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency=quote_currency
+    )
+
+
+@pytest_asyncio.fixture
+async def an_instrument_named_zxco(conn):
+    """A single instrument this test file owns, isolated by the rolled-back
+    `conn` transaction from tests/conftest.py -- it never persists."""
+    return await upsert_instrument(conn, _equity("ZXCO"))
+
+
+@pytest_asyncio.fixture
+async def two_same_symbol(conn):
+    """Two instruments sharing a symbol but not a natural_key -- the same
+    ticker quoted in two different currencies."""
+    a = await upsert_instrument(conn, _equity("DUPE", "USD"))
+    b = await upsert_instrument(conn, _equity("DUPE", "EUR"))
+    return a, b
+
+
+def _args(*, symbol=None, natural_key=None, price, as_of=None):
+    """Small namespace helper, same pattern tests/test_cli_sync.py's `_args`
+    and tests/test_cli.py's hand-built argparse.Namespace(...) calls use -- a
+    real argparse.Namespace built by hand rather than through
+    parser.parse_args()."""
+    return argparse.Namespace(symbol=symbol, natural_key=natural_key, price=price, as_of=as_of)
+
+
+async def test_marks_set_records_a_price(conn, monkeypatch, an_instrument_named_zxco, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(
+        _args(symbol="ZXCO", price="24.50", as_of="2026-08-08T12:00:00+00:00")
+    )
+    assert rc == 0, capsys.readouterr().err
+    assert (await latest_marks(conn, [an_instrument_named_zxco]))[an_instrument_named_zxco][
+        0
+    ] == Decimal("24.50")
+
+
+async def test_marks_set_refuses_an_ambiguous_symbol_without_writing(
+    conn, monkeypatch, two_same_symbol, capsys
+):
+    """The refusal must happen before any write -- a partially applied mark
+    is worse than none."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(_args(symbol="DUPE", price="1"))
+    assert rc == 2
+    assert "natural-key" in capsys.readouterr().err
+    for iid in two_same_symbol:
+        assert await latest_marks(conn, [iid]) == {}
+
+
+def test_marks_set_requires_exactly_one_of_symbol_or_natural_key(monkeypatch):
+    """Real argparse-level assertion, driven the way every other DB-free
+    parser test in tests/test_cli.py is: monkeypatch sys.argv and call
+    cli.main() directly -- there is no cli.main_with_argv helper in this
+    codebase."""
+    monkeypatch.setattr("sys.argv", ["deadband", "marks", "set", "--price", "1"])
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+async def test_marks_set_defaults_as_of_to_now_when_omitted(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """The clock lives in the CLI, not in db/marks.py -- confirms cmd_marks_set
+    itself supplies datetime.now(UTC) when --as-of is absent, rather than
+    passing None through to set_mark (which would crash on
+    naive.tzinfo is None)."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="5"))
+    assert rc == 0, capsys.readouterr().err
+    assert (await latest_marks(conn, [an_instrument_named_zxco]))[an_instrument_named_zxco][
+        0
+    ] == Decimal("5")
+
+
+async def test_marks_set_accepts_an_as_of_slightly_in_the_past_or_now(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Pins the accepting side of the future-date guard's boundary: a mark
+    dated a few seconds ago (well inside the tolerance, and never actually in
+    the future) must not be refused."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    as_of = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="7", as_of=as_of))
+    assert rc == 0, capsys.readouterr().err
+    assert (await latest_marks(conn, [an_instrument_named_zxco]))[an_instrument_named_zxco][
+        0
+    ] == Decimal("7")
+
+
+async def test_marks_set_refuses_a_clearly_future_dated_as_of_without_writing(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Task 3 review follow-up: nothing rejected a future-dated mark, and
+    latest_marks treats the newest as_of as the current price -- a
+    fat-fingered year or a bad backfill would otherwise silently become
+    today's price with no signal at all. One year out is far past any
+    plausible clock-skew tolerance, so this pins the refusing side
+    unambiguously."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    as_of = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="9", as_of=as_of))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "future" in err.lower()
+    assert await latest_marks(conn, [an_instrument_named_zxco]) == {}

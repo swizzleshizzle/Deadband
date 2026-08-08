@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import pathlib
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.importing import commit_batch, probe_duplicates, route_batch
+from db.marks import resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.trades import list_trades, regroup_account
@@ -576,6 +578,76 @@ async def cmd_trades(args) -> int:
     return 0
 
 
+# latest_marks (db/marks.py) treats the newest as_of as "the current price"
+# with nothing else checking plausibility -- a fat-fingered year or a bad
+# backfill would otherwise silently become today's price and produce a wrong
+# unrealized figure with no signal at all. The tolerance absorbs clock skew
+# between this box and the database, and the fact that "now" isn't identically
+# defined on two machines, without opening the door to a meaningfully wrong
+# future date. Two minutes comfortably covers ordinary clock drift for a
+# command that is typed by hand, not fired in a tight loop.
+_MARK_FUTURE_TOLERANCE = timedelta(minutes=2)
+
+
+async def cmd_marks_set(args) -> int:
+    # The clock lives here, in the I/O layer -- db/marks.py and everything
+    # under ledger/ are clock-free by design. This single `now` anchors both
+    # the omitted-as_of default and the future-date guard below, so the two
+    # measure against the exact same instant.
+    now = datetime.now(UTC)
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            if args.symbol:
+                try:
+                    instrument_id = await resolve_instrument_by_symbol(conn, args.symbol)
+                except ValueError as exc:
+                    print(
+                        f"error: {exc} -- pass --natural-key instead of --symbol "
+                        "to name the exact instrument",
+                        file=sys.stderr,
+                    )
+                    return 2
+            else:
+                instrument_id = await conn.fetchval(
+                    "SELECT id FROM instrument WHERE natural_key = $1", args.natural_key
+                )
+                if instrument_id is None:
+                    print(
+                        f"error: no instrument with natural_key {args.natural_key!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
+
+            as_of = datetime.fromisoformat(args.as_of) if args.as_of else now
+
+            # Refuse before writing: an ambiguous symbol or a naive/future
+            # as_of must never half-apply. Both resolution (above) and this
+            # check happen before set_mark is ever called.
+            if as_of > now + _MARK_FUTURE_TOLERANCE:
+                print(
+                    f"error: --as-of {as_of.isoformat()} is in the future "
+                    f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+                    file=sys.stderr,
+                )
+                return 2
+
+            try:
+                price = Decimal(args.price)
+                await set_mark(conn, instrument_id, price, as_of)
+            except ValueError as exc:
+                # set_mark raises ValueError for a naive (timezone-less)
+                # as_of -- e.g. an ISO-8601 string on the CLI with no offset.
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -647,6 +719,18 @@ def main() -> int:
     p_trades = sub.add_parser("trades")
     p_trades.add_argument("--account")
     p_trades.set_defaults(fn=cmd_trades)
+
+    p_marks = sub.add_parser("marks", help="manual price marks")
+    marks_sub = p_marks.add_subparsers(dest="marks_command", required=True)
+    p_marks_set = marks_sub.add_parser("set", help="record a price mark for an instrument")
+    group = p_marks_set.add_mutually_exclusive_group(required=True)
+    group.add_argument("--symbol", help="instrument symbol; refused if it is ambiguous")
+    group.add_argument("--natural-key", help="exact instrument natural key")
+    p_marks_set.add_argument("--price", required=True)
+    p_marks_set.add_argument(
+        "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
+    )
+    p_marks_set.set_defaults(fn=cmd_marks_set)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether
