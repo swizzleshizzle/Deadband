@@ -1222,7 +1222,15 @@ async def test_marks_set_refuses_an_ambiguous_symbol_without_writing(
 
     rc = await cli.cmd_marks_set(_args(symbol="DUPE", price="1"))
     assert rc == 2
-    assert "natural-key" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "natural-key" in err
+    # Not just the CLI's own hint -- db.marks.resolve_instrument_by_symbol's
+    # actual message (naming every candidate) must survive into stderr too.
+    # A print that dropped `{exc}` and kept only the static hint would still
+    # satisfy the "natural-key" check above while silently deleting the
+    # candidate list a user actually needs to disambiguate.
+    assert "equity:DUPE:USD" in err
+    assert "equity:DUPE:EUR" in err
     for iid in two_same_symbol:
         assert await latest_marks(conn, [iid]) == {}
 
@@ -1243,18 +1251,28 @@ async def test_marks_set_defaults_as_of_to_now_when_omitted(
     """The clock lives in the CLI, not in db/marks.py -- confirms cmd_marks_set
     itself supplies datetime.now(UTC) when --as-of is absent, rather than
     passing None through to set_mark (which would crash on
-    naive.tzinfo is None)."""
+    naive.tzinfo is None).
+
+    Must assert the STORED as_of, not just the price: a version of this test
+    that checked only the recorded price passed even when the reviewer
+    replaced the default with datetime(1970, 1, 1, tzinfo=UTC) -- it pinned
+    nothing about "the clock lives in the CLI" at all. A generous one-minute
+    window is plenty to distinguish "now" from any stale hardcoded stand-in
+    without becoming flaky."""
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
 
+    before = datetime.now(UTC)
     rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="5"))
     assert rc == 0, capsys.readouterr().err
-    assert (await latest_marks(conn, [an_instrument_named_zxco]))[an_instrument_named_zxco][
-        0
-    ] == Decimal("5")
+    price, stored_as_of = (await latest_marks(conn, [an_instrument_named_zxco]))[
+        an_instrument_named_zxco
+    ]
+    assert price == Decimal("5")
+    assert abs(stored_as_of - before) < timedelta(minutes=1)
 
 
 async def test_marks_set_accepts_an_as_of_slightly_in_the_past_or_now(
@@ -1297,4 +1315,106 @@ async def test_marks_set_refuses_a_clearly_future_dated_as_of_without_writing(
     assert rc == 2
     err = capsys.readouterr().err
     assert "future" in err.lower()
+    assert await latest_marks(conn, [an_instrument_named_zxco]) == {}
+
+
+async def test_marks_set_refuses_a_naive_as_of_cleanly_not_a_traceback(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Review finding (Critical 1): a timezone-less --as-of used to reach the
+    `as_of > now + tolerance` comparison first, raising an uncaught
+    `TypeError: can't compare offset-naive and offset-aware datetimes` --
+    never the clean ValueError path set_mark provides for exactly this case,
+    since set_mark was never even reached. Typing a timestamp with no offset
+    is an ordinary fat-finger; it must produce rc == 2 and a one-line stderr
+    message, not a stack trace."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(
+        _args(symbol="ZXCO", price="1", as_of="2026-08-08T12:00:00")
+    )
+    assert rc == 2
+    assert "offset" in capsys.readouterr().err.lower()
+    assert await latest_marks(conn, [an_instrument_named_zxco]) == {}
+
+
+async def test_marks_set_refuses_an_unparseable_price_cleanly_not_a_traceback(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Review finding (Important 3): decimal.InvalidOperation does not
+    descend from ValueError, so `Decimal("abc")` used to crash uncaught."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="abc"))
+    assert rc == 2
+    assert "not a valid number" in capsys.readouterr().err
+    assert await latest_marks(conn, [an_instrument_named_zxco]) == {}
+
+
+@pytest.mark.parametrize("bad_price", ["NaN", "Infinity", "-Infinity"])
+async def test_marks_set_refuses_a_non_finite_price(
+    conn, monkeypatch, an_instrument_named_zxco, capsys, bad_price
+):
+    """Review finding (Important 4): Decimal("NaN")/Decimal("Infinity")
+    construct successfully and used to reach the database, where
+    mark_price_chk refused them as an uncaught asyncpg.CheckViolationError.
+    is_finite() is this codebase's own established guard for exactly this
+    (see importers/fidelity.py, importers/coinbase_api.py)."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price=bad_price))
+    assert rc == 2
+    assert "finite" in capsys.readouterr().err.lower()
+    assert await latest_marks(conn, [an_instrument_named_zxco]) == {}
+
+
+async def test_marks_set_accepts_an_as_of_just_inside_the_future_tolerance(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Minor finding: pin the tolerance boundary itself, not just an
+    extreme (365-day) future date far past any plausible window. 90 seconds
+    is comfortably inside the 2-minute tolerance with margin against test
+    execution time."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    as_of = (datetime.now(UTC) + timedelta(seconds=90)).isoformat()
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="11", as_of=as_of))
+    assert rc == 0, capsys.readouterr().err
+    assert (await latest_marks(conn, [an_instrument_named_zxco]))[an_instrument_named_zxco][
+        0
+    ] == Decimal("11")
+
+
+async def test_marks_set_refuses_an_as_of_just_outside_the_future_tolerance(
+    conn, monkeypatch, an_instrument_named_zxco, capsys
+):
+    """Negative twin of the test above: 150 seconds out is comfortably past
+    the 2-minute tolerance, pinning the refusing side of the same boundary
+    rather than relying solely on an extreme future date."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    as_of = (datetime.now(UTC) + timedelta(seconds=150)).isoformat()
+    rc = await cli.cmd_marks_set(_args(symbol="ZXCO", price="13", as_of=as_of))
+    assert rc == 2
+    assert "future" in capsys.readouterr().err.lower()
     assert await latest_marks(conn, [an_instrument_named_zxco]) == {}

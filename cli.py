@@ -7,7 +7,7 @@ import asyncio
 import pathlib
 import sys
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
@@ -595,6 +595,28 @@ async def cmd_marks_set(args) -> int:
     # the omitted-as_of default and the future-date guard below, so the two
     # measure against the exact same instant.
     now = datetime.now(UTC)
+
+    # Decimal("abc") raises decimal.InvalidOperation, which does NOT descend
+    # from ValueError -- same class of gotcha the --account UUID parsing in
+    # main() works around below (see its comment): a bare `except ValueError`
+    # would let this crash through uncaught instead of becoming a clean
+    # message. Decimal("NaN") and Decimal("Infinity") construct successfully
+    # and slip past that catch entirely -- is_finite() is this codebase's
+    # established check for catching them afterward (see
+    # importers/fidelity.py, importers/coinbase_api.py); left unchecked,
+    # mark_price_chk would refuse them as an uncaught
+    # asyncpg.CheckViolationError instead of a clean CLI error. Parsed before
+    # opening the pool: whether this is a problem depends only on the
+    # argument, never on the database.
+    try:
+        price = Decimal(args.price)
+    except InvalidOperation:
+        print(f"error: --price {args.price!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not price.is_finite():
+        print(f"error: --price {args.price!r} must be a finite number", file=sys.stderr)
+        return 2
+
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
@@ -621,9 +643,26 @@ async def cmd_marks_set(args) -> int:
 
             as_of = datetime.fromisoformat(args.as_of) if args.as_of else now
 
-            # Refuse before writing: an ambiguous symbol or a naive/future
-            # as_of must never half-apply. Both resolution (above) and this
-            # check happen before set_mark is ever called.
+            # A naive (timezone-less) as_of must be caught HERE, before the
+            # future-date comparison just below -- `as_of > now + tolerance`
+            # between an offset-naive and an offset-aware datetime raises a
+            # raw, uncaught TypeError ("can't compare offset-naive and
+            # offset-aware datetimes"), never reaching set_mark's own
+            # ValueError for exactly this case. Checking first means a
+            # fat-fingered timestamp with no offset always gets a clean
+            # message instead of a traceback.
+            if as_of.tzinfo is None:
+                print(
+                    f"error: --as-of {args.as_of!r} has no UTC offset "
+                    "(e.g. append +00:00 or Z)",
+                    file=sys.stderr,
+                )
+                return 2
+
+            # Refuse before writing: an ambiguous symbol, a naive as_of
+            # (above), or a future-dated as_of (below) must never half-apply.
+            # All of resolution and validation happens before set_mark is
+            # ever called.
             if as_of > now + _MARK_FUTURE_TOLERANCE:
                 print(
                     f"error: --as-of {as_of.isoformat()} is in the future "
@@ -632,14 +671,7 @@ async def cmd_marks_set(args) -> int:
                 )
                 return 2
 
-            try:
-                price = Decimal(args.price)
-                await set_mark(conn, instrument_id, price, as_of)
-            except ValueError as exc:
-                # set_mark raises ValueError for a naive (timezone-less)
-                # as_of -- e.g. an ISO-8601 string on the CLI with no offset.
-                print(f"error: {exc}", file=sys.stderr)
-                return 2
+            await set_mark(conn, instrument_id, price, as_of)
     finally:
         # See cmd_trades's identical comment: pool.close() must run after the
         # `async with pool.acquire()` block has exited, never from inside it,
