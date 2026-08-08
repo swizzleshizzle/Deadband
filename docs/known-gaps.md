@@ -154,14 +154,15 @@ without it, and two reviewers concluded it was the artifact that would have caug
 with `tests/test_fidelity_real_shape.py` as its acceptance test.
 
 It found both of these on its first run — against the rule table part 2a had already
-merged, six per-task reviews and a whole-branch review clean.
+merged, six per-task reviews and a whole-branch review clean. F1 is now fixed; F2 is a
+decision still open.
 
 > [!note] Same non-specificity rule as the 2026-08-05 section
 > Shapes, never specimens. The synthetic fixture is the reproduction case.
 
 | # | Gap | Why it matters |
 |---|---|---|
-| F1 | **An employer-plan `Investment Gain/Loss` row matches no rule and therefore BLOCKS every commit** (§8: unmatched + carries money ⇒ refuse). The real export contains several. | The owner's export cannot be imported at all as the importer stands. Listed as unhandled in R4 back on 2026-08-05, but part 2a's rule table closed the other eight actions in that list and not this one, so an item recorded as "vocabulary to cover" became a hard stop nobody had run into. The row is periodic market-value change, not a transaction: recording it as `CASH` would inject money that never moved, and Deadband derives unrealized value from positions × price. `INTERNAL` is the likely resolution — but that is a decision, so it is written down rather than quietly patched. |
+| F1 | ~~**An employer-plan `Investment Gain/Loss` row matches no rule and therefore BLOCKS every commit**~~ — **FIXED 2026-08-08**, mapped to `INTERNAL`. | Listed as unhandled in R4 back on 2026-08-05, but part 2a's rule table closed the other eight actions in that list and not this one, so an item recorded as "vocabulary to cover" became a hard stop: under §8 an unmapped row carrying money refuses the commit, and a real export holds several — it could not be imported at all. The row is periodic market-value change, not a transaction, so `CASH` would inject money that never moved *and* double-count appreciation the ledger already derives from positions × price. `INTERNAL` — recognised, deliberately produces nothing — is the honest description. Verified against a real export: blocking went from several to zero with fill and cash counts unchanged, so nothing was reclassified into money. **The verb must stay narrow.** Broadening it to a bare `INVESTMENT` prefix survived the entire suite, and the venue emits other `INVESTMENT …` actions — `INVESTMENT ADVISORY FEE` is real money leaving. An over-broad `INTERNAL` is the worst available outcome: it loses money with no warning at all, where an unmapped row at least blocks. `test_investment_gain_loss_does_not_swallow_its_prefix_neighbours` is the guard. |
 | F2 | **Employer-plan rows carry a unit quantity and no price, and the rule table maps them to `CASH` — so the position held inside the plan is invisible to the ledger.** | A plan `Contributions` row is the *purchase* of fund units at an implied price (amount ÷ quantity), with the `Price ($)` column left empty; `RECORDKEEPING FEE` is the same shape in reverse, a fee paid by selling units. Recorded as pure cash, every plan holding has no basis, no quantity and no trade. This is not a mis-mapping of one verb — the whole plan dialect is modelled as cash flow. Deciding it needs an answer to "what instrument is this?", since the export supplies a fund name in `Description` and **no ticker at all**. Subsystem-shaped; do not fix inside an importer task. |
 
 **The dialect split is the underlying shape, and it is the project's named recurring

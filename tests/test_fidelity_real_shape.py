@@ -349,21 +349,54 @@ def test_venues_own_header_inconsistency_is_present_in_the_fixture():
 # --- Known-wrong behaviour, pinned deliberately --------------------------
 
 
-def test_employer_plan_gain_loss_blocks_every_commit():
-    """KNOWN GAP -- this is the real export's actual behaviour today.
+def test_employer_plan_gain_loss_is_recognised_and_produces_nothing():
+    """F1, DECIDED 2026-08-08: `Investment Gain/Loss` is INTERNAL.
 
-    An employer-plan `Investment Gain/Loss` row carries a dollar figure in
-    Amount, matches no rule, and therefore blocks the commit under §8. The
-    owner's real export contains several, so it cannot be committed at all as
-    the importer stands.
+    An employer-plan `Investment Gain/Loss` row is periodic market-value
+    change, not a transaction. Deadband derives unrealized value from
+    positions and prices, so recording this as `CASH` would inject money that
+    never moved and double-count the appreciation the ledger already computes.
+    It is recognised and deliberately produces nothing -- the same treatment,
+    for the same reason, as a sweep reinvestment leg.
 
-    The row is periodic market-value change, not a transaction: recording it
-    as cash would inject money that never moved, and Deadband derives
-    unrealized value from positions and prices instead. INTERNAL is the likely
-    resolution, but it is a design decision, not a bug fix -- see
-    docs/known-gaps.md. When it is settled, this test changes deliberately."""
+    Before this rule existed the row matched nothing, and because it carries a
+    dollar figure in Amount, §8 blocked the commit -- so a real export could
+    not be imported at all.
+
+    Three things are asserted, because "produces nothing" has three distinct
+    ways to be wrong: it must not block, it must not become cash, and it must
+    not become a fill. A rule that merely stopped the blocking while quietly
+    recording a cash movement would be the worse outcome of the two."""
     b = batch()
-    assert [(ref, "INVESTMENT GAIN/LOSS" in msg) for ref, msg in b.blocking] == [("90210", True)]
+    gain_loss_row = next(
+        r for r in _data_rows() if r["Action"].strip().upper().startswith("INVESTMENT GAIN/LOSS")
+    )
+    rule = classify(gain_loss_row["Action"], gain_loss_row["Symbol"])
+
+    assert rule is not None and rule.outcome is Outcome.INTERNAL
+    assert b.blocking == ()
+    # The row's Amount reaches no cash movement and no fill.
+    assert not [c for c in b.cash if c.amount == Decimal(gain_loss_row["Amount ($)"])]
+    assert not [f for f in b.fills if f.external_ref == "90210"]
+
+
+def test_recognising_gain_loss_did_not_silence_genuinely_unknown_actions():
+    """The guard on F1's fix. `INTERNAL` is a claim that a row means nothing,
+    and the cheapest way to make an importer stop complaining is to make that
+    claim too widely. An action the venue has not been mapped for must still
+    reach `blocking` when it carries money.
+
+    Synthesised rather than added to the fixture: the fixture holds shapes a
+    real export actually emits, and this is a shape it does not."""
+    lines = FIXTURE.lstrip("﻿").splitlines()
+    header = lines[2]
+    row = (
+        "04/02/2026,EXAMPLE SAVINGS PLAN,90210,Some Unmapped Action,,"
+        "EXAMPLE REAL ESTATE FUND,,,0,,,,9.99,"
+    )
+    result = FidelityImporter().parse("\n".join([header, row]))
+    assert [ref for ref, _ in result.blocking] == ["90210"]
+    assert "SOME UNMAPPED ACTION" in result.blocking[0][1]
 
 
 def test_employer_plan_unit_quantities_are_currently_discarded():
