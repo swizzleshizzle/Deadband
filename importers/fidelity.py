@@ -138,6 +138,23 @@ RULES: tuple[Rule, ...] = (
     Rule("reinvest_security", "REINVESTMENT", Outcome.FILL,
          side=Side.BUY, funding_source="reinvestment", sweep_only=False),
     Rule("exchange_sweep", "EXCHANGED TO", Outcome.INTERNAL, sweep_only=True),
+    # F1, DECIDED 2026-08-08. An employer-plan row reporting the period's
+    # market-value change on a plan holding -- not a transaction, and not
+    # money entering or leaving the account. Recording it as CASH would
+    # inject money that never moved AND double-count appreciation the ledger
+    # already derives from positions and prices.
+    #
+    # INTERNAL rather than "leave it unmapped": the row carries a dollar
+    # figure in Amount, so under §8 an unmapped one BLOCKS the commit -- a
+    # real export contains several, and could not be imported at all until
+    # this rule existed. "Recognised, and deliberately produces nothing" is
+    # the honest description, and it is what INTERNAL means.
+    #
+    # sweep_only is None (symbol irrelevant) because plan rows carry NO
+    # symbol at all -- the fund is named only in Description. Do not tighten
+    # this to a symbol predicate without re-reading the plan dialect's shape
+    # in tests/fixtures/fidelity/real_shape_activity.csv.
+    Rule("investment_gain_loss", "INVESTMENT GAIN/LOSS", Outcome.INTERNAL),
     Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
     Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
     Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),

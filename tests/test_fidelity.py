@@ -524,6 +524,22 @@ def test_an_unrecognised_action_classifies_as_none():
     assert classify("SOME BRAND NEW ACTION NOBODY MAPPED", "AAA") is None
 
 
+def test_investment_gain_loss_does_not_swallow_its_prefix_neighbours():
+    """`investment_gain_loss` is INTERNAL -- it asserts a row means nothing --
+    so its verb must stay narrow. Broadening it to a bare `INVESTMENT` prefix
+    survived every other test in the suite, which is precisely why this one
+    exists: the venue emits other `INVESTMENT …` actions, and `INVESTMENT
+    ADVISORY FEE` is real money leaving the account.
+
+    Silently classifying a fee as "produces nothing" is the silent-loss shape
+    this whole effort exists to close, and an over-broad INTERNAL is the one
+    outcome that loses money without even a warning -- an unmapped row at
+    least blocks the commit."""
+    assert classify("INVESTMENT GAIN/LOSS", "").outcome is Outcome.INTERNAL
+    assert classify("INVESTMENT ADVISORY FEE", "") is None
+    assert classify("INVESTMENT EXPENSE Q1 2026", "") is None
+
+
 # One (action, symbol) sample per rule in RULES, using synthetic tickers only,
 # each engineered to be the FIRST matching rule for its sample so the
 # reachability test below can prove no rule is shadowed by an earlier one.
@@ -531,6 +547,7 @@ RULE_COVERAGE_SAMPLES = [
     ("REINVESTMENT MONEY MARKET (SPAXX) (CASH)", "SPAXX"),  # reinvest_sweep
     ("REINVESTMENT ACME CORP (AAA) (CASH)", "AAA"),  # reinvest_security
     ("EXCHANGED TO MONEY MARKET (SPAXX)", "SPAXX"),  # exchange_sweep
+    ("INVESTMENT GAIN/LOSS", ""),  # investment_gain_loss
     ("DIVIDEND RECEIVED ACME CORP (AAA) (CASH)", "AAA"),  # dividend_received
     ("DIVIDENDS ACME CORP (AAA) (CASH)", "AAA"),  # dividends
     ("INTEREST EARNED ON CASH (AAA)", "AAA"),  # interest
