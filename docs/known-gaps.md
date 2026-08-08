@@ -338,7 +338,7 @@ this file is the project's memory.
 | 10 | ~~`open_quantity` / `open_cost_basis` are computed but never persisted~~ — CLOSED in A-2 part 1, recorded 2026-08-08 | `unrealized_pnl()` cannot obtain its inputs from the database without re-running the grouper. |
 | 11 | ~~`fill.is_estimated` never propagates to `trade`~~ — CLOSED in A-2 part 1, recorded 2026-08-08 | Spec §4 requires opening-balance trades to be excluded from R-multiple and win-rate stats. C cannot be built without it. |
 | 12 | ~~`positions` command missing (spec §3, plan's Task 14 interfaces)~~ — CLOSED, recorded 2026-08-08 | Replaced by `trades` during implementation and never recorded as a deferral. |
-| 13 | `reconcile` CLI command not implemented | Needs the `account_snapshot` write path. Deliberately not stubbed. |
+| 13 | `reconcile` CLI command not implemented — unblocked, not closed | The `account_snapshot` write path is genuinely absent (the table exists in the schema; nothing writes it) — but that is not the only piece missing. See the note below gap #12: `db/positions.py::open_positions` returns `OpenPosition`, `ledger/reconcile.py::reconcile` consumes `Position`, and they are different types, not just different names. `Position` has no `unvaluable_reason` (or `direction`, or `is_estimated`) field at all, so an `OpenPosition` with a reason set has **no valid `Position` representation** — there is nothing to adapt it to. Wiring the two together needs both an adapter and a design decision, arguably the more interesting of the two: what should `reconcile` do with a position it cannot value — exclude it from computed equity and flag the exclusion, treat cost basis as a stale mark the way an unmarked-but-valuable position already does in `ledger/reconcile.py`'s own fallback, or refuse to reconcile the account at all until it is resolved? None of that is decided yet. |
 | 14 | Unrealized P&L is only as fresh as the last manual mark | There is no price feed, and that is deliberate (spec §3 keeps market data out of the foundation) — `positions` shows each mark's date alongside the valuation so staleness is visible rather than assumed. |
 
 > [!note] Gaps #10 and #11 were done and left on the list
@@ -361,18 +361,27 @@ this file is the project's memory.
 
 > [!note] Gap #12, closed — what `positions` actually does
 > `positions` groups an account's open trades per instrument (quantity-weighted average
-> cost basis across trades in the same instrument), values a position only where a manual
-> mark exists, and rolls `is_estimated` up with the same `any()` convention as `trade`. A
-> position that cannot be priced — the open quantity spans both a long and a short, an
-> orphaned trade's quantity is unknown, or simply no mark has ever been recorded for that
-> instrument — is still listed, carrying an `unvaluable_reason` instead of a number, rather
-> than being silently dropped from the view. That was a deliberate choice: a position
-> missing from a list reads as "flat", which is a worse failure than a position present
-> with an honest "can't price this" note.
+> cost basis across trades in the same instrument) and rolls `is_estimated` up with the
+> same `any()` convention as `trade`. Two separate mechanisms decide what a row shows, and
+> they must not be conflated:
 >
-> `reconcile` (gap #13) is now unblocked by this work, though still unbuilt: it needs the
-> `account_snapshot` write path, but the position query it would consume (`db/positions.py`'s
-> `open_positions`) and `ledger/reconcile.py` both exist already.
+> - **Structurally unvaluable**, decided by `aggregate_positions` (`ledger/positions.py`)
+>   without ever looking at a mark — marks are not even passed to it. It sets
+>   `unvaluable_reason` for exactly two conditions: an unknown open quantity (an orphaned
+>   trade whose instrument is unreachable), or a direction the contributing trades disagree
+>   on (spread, or genuinely mixed long/short). These rows render `n/a (<reason>)`.
+> - **Valuable but unmarked**, decided separately in `cli.py`'s `cmd_positions`: when
+>   `unvaluable_reason` is `None` but no manual mark exists for the instrument, the row
+>   renders `--` in both the mark and unrealized-P&L columns. `unvaluable_reason` stays
+>   `None` here — this is not a reason, it is an absence of data.
+>
+> Both kinds of row are listed rather than hidden — nothing is silently dropped — but only
+> the first kind carries a reason. A future reader (`reconcile`, most likely) that filters
+> on "does `unvaluable_reason` say anything" and treats everything else as valuable would
+> silently mishandle the unmarked case, since it produces no error and no reason string,
+> only a missing price.
+>
+> `reconcile` (gap #13) is now unblocked by this work, though still unbuilt — see below.
 
 ---
 
