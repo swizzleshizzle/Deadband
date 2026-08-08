@@ -25,6 +25,15 @@ def _when(raw: str) -> datetime:
 
 class CoinbaseAPIImporter:
     venue = "coinbase-api"
+    # "coinbase-api" is a TRANSPORT identity (this parser vs. the CSV one),
+    # not an account venue -- no account is ever registered under it. Every
+    # real Coinbase account is registered under the plain "coinbase" venue
+    # regardless of whether its fills arrived via CSV or this API, so
+    # account_venue is deliberately co-located here, right next to `venue`,
+    # so the mapping between the two is visible in one place rather than
+    # left for a caller to get right on its own (see importers/base.py's
+    # Importer.account_venue docstring for the incident this fixes).
+    account_venue = "coinbase"
 
     def parse(self, text: str) -> ImportBatch:
         fills: list[CanonicalFill] = []

@@ -110,22 +110,25 @@ async def cmd_accounts_add(args) -> int:
 async def cmd_import(args) -> int:
     importer = get_importer(args.venue)
     batch = importer.parse(pathlib.Path(args.file).read_text())
-    return await _preview_or_commit(importer.venue, batch, args)
+    return await _preview_or_commit(importer.account_venue, batch, args)
 
 
 async def _preview_or_commit(venue: str, batch: ImportBatch, args) -> int:
     """The three-phase body every entry point (`import`, `sync`) shares.
 
-    `venue` is deliberately NOT always the parsing importer's own `.venue`
-    identity: `cmd_sync` parses with the "coinbase-api" importer (fills
-    only, no per-row account ref) but accounts are registered under the
-    plain "coinbase" venue -- the same account a `deadband import coinbase
-    ...` CSV run would target. `venue` here is "the venue accounts are
-    registered under, that this batch should route/match against" -- for
-    `cmd_import` that happens to equal the importer's own identity (the
-    importer's venue IS the account venue for every CSV importer), but the
-    two are conceptually distinct, and `cmd_sync` is the case where they
-    diverge. Keeping this one function (rather than a second copy of the
+    `venue` is always an importer's `.account_venue` (see the Importer
+    Protocol in importers/base.py), never its `.venue` identity -- those
+    two differ for `coinbase-api`, whose own identity is a TRANSPORT
+    ("coinbase-api" vs. the CSV importer) rather than the venue accounts are
+    registered under (every real account is "coinbase"). This function only
+    ever needs "which registered account venue does this batch route/match
+    against", so taking `account_venue` directly (rather than `venue` plus a
+    caller-side literal) makes it structurally impossible for a caller to
+    pass the wrong one -- which is exactly the shape of the bug that
+    motivated adding `account_venue` at all: `cmd_sync` used to pass the
+    literal "coinbase" here itself, alongside `get_importer("coinbase-api")`
+    a few lines away, with nothing forcing the two to agree as venues were
+    added. Keeping this one function (rather than a second copy of the
     preview/commit body for `sync`) is what the plan's "no second, parallel
     write path" constraint requires.
     """
@@ -418,12 +421,16 @@ async def cmd_sync(args) -> int:
     preview/commit body `cmd_import` uses (`_preview_or_commit`) -- `sync`
     differs from `import` only in where the text comes from (an API call
     instead of a file on disk). Never grows its own write path.
-    """
-    if args.venue != "coinbase":
-        # Unreachable: argparse's `choices=["coinbase"]` on the `venue`
-        # positional rejects anything else before cmd_sync is ever called.
-        raise ValueError(f"unknown sync venue {args.venue!r}")
 
+    No `if args.venue != "coinbase"` guard here: argparse's own
+    `choices=["coinbase"]` on the `venue` positional (main(), below) is the
+    only thing that ever needs to reject an unknown sync venue, and it does
+    so before cmd_sync is even called -- a second, hand-written check here
+    could only ever agree with argparse's `choices` or silently drift out of
+    sync with it, never usefully disagree. When a second venue is added,
+    branch here on `args.venue` to pick its client/importer; until then
+    there is nothing else for this function to check.
+    """
     try:
         creds = CoinbaseCredentials.from_env()
     except RuntimeError as exc:
@@ -443,11 +450,10 @@ async def cmd_sync(args) -> int:
     )
     importer = get_importer("coinbase-api")
     batch = importer.parse(text)
-    # "coinbase", not importer.venue ("coinbase-api"): see _preview_or_commit's
-    # docstring -- accounts are registered under the plain "coinbase" venue,
-    # never under the API importer's own identity, so routing/account-match
-    # must be checked against that, not against what parsed the document.
-    return await _preview_or_commit("coinbase", batch, args)
+    # importer.account_venue ("coinbase"), not importer.venue
+    # ("coinbase-api"): see importers/base.py's Importer.account_venue
+    # docstring and _preview_or_commit's docstring above.
+    return await _preview_or_commit(importer.account_venue, batch, args)
 
 
 async def cmd_regroup(args) -> int:

@@ -238,6 +238,22 @@ def zero_amount_warning(line_no: int, kind: str, amount: Decimal) -> str | None:
 
 class Importer(Protocol):
     venue: str
+    # The account.venue this importer's rows belong to -- what a caller must
+    # route/match against when deciding which registered account a parsed
+    # batch may commit into. For every CSV importer this equals `venue`: the
+    # importer's own identity IS the venue whose accounts it feeds. It
+    # differs from `venue` only when an importer's own name is a TRANSPORT,
+    # not a venue -- the coinbase-api case: "coinbase-api" identifies the
+    # Advanced Trade API as a distinct parser from the CSV importer (they
+    # dedupe on different keys, see importers/registry.py), but there is no
+    # "coinbase-api" account anywhere -- every real account is registered
+    # under the plain "coinbase" venue, whether its fills arrived via CSV or
+    # API. A caller that compares against `venue` instead of `account_venue`
+    # here reintroduces exactly the bug this field exists to make
+    # structurally impossible to repeat: see cli.py's _preview_or_commit,
+    # which uses account_venue for every importer, and its docstring for the
+    # sync-coinbase incident that motivated adding this field.
+    account_venue: str
 
     def parse(self, text: str) -> ImportBatch:
         """Map a venue export to canonical rows. Never writes anything."""

@@ -380,7 +380,17 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
 # --- shared preview/commit body, this would refuse every real account with
 # --- "account ... is a 'coinbase' account; refusing to commit a
 # --- 'coinbase-api' import to it" -- sync could never commit anything, ever,
-# --- against any account a user could actually create. -----------------
+# --- against any account a user could actually create.
+# ---
+# --- Review follow-up: that fix relocated the literal "coinbase" from
+# --- cmd_sync's own body into a caller-supplied argument, which still left
+# --- four places (argparse choices, a now-dead venue check, get_importer's
+# --- name, and the _preview_or_commit call) that had to agree with nothing
+# --- forcing them to. Importer.account_venue (importers/base.py) makes the
+# --- importer itself the one source of truth: cmd_sync now passes
+# --- importer.account_venue, never a literal. The two tests below pin that
+# --- routing/matching genuinely reads account_venue rather than a
+# --- resurrected literal -- see the mutation note on the second test. ------
 
 
 async def test_sync_commits_fills_to_a_real_coinbase_venue_account(conn, monkeypatch, capsys):
@@ -431,6 +441,70 @@ async def test_sync_commits_fills_to_a_real_coinbase_venue_account(conn, monkeyp
     err = capsys.readouterr().err
     assert rc == 0, err
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+
+
+async def test_sync_refuses_to_commit_to_an_account_of_a_different_venue(
+    conn, monkeypatch, capsys
+):
+    """Negative twin of the test above: account_venue routing must still
+    REFUSE a genuine mismatch, not just permit the matching case. Fails if
+    the account-venue check is ever dropped entirely rather than merely
+    switched to the wrong attribute -- rc would be 0 and the fidelity
+    account would end up with a Coinbase fill committed to it, with no CLI
+    path to undo it.
+
+    Mutation gate for the review finding this pair of tests exists to close:
+    with `CoinbaseAPIImporter.account_venue` temporarily set back to
+    "coinbase-api" (the importer's own identity, the pre-fix behaviour),
+    this test still passes (a mismatch is still refused -- for the wrong
+    reason, "fidelity" != "coinbase-api" instead of "fidelity" !=
+    "coinbase", but still refused) while
+    test_sync_commits_fills_to_a_real_coinbase_venue_account above goes red
+    (rc == 2, zero fills, "account ... is a 'coinbase' account; refusing to
+    commit a 'coinbase-api' import to it" -- the exact pre-fix failure).
+    Verified by hand; see task-5-report.md."""
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_fetch(creds, **kw):
+        import json
+
+        return json.dumps(
+            {
+                "fills": [
+                    {
+                        "trade_id": "sync-mismatch-t1",
+                        "order_id": "sync-mismatch-o1",
+                        "trade_time": "2026-06-01T00:00:00Z",
+                        "price": "100.00",
+                        "size": "2",
+                        "size_in_quote": False,
+                        "commission": "0.10",
+                        "product_id": "BTC-USD",
+                        "side": "BUY",
+                    }
+                ],
+                "cursor": "",
+            }
+        )
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "fetch_all_fills", fake_fetch)
+    monkeypatch.setenv("COINBASE_API_KEY", "k")
+    monkeypatch.setenv("COINBASE_API_SECRET", "pem")
+
+    args = argparse.Namespace(
+        venue="coinbase", account=str(acc), start=None, end=None, commit=True
+    )
+    rc = await cli.cmd_sync(args)
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "fidelity" in err
+    assert "coinbase" in err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
 # --- Item 7: cmd_regroup must surface an unknown account the same clean way

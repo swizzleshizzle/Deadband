@@ -82,6 +82,12 @@ def _row_carries_money(row: dict[str, str]) -> bool:
 
 class CoinbaseImporter:
     venue = "coinbase"
+    # Equal to `venue`: this importer's own identity IS the account venue
+    # (see importers/base.py's Importer.account_venue docstring). No
+    # Protocol-level default reaches here -- CoinbaseImporter satisfies
+    # Importer structurally rather than by inheriting from it, so the
+    # attribute has to be set explicitly on every concrete importer.
+    account_venue = "coinbase"
 
     def parse(self, text: str) -> ImportBatch:
         fills: list[CanonicalFill] = []

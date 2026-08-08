@@ -51,3 +51,28 @@ def test_unknown_venue_raises_key_error_naming_the_available_ones():
 
 def test_get_importer_is_case_insensitive():
     assert get_importer("COINBASE-API").venue == "coinbase-api"
+
+
+# --- Task 5 review finding: cli.py used to hard-code the literal "coinbase"
+# --- wherever it needed "the account venue a coinbase-api batch routes
+# --- against", alongside get_importer("coinbase-api") a few lines away, with
+# --- nothing forcing the two to agree. account_venue makes the importer
+# --- itself the single source of truth for that mapping. ---------------------
+
+
+def test_coinbase_api_importers_account_venue_is_the_plain_coinbase_venue():
+    """"coinbase-api" is a TRANSPORT identity (this parser vs. the CSV one),
+    not an account venue -- no account anywhere is ever registered under it.
+    Fails if account_venue is left equal to `venue` (the mistake this field
+    exists to make structurally impossible for a caller to make instead)."""
+    importer = get_importer("coinbase-api")
+    assert importer.account_venue == "coinbase"
+    assert importer.account_venue != importer.venue
+
+
+def test_csv_importers_account_venue_equals_their_own_venue():
+    """For every CSV importer, the importer's own identity IS the account
+    venue its rows belong to -- account_venue and venue coincide. Fails if
+    either importer's account_venue drifts from its venue."""
+    assert get_importer("coinbase").account_venue == get_importer("coinbase").venue == "coinbase"
+    assert get_importer("fidelity").account_venue == get_importer("fidelity").venue == "fidelity"

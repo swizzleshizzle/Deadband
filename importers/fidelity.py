@@ -262,6 +262,10 @@ def _locate_header(text: str) -> tuple[list[str], int]:
 
 class FidelityImporter:
     venue = "fidelity"
+    # Equal to `venue`: see importers/base.py's Importer.account_venue
+    # docstring, and CoinbaseImporter's identical comment for why this can't
+    # come from a Protocol-level default instead.
+    account_venue = "fidelity"
 
     def parse(self, text: str) -> ImportBatch:
         fills: list[CanonicalFill] = []
