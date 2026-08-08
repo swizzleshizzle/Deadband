@@ -1,0 +1,40 @@
+﻿
+
+Run Date,Account,Account Number,Action,Symbol,Description,Type,Price ($),Quantity,Commission ($),Fees ($),Accrued Interest ($),Amount ($),Settlement Date
+05/12/2026,Brokerage - TOD,X23456789,YOU BOUGHT OPENING TRANSACTION CALL (ZXCO) ZEPHYR EXPLORATION CO COM JAN 21 28 $100 (100 SHS) (Cash)," -ZXCO280121C100",CALL (ZXCO) ZEPHYR EXPLORATION CO COM JAN 21 28 $100 (100 SHS),Cash,0.75,4,2.6,0.05,"","-302.65",05/13/2026
+05/11/2026,Brokerage - TOD,X23456789,YOU BOUGHT ZEPHYR EXPLORATION CO (ZXCO) (Cash),ZXCO,ZEPHYR EXPLORATION CO,Cash,18.2,25,"",0.01,"","-455.01",05/12/2026
+05/08/2026,Brokerage - TOD,X23456789,YOU SOLD ZEPHYR EXPLORATION CO (ZXCO) (Cash),ZXCO,ZEPHYR EXPLORATION CO,Cash,19.4,-11,"",0.02,"",213.38,05/11/2026
+05/11/2026,Brokerage - TOD,X23456789,CASH CONTRIBUTION CURRENT YEAR (Cash),"",No Description,Cash,"",0,"","","",800,""
+04/20/2026,Brokerage - TOD,X23456789,ELECTRONIC FUNDS TRANSFER RECEIVED (Cash),"",No Description,Cash,"",0,"","","",1500,""
+04/22/2026,Brokerage - TOD,X23456789,ELECTRONIC FUNDS TRANSFER PAID (Cash),"",No Description,Cash,"",0,"","","","-275",""
+04/30/2026,Retirement - Rollover,112233445,DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (Cash),SPAXX,FIDELITY GOVERNMENT MONEY MARKET,Cash,"",0,"","","",7.44,""
+04/30/2026,Retirement - Rollover,112233445,REINVESTMENT FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (Cash),SPAXX,FIDELITY GOVERNMENT MONEY MARKET,Cash,1,7.44,"","","","-7.44",""
+04/27/2026,Retirement - Rollover,112233445,DIVIDEND RECEIVED DIVIDEND INDEX ETF (DVDX) (Cash),DVDX,DIVIDEND INDEX ETF,Cash,"",0,"","","",11.28,""
+04/29/2026,Retirement - Rollover,112233445,REINVESTMENT as of 2026-04-25 DIVIDEND INDEX ETF (DVDX) (Cash),DVDX,DIVIDEND INDEX ETF,Cash,57.25,0.197,"","","","-11.28",""
+04/09/2026,Retirement - Rollover,112233445,DIVIDEND RECEIVED KLMY MOTORS ADR-EACH REP 5 OR... (KLMY) (Cash),KLMY,KLMY MOTORS ADR-EACH REP 5 ORD SHS,Cash,"",0,"","","",22.85,""
+04/09/2026,Retirement - Rollover,112233445,FOREIGN TAX PAID KLMY MOTORS ADR-EACH REP 5 OR... (KLMY) (Cash),KLMY,KLMY MOTORS ADR-EACH REP 5 ORD SHS,Cash,"",0,"","","","-2.29",""
+04/09/2026,Retirement - Rollover,112233445,FEE CHARGED KLMY MOTORS ADR-EACH REP 5 OR... (KLMY) (Cash),KLMY,KLMY MOTORS ADR-EACH REP 5 ORD SHS,Cash,"",0,"","","","-0.91",""
+03/31/2026,Retirement - Rollover,112233445,RETURN OF CAPITAL ZEPHYR PREFERRED SERIES A (ZXCOP) (Cash),ZXCOP,ZEPHYR PREFERRED SERIES A,Cash,"",0,"","","",35,""
+04/30/2026,Medical Savings,556677889,EXCHANGED TO FDRXX FIDELITY GOVERNMENT CASH RESERVES (FDRXX) (Cash),FDRXX,FIDELITY GOVERNMENT CASH RESERVES,Cash,"",0,"","","",0.00,""
+04/30/2026,Medical Savings,556677889,INTEREST EARNED FDIC INSURED DEPOSIT AT EXAMPLE BANK ... (QPIHQ) (Cash),QPIHQ,FDIC INSURED DEPOSIT AT EXAMPLE BANK HSA NOT COVERED BY SIPC,Cash,"",0,"","","",0.62,""
+04/28/2026,Medical Savings,556677889,CO CONTR CURRENT YR EMPLOYER CUR YR (Cash),"",No Description,Cash,"",0,"","","",125,""
+04/28/2026,Medical Savings,556677889,PARTIC CONTR CURRENT PARTICIPANT CUR YR (Cash),"",No Description,Cash,"",0,"","","",175,""
+04/24/2026,EXAMPLE SAVINGS PLAN,90210,Contributions,,EXAMPLE REAL ESTATE FUND,,,2.874,,,,118.44,
+03/06/2026,EXAMPLE SAVINGS PLAN,90210,Dividends,,EXAMPLE REAL ESTATE FUND,,,0.031,,,,1.27,
+04/30/2026,EXAMPLE SAVINGS PLAN,90210,REVENUE CREDIT,,EXAMPLE REAL ESTATE FUND,,,0.011,,,,0.44,
+04/01/2026,EXAMPLE SAVINGS PLAN,90210,RECORDKEEPING FEE,,EXAMPLE REAL ESTATE FUND,,,"-0.017",,,,"-0.69",
+04/01/2026,EXAMPLE SAVINGS PLAN,90210,Investment Gain/Loss,,EXAMPLE REAL ESTATE FUND,,,0,,,,0.58,
+
+"The data and information in this spreadsheet is provided to you solely for your use and is not intended for"
+"informational purposes only, and is not intended to provide advice, nor should it be construed as an offer"
+"for any security, digital asset or insurance product. Data reflects the date on which it was"
+"exported and is subject to change. It should not be used in place of your account statement."
+
+"Brokerage services are provided by an example broker-dealer, a member of an example exchange."
+
+"Transactions which had a spread applied to them prior to the model change may appear in this file, but"
+"their cost will show as blank in the ""Fees($)"" column."
+
+"9900001.1.0"
+
+Date downloaded 09/12/2026 02:30 pm

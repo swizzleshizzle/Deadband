@@ -146,6 +146,45 @@ multiplier applied.
 
 ---
 
+## Found by the real-shape fixture (2026-08-07)
+
+Spec §9 asked for "an anonymized fixture derived from a real export". Part 2a shipped
+without it, and two reviewers concluded it was the artifact that would have caught part
+2a's Critical before review. It now exists as `tests/fixtures/fidelity/real_shape_activity.csv`,
+with `tests/test_fidelity_real_shape.py` as its acceptance test.
+
+It found both of these on its first run — against the rule table part 2a had already
+merged, six per-task reviews and a whole-branch review clean.
+
+> [!note] Same non-specificity rule as the 2026-08-05 section
+> Shapes, never specimens. The synthetic fixture is the reproduction case.
+
+| # | Gap | Why it matters |
+|---|---|---|
+| F1 | **An employer-plan `Investment Gain/Loss` row matches no rule and therefore BLOCKS every commit** (§8: unmatched + carries money ⇒ refuse). The real export contains several. | The owner's export cannot be imported at all as the importer stands. Listed as unhandled in R4 back on 2026-08-05, but part 2a's rule table closed the other eight actions in that list and not this one, so an item recorded as "vocabulary to cover" became a hard stop nobody had run into. The row is periodic market-value change, not a transaction: recording it as `CASH` would inject money that never moved, and Deadband derives unrealized value from positions × price. `INTERNAL` is the likely resolution — but that is a decision, so it is written down rather than quietly patched. |
+| F2 | **Employer-plan rows carry a unit quantity and no price, and the rule table maps them to `CASH` — so the position held inside the plan is invisible to the ledger.** | A plan `Contributions` row is the *purchase* of fund units at an implied price (amount ÷ quantity), with the `Price ($)` column left empty; `RECORDKEEPING FEE` is the same shape in reverse, a fee paid by selling units. Recorded as pure cash, every plan holding has no basis, no quantity and no trade. This is not a mis-mapping of one verb — the whole plan dialect is modelled as cash flow. Deciding it needs an answer to "what instrument is this?", since the export supplies a fund name in `Description` and **no ticker at all**. Subsystem-shaped; do not fix inside an importer task. |
+
+**The dialect split is the underlying shape, and it is the project's named recurring
+defect again.** A real export contains two row grammars, not one: brokerage rows write an
+empty field as `""`, set `Type`, use SHOUTED compound action prose, and carry a ticker;
+employer-plan rows write empties bare, leave `Type` and `Symbol` empty, use Title-case
+bare verbs (`Contributions`, `Dividends`, `Investment Gain/Loss`), and identify the
+security only in `Description`. Every guard added from here should be checked against
+**both**, which is now mechanical: they are both in the one fixture.
+
+**Also worth not re-litigating** (verified while building the fixture): the two
+`.strip()` calls defending a whitespace-padded option symbol — parse()'s call site and
+`parse_option_symbol`'s own — are *mutually redundant*. Removing either alone leaves the
+suite green; only removing both is caught. Neither is "the" load-bearing one, and no
+real-shape input can separate them, because the real export's only whitespace-padded
+symbol is that option row.
+
+**Hygiene note:** the deny-list covers real tickers but not the plan's *fund names*,
+which appear in `Description` and are equally "what Michael decided". Worth adding
+before any further work quotes a plan row.
+
+---
+
 ## Carried into A-2 part 2 and beyond
 
 Recorded here rather than only in an execution ledger, because ledgers are scratch and
@@ -268,6 +307,42 @@ Two test-side failure modes recurred often enough to name:
   can actually move. Gate every new test against a mutant before accepting it.
 - **Fixtures that cannot fail.** A `_FakePool.close()` that was `pass` made a deadlock
   structurally unobservable regardless of how the assertion was written.
+- **Slack that exceeds the defect** (added 2026-08-07, three instances in one sitting).
+  All three were in the real-shape fixture's own tests, and all three were the same
+  mistake in different clothes: an assertion loose enough that the thing it watched for
+  could happen without moving it.
+  - A row-accounting check written as `>= 23` against a total that also counted nine
+    disclaimer rows. It summed to 32 and would have stayed above the bar however many
+    dated rows were silently dropped. Fixed by making the count **exact** — and the
+    exact version then failed immediately, twice, on real problems the `>=` version had
+    been hiding.
+  - Two row filters that accepted anything date-*shaped*: `[:2].isdigit()` swallowed a
+    document id (`9900001.1.0`), and an unanchored `\d{2}/\d{2}/\d{4}` search swallowed
+    the footer's "Date downloaded …". Both over-counted by exactly one, which an
+    inequality would never have surfaced.
+
+  The generalisation is not "prefer `==` to `>=`" but: **when an assertion has slack,
+  the slack must be smaller than the smallest defect it is meant to catch** — and if the
+  slack cannot be bounded, the assertion is decoration. A useful tell is that an exact
+  assertion fails loudly while you are still writing it; a slack one goes green
+  immediately and feels finished.
+
+Also worth naming: **the deny-list guards identifiers, not values.** The real-shape
+fixture was first written with faithfully-copied SHAPES and faithfully-copied NUMBERS —
+real amounts, real dates, the export's real document id — and passed the deny-list scan
+cleanly, because the list holds account numbers and tickers and those had all been
+fabricated. Caught by diffing the fixture's tokens against the real export's, which is
+the check that actually matches the rule ("real values that look boring are still real"):
+
+```
+python3 - <<'EOF'   # run before committing anything derived from a real export
+import re, pathlib
+real = pathlib.Path('imports/Accounts_History.csv').read_text(encoding='utf-8-sig')
+fix  = pathlib.Path('tests/fixtures/fidelity/real_shape_activity.csv').read_text(encoding='utf-8-sig')
+nums = lambda t: set(re.findall(r'-?\d+\.\d+|\b\d{2,}\b', t))
+print(sorted(nums(real) & nums(fix)))   # expect only calendar/structural fragments
+EOF
+```
 
 Also: synthetic fixtures cannot catch defects that live in a file format's real-world
 packaging. A UTF-8 BOM would have made a real Coinbase export import at 0%, and preamble
