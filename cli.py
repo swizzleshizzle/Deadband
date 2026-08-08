@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import pathlib
 import sys
+from datetime import UTC, datetime
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
@@ -15,6 +16,7 @@ from db.pool import create_pool
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
+from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
 async def cmd_migrate(_args) -> int:
@@ -108,7 +110,25 @@ async def cmd_accounts_add(args) -> int:
 async def cmd_import(args) -> int:
     importer = get_importer(args.venue)
     batch = importer.parse(pathlib.Path(args.file).read_text())
+    return await _preview_or_commit(importer.venue, batch, args)
 
+
+async def _preview_or_commit(venue: str, batch: ImportBatch, args) -> int:
+    """The three-phase body every entry point (`import`, `sync`) shares.
+
+    `venue` is deliberately NOT always the parsing importer's own `.venue`
+    identity: `cmd_sync` parses with the "coinbase-api" importer (fills
+    only, no per-row account ref) but accounts are registered under the
+    plain "coinbase" venue -- the same account a `deadband import coinbase
+    ...` CSV run would target. `venue` here is "the venue accounts are
+    registered under, that this batch should route/match against" -- for
+    `cmd_import` that happens to equal the importer's own identity (the
+    importer's venue IS the account venue for every CSV importer), but the
+    two are conceptually distinct, and `cmd_sync` is the case where they
+    diverge. Keeping this one function (rather than a second copy of the
+    preview/commit body for `sync`) is what the plan's "no second, parallel
+    write path" constraint requires.
+    """
     print(f"parsed {len(batch.fills)} fills, {len(batch.cash)} cash movements")
     for w in batch.warnings:
         print(f"  warning: {w}", file=sys.stderr)
@@ -182,7 +202,7 @@ async def cmd_import(args) -> int:
                     # mechanism --commit uses, reused rather than reinvented so
                     # the probe never disagrees with --commit about where a row
                     # lands.
-                    plan = await route_batch(conn, importer.venue, batch)
+                    plan = await route_batch(conn, venue, batch)
                     targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
                     if (unrouted.fills or unrouted.cash) and args.account:
@@ -250,7 +270,7 @@ async def cmd_import(args) -> int:
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            plan = await route_batch(conn, importer.venue, batch)
+            plan = await route_batch(conn, venue, batch)
 
             # Same "refuse the whole batch, write nothing" shape as the
             # unknown-ref refusal below. See ImportBatch.blocking's
@@ -295,10 +315,10 @@ async def cmd_import(args) -> int:
                 # account belonging to a different venue — that would permanently
                 # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
                 # path to undo it.
-                if account["venue"] != importer.venue:
+                if account["venue"] != venue:
                     print(
                         f"error: account {account_id} is a {account['venue']!r} account; "
-                        f"refusing to commit a {importer.venue!r} import to it",
+                        f"refusing to commit a {venue!r} import to it",
                         file=sys.stderr,
                     )
                     return 2
@@ -378,6 +398,56 @@ async def cmd_import(args) -> int:
         f"{cash_inserted} cash movements, {trades_regrouped} trades regrouped"
     )
     return 0
+
+
+def _parse_sync_bound(raw: str | None) -> datetime | None:
+    """--start/--end are ISO-8601 strings on the CLI; fetch_all_fills wants a
+    datetime and calls .astimezone(UTC) on whichever it's given. A bound
+    with no offset is anchored to UTC here rather than left for
+    astimezone() to silently treat as the local zone -- the venue API's own
+    sequence_timestamp is UTC, so reinterpreting a bare bound as local time
+    would shift the requested window with no error at all."""
+    if raw is None:
+        return None
+    dt = datetime.fromisoformat(raw)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+async def cmd_sync(args) -> int:
+    """Fetch fills from a venue API and run them through the exact same
+    preview/commit body `cmd_import` uses (`_preview_or_commit`) -- `sync`
+    differs from `import` only in where the text comes from (an API call
+    instead of a file on disk). Never grows its own write path.
+    """
+    if args.venue != "coinbase":
+        # Unreachable: argparse's `choices=["coinbase"]` on the `venue`
+        # positional rejects anything else before cmd_sync is ever called.
+        raise ValueError(f"unknown sync venue {args.venue!r}")
+
+    try:
+        creds = CoinbaseCredentials.from_env()
+    except RuntimeError as exc:
+        # Fail loud: absent or rejected credentials must surface as an
+        # error and a non-zero exit, never as a request that silently runs
+        # unauthenticated and reports "0 fills found" (spec §10 gap 5).
+        # Raised as SystemExit (rather than returned) so a caller driving
+        # cmd_sync directly -- not through main()'s asyncio.run wrapper --
+        # still gets a hard stop instead of a return code it could ignore.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+    text = await fetch_all_fills(
+        creds,
+        start=_parse_sync_bound(args.start),
+        end=_parse_sync_bound(args.end),
+    )
+    importer = get_importer("coinbase-api")
+    batch = importer.parse(text)
+    # "coinbase", not importer.venue ("coinbase-api"): see _preview_or_commit's
+    # docstring -- accounts are registered under the plain "coinbase" venue,
+    # never under the API importer's own identity, so routing/account-match
+    # must be checked against that, not against what parsed the document.
+    return await _preview_or_commit("coinbase", batch, args)
 
 
 async def cmd_regroup(args) -> int:
@@ -474,6 +544,16 @@ def main() -> int:
         ),
     )
     p_import.set_defaults(fn=cmd_import)
+
+    p_sync = sub.add_parser("sync", help="fetch from a venue API and import")
+    p_sync.add_argument("venue", choices=["coinbase"])
+    p_sync.add_argument(
+        "--account", required=True, help="account UUID: the API carries no per-row account ref"
+    )
+    p_sync.add_argument("--start", help="ISO-8601 lower bound on sequence_timestamp")
+    p_sync.add_argument("--end", help="ISO-8601 upper bound on sequence_timestamp")
+    p_sync.add_argument("--commit", action="store_true", help="write to the database")
+    p_sync.set_defaults(fn=cmd_sync)
 
     p_regroup = sub.add_parser("regroup")
     p_regroup.add_argument("--account", required=True)

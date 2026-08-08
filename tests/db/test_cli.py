@@ -372,6 +372,67 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     )
 
 
+# --- Task 5: `deadband sync coinbase` must reuse this exact venue-match/
+# --- routing check, not a parallel copy of it -- and the check must not
+# --- mistake the PARSING importer's own identity ("coinbase-api") for the
+# --- venue accounts are registered under ("coinbase"). Before cmd_sync
+# --- passed "coinbase" (not get_importer("coinbase-api").venue) into the
+# --- shared preview/commit body, this would refuse every real account with
+# --- "account ... is a 'coinbase' account; refusing to commit a
+# --- 'coinbase-api' import to it" -- sync could never commit anything, ever,
+# --- against any account a user could actually create. -----------------
+
+
+async def test_sync_commits_fills_to_a_real_coinbase_venue_account(conn, monkeypatch, capsys):
+    """End-to-end proof that `sync coinbase --commit` reaches a real account:
+    fetch (faked) -> parse -> the shared preview/commit body -> insert. Fails
+    if cmd_sync compares the account's venue against the coinbase-api
+    importer's own `.venue` ("coinbase-api") instead of the plain "coinbase"
+    accounts are actually registered under -- that mismatch would print the
+    "refusing to commit" error below and rc would be 2, with zero fills
+    inserted, for every account this test (or a real user) could construct."""
+    acc = await create_account(conn, name="T", venue="coinbase", account_type="wallet")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_fetch(creds, **kw):
+        import json
+
+        return json.dumps(
+            {
+                "fills": [
+                    {
+                        "trade_id": "sync-t1",
+                        "order_id": "sync-o1",
+                        "trade_time": "2026-06-01T00:00:00Z",
+                        "price": "100.00",
+                        "size": "2",
+                        "size_in_quote": False,
+                        "commission": "0.10",
+                        "product_id": "BTC-USD",
+                        "side": "BUY",
+                    }
+                ],
+                "cursor": "",
+            }
+        )
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "fetch_all_fills", fake_fetch)
+    monkeypatch.setenv("COINBASE_API_KEY", "k")
+    monkeypatch.setenv("COINBASE_API_SECRET", "pem")
+
+    args = argparse.Namespace(
+        venue="coinbase", account=str(acc), start=None, end=None, commit=True
+    )
+    rc = await cli.cmd_sync(args)
+
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+
+
 # --- Item 7: cmd_regroup must surface an unknown account the same clean way
 # --- cmd_import already does, not as a raw ValueError('None is not a valid
 # --- TradeIntent') traceback that never names the account. -----------------
