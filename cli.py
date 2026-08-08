@@ -711,9 +711,13 @@ async def cmd_positions(args) -> int:
         # truncated for the same reason the symbol column isn't: a
         # truncated account name can read as a different, shorter-named
         # account that happens to exist, which is a wrong answer dressed as
-        # a real one, whereas an overflowing column is only ugly.
+        # a real one, whereas an overflowing column is only ugly. An
+        # explicit space follows it (unlike the symbol column, which relies
+        # on the estimated marker's own leading space) so a name at or past
+        # the 15-char width still can't run straight into the quantity
+        # column with no gap at all.
         print(
-            f"{p.symbol:<21}{estimated} {p.account_name:<15}{qty_col:>14} {basis_col:>14} "
+            f"{p.symbol:<21}{estimated} {p.account_name:<15} {qty_col:>14} {basis_col:>14} "
             f"{mark_col:>22} {unreal}"
         )
     if not positions:

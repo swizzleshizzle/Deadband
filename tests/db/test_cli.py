@@ -1471,10 +1471,13 @@ async def _second_open_trade_on(conn, acc, inst, *, direction, quantity, basis, 
 
     It is nonetheless a real database state: an unregrouped import, a manual
     trade (`grouping_mode = 'manual'`), or a partially applied regroup all
-    leave two open trades on one instrument, and `aggregate_positions` groups
-    strictly by instrument, so the two land in one position. That is the only
-    way to reach the compound arithmetic (a summed quantity, a weighted basis
-    across both) the fabricated-figure and precision findings are about.
+    leave two open trades on one instrument. `aggregate_positions` groups by
+    (account, instrument), not instrument alone, so these two land in one
+    position because `acc` (passed in by every caller below) is the SAME
+    account both times -- not because the instrument alone is enough. That is
+    the only way to reach the compound arithmetic (a summed quantity, a
+    weighted basis across both) the fabricated-figure and precision findings
+    are about.
 
     The fill is real and anchors `opening_fill_id`, so the LEFT JOIN in
     db/positions.py resolves the instrument normally -- this is NOT the
@@ -2035,13 +2038,17 @@ async def test_positions_unscoped_shows_one_row_per_account_not_a_blend(
     rc = await cli.cmd_positions(_positions_args(account=None))
     assert rc == 0, capsys.readouterr().err
     out = capsys.readouterr().out
-    lines = out.splitlines()
+    # The test database is shared and persistent, so an unscoped call can see
+    # other committed data -- filtered to this fixture's own symbol, the same
+    # pattern as tests/db/test_positions.py's
+    # test_two_orphaned_trades_in_different_accounts_do_not_merge_when_unscoped.
+    # A bare `len(lines) == 2` would only pass by accident of the database
+    # happening to hold nothing else right now.
+    shrd_lines = [line for line in out.splitlines() if line.startswith("SHRD")]
 
-    assert len(lines) == 2
-    assert "mixed direction" not in out
-    tax_line = next(line for line in lines if "Taxable" in line)
-    ret_line = next(line for line in lines if "Retirement" in line)
-    assert tax_line.split()[0] == "SHRD"
-    assert ret_line.split()[0] == "SHRD"
+    assert len(shrd_lines) == 2
+    assert not any("mixed direction" in line for line in shrd_lines)
+    tax_line = next(line for line in shrd_lines if "Taxable" in line)
+    ret_line = next(line for line in shrd_lines if "Retirement" in line)
     assert tax_line.split()[2] == "10.00"  # quantity, not blended with the other leg
     assert ret_line.split()[2] == "4.00"

@@ -225,10 +225,18 @@ async def test_a_trade_whose_opening_fill_was_deleted_is_reported_not_dropped(
 ):
     """A protected trade has opening_fill_id NULL, so it cannot be joined to
     an instrument. Dropping it would understate the account's exposure with
-    nothing saying so."""
+    nothing saying so.
+
+    Also pins the seam this task touched: the instrument join failing (hence
+    `unvaluable_reason`) must not take the account join down with it. That
+    join is a plain, non-orphaning INNER JOIN on trade.account_id, which is
+    NOT NULL and always reachable -- unlike the instrument join, there is no
+    "protected" state for it to fail into."""
     ps = await open_positions(conn, orphaned_trade_account)
     assert len(ps) == 1
     assert ps[0].unvaluable_reason is not None
+    assert ps[0].account_id == orphaned_trade_account
+    assert ps[0].account_name == "Orphan"
 
 
 async def test_an_empty_symbol_is_not_labelled_an_unknown_instrument(conn):
@@ -280,6 +288,10 @@ async def test_two_orphaned_trades_in_the_same_account_are_two_rows(conn):
     assert {p.instrument_id for p in ps} == {id1, id2}
     assert all(p.trade_count == 1 for p in ps)
     assert all(p.unvaluable_reason is not None for p in ps)
+    # The instrument join failing on both rows must not take the account
+    # join down with it -- both still carry the one real account they share.
+    assert all(p.account_id == acc for p in ps)
+    assert all(p.account_name == "TwoOrphans" for p in ps)
 
 
 async def test_two_orphaned_trades_in_different_accounts_do_not_merge_when_unscoped(conn):
