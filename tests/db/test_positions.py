@@ -199,6 +199,47 @@ async def test_two_orphaned_trades_in_different_accounts_do_not_merge_when_unsco
 
     assert id1 in by_id
     assert id2 in by_id
-    assert by_id[id1] is not by_id[id2]
+    # trade_count == 1 on each, not the "is not" identity check the two `in`
+    # lookups above would already make trivially true, is what actually
+    # proves they did not merge into a single combined row.
     assert by_id[id1].trade_count == 1
     assert by_id[id2].trade_count == 1
+
+
+async def test_an_orphaned_trade_with_a_real_quantity_is_still_unvaluable(conn):
+    """A trade can lose its opening fill (the composite FK's
+    ON DELETE SET NULL) without ever going through regroup_account's
+    protection step -- e.g. a future delete-a-fill action with no immediate
+    regroup. In that state open_quantity is NOT NULL: nothing in the schema
+    ties nulling opening_fill_id to nulling open_quantity, and today's other
+    fixtures never exercise it because they always regroup afterward. If
+    open_positions forwarded that real quantity, the resulting row would
+    show a real, priceable-looking number under a trade-id standing in for
+    an instrument id -- a wrong number presented as a real one. It must be
+    unvaluable with no quantity instead."""
+    acc = await create_account(conn, name="RealQty", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="RLQT", quote_currency="USD"),
+    )
+    fill = _fill(acc, inst, side=Side.BUY, quantity="7", price="10", ref="rq1")
+    await insert_fills(conn, [fill])
+    await regroup_account(conn, acc)
+    trade = (await list_trades(conn, acc))[0]
+    assert trade["open_quantity"] == Decimal("7")
+
+    # No notes, no second regroup -- just the FK firing on its own, which is
+    # the exact state db/trades.py's protection step never gets a chance to
+    # touch.
+    await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
+
+    orphaned = (await list_trades(conn, acc))[0]
+    assert orphaned["opening_fill_id"] is None
+    assert orphaned["open_quantity"] == Decimal("7")  # confirms this is real, not already NULL
+    assert orphaned["status"] == "open"
+
+    ps = await open_positions(conn, acc)
+
+    assert len(ps) == 1
+    assert ps[0].unvaluable_reason is not None
+    assert ps[0].quantity == Decimal(0)  # the real 7 must NOT be reported

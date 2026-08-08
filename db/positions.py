@@ -29,6 +29,7 @@ _SQL = """
        AND ($1::uuid IS NULL OR t.account_id = $1)
 """
 
+
 async def open_positions(
     conn: asyncpg.Connection, account_id: UUID | None = None
 ) -> tuple[OpenPosition, ...]:
@@ -48,23 +49,33 @@ async def open_positions(
             # This is a deliberate lie of type -- a trade id standing in
             # where an instrument id belongs -- but it never leaks past this
             # module: nothing here (or in ledger/positions.py) uses
-            # `instrument_id` to look up an instrument or a mark directly,
-            # and every row built this way also has open_quantity/
-            # open_cost_basis NULL (the only path to a NULL joined instrument
-            # is opening_fill_id IS NULL, which db/trades.py's protection
-            # step always nulls those two columns alongside), so
-            # `aggregate_positions` always sets `unvaluable_reason` on it. A
+            # `instrument_id` to look up an instrument or a mark directly.
+            # Trade ids and instrument ids are drawn from the same
+            # gen_random_uuid() space but are never cross-inserted, so a
             # future caller (e.g. Task 3's mark lookup) that fetches marks
             # for these instrument_ids will simply find no matching mark row
-            # -- trade ids and instrument ids are drawn from the same
-            # gen_random_uuid() space but are never cross-inserted, so this
-            # is a safe miss, not a silent collision.
+            # -- a safe miss, not a silent collision.
             instrument_id=r["instrument_id"] or r["id"],
             symbol=r["symbol"] or "(unknown instrument)",
             multiplier=r["multiplier"] if r["multiplier"] is not None else Decimal(1),
             direction=Direction(r["direction"]),
-            open_quantity=r["open_quantity"],
-            open_cost_basis=r["open_cost_basis"],
+            # When the instrument is unreachable, quantity/cost_basis are
+            # forced to None HERE rather than forwarded from the row,
+            # deliberately not relying on them already being NULL. Today
+            # every db/trades.py path that nulls opening_fill_id also nulls
+            # these two columns, but nothing enforces that pairing -- no
+            # CHECK ties them together, and the FK's ON DELETE SET NULL only
+            # touches opening_fill_id. The day a delete-a-fill action or an
+            # import-undo runs without an immediate regroup_account, a trade
+            # could carry a real, non-NULL open_quantity while its
+            # instrument is unreachable, and forwarding it here would render
+            # a wrong number as a real position under a trade-id standing in
+            # for an instrument id. Forcing None instead makes the
+            # "unreachable instrument" case unconditionally unvaluable: if we
+            # cannot say which instrument a quantity belongs to, we cannot
+            # report that quantity as a position in one.
+            open_quantity=r["open_quantity"] if r["instrument_id"] is not None else None,
+            open_cost_basis=r["open_cost_basis"] if r["instrument_id"] is not None else None,
             is_estimated=r["is_estimated"],
         )
         for r in records
