@@ -23,6 +23,14 @@
       "trade_type": "FILL", "price": "0.9998", "size": "500",
       "size_in_quote": true, "commission": "0.50",
       "product_id": "USDC-USD", "side": "BUY", "liquidity_indicator": "TAKER"
+    },
+    {
+      "entry_id": "e4", "trade_id": "t4", "order_id": "o4",
+      "trade_time": "2026-05-14T10:00:00.000Z",
+      "sequence_timestamp": "2026-05-14T10:00:00.500Z",
+      "trade_type": "FILL", "price": "0.00001234", "size": "1234567890.12345678",
+      "size_in_quote": false, "commission": "1.00",
+      "product_id": "SHIB-USD", "side": "BUY", "liquidity_indicator": "TAKER"
     }
   ],
   "cursor": ""

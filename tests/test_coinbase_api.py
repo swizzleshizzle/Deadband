@@ -51,11 +51,37 @@ def test_size_in_quote_blocks_rather_than_recording_a_wrong_quantity():
 
 def test_money_fields_never_become_floats():
     """Coinbase quotes its money fields today. If it ever stops for one of
-    them, parse_float=Decimal is what keeps a float out of the pipeline."""
-    unquoted = FIXTURE.replace('"price": "61250.44"', '"price": 61250.44')
-    f = CoinbaseAPIImporter().parse(unquoted).fills[0]
-    assert isinstance(f.price, Decimal)
-    assert f.price == Decimal("61250.44")
+    them, parse_float=Decimal is what keeps a float out of the pipeline.
+
+    This test previously targeted the BTC fill's `price: "61250.44"` (7
+    significant figures) and only asserted `isinstance(f.price, Decimal)`.
+    That value round-trips exactly through `float`:
+    `str(float("61250.44")) == "61250.44"`. Because `_decimal()` builds
+    every Decimal via `Decimal(str(raw))` regardless of `raw`'s original
+    type, that round-trip meant the mutant with `parse_float=Decimal`
+    removed still produced a `Decimal` equal to the expected value -- the
+    assertion could not fail no matter which code path built it. That is
+    the "assertion that cannot fail" defect this project has shipped
+    before: a green test watching nothing.
+
+    `float` holds ~15-17 significant decimal digits. The fix is a fixture
+    value with more precision than that, in a shape Coinbase genuinely
+    produces: a high-supply token (SHIB/PEPE-style) trading in the billions
+    of units at 8 decimal places. `t4`'s `size`, "1234567890.12345678", has
+    18 significant figures and is genuinely float-lossy --
+    `float("1234567890.12345678")` rounds to `1234567890.1234567`, a
+    different number -- so this assertion goes red when
+    `parse_float=Decimal` is removed. Do not shrink this back to a short,
+    round-tripping literal; that is exactly what made the original version
+    decorative.
+    """
+    unquoted = FIXTURE.replace(
+        '"size": "1234567890.12345678"', '"size": 1234567890.12345678'
+    )
+    fills = CoinbaseAPIImporter().parse(unquoted).fills
+    f = next(x for x in fills if x.venue_fill_id == "t4")
+    assert isinstance(f.quantity, Decimal)
+    assert f.quantity == Decimal("1234567890.12345678")
 
 
 def test_an_empty_document_is_empty_not_an_error():
