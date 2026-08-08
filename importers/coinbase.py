@@ -9,7 +9,6 @@ from decimal import Decimal, InvalidOperation
 
 from importers.base import (
     CanonicalCash,
-    CanonicalFill,
     ImportBatch,
     normalize_field,
     zero_amount_warning,
@@ -90,7 +89,12 @@ class CoinbaseImporter:
     account_venue = "coinbase"
 
     def parse(self, text: str) -> ImportBatch:
-        fills: list[CanonicalFill] = []
+        # M8: no `fills` accumulator any more. Since the gap-6 cut-over (below)
+        # this importer emits CASH ONLY -- every trade row is reported and
+        # points at `sync coinbase`. The empty list that used to be built here
+        # and returned as `fills=tuple(fills)` was the last vestige of the
+        # retired fill path, and it made the cut-over invisible at a glance.
+        # ImportBatch.fills defaults to (), which is now the honest statement.
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
@@ -252,7 +256,6 @@ class CoinbaseImporter:
                 )
 
         return ImportBatch(
-            fills=tuple(fills),
             cash=tuple(cash),
             warnings=tuple(warnings),
             unmapped_rows=tuple(unmapped),
