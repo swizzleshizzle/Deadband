@@ -1247,6 +1247,21 @@ def test_marks_set_requires_exactly_one_of_symbol_or_natural_key(monkeypatch):
         cli.main()
 
 
+def test_marks_set_price_help_states_the_unit(monkeypatch, capsys):
+    """Final-review finding (M1): `--price` was the only argument in this
+    parser with no help= at all, and its unit is not guessable. For an option
+    the correct input is the per-share premium (2.50), not the per-contract
+    cost (250) -- entering the latter silently produces a 100x wrong
+    unrealized P&L, which is Important 3's failure reached through user
+    input rather than through a dropped multiplier."""
+    monkeypatch.setattr("sys.argv", ["deadband", "marks", "set", "--help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    help_text = capsys.readouterr().out
+    assert "multiplier" in help_text
+    assert "quote currency" in help_text
+
+
 async def test_marks_set_defaults_as_of_to_now_when_omitted(
     conn, monkeypatch, an_instrument_named_zxco, capsys
 ):
