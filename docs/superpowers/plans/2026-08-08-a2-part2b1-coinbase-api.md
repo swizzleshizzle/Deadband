@@ -1027,6 +1027,28 @@ git commit -m "docs: Coinbase API credentials and the remaining cash-import gap"
 
 ---
 
+## Amendments made during execution
+
+The code blocks above are the plan as written. Review caught three defects **in this
+plan's own template code**, each of which contradicted the plan's own Global
+Constraints. If you re-run these tasks from the text above, apply these first — the
+committed code is correct, this document is the artifact that lagged.
+
+| Task | Defect in the template | Constraint it violated | Fixed in |
+|---|---|---|---|
+| 2 | `test_money_fields_never_become_floats` used a 7-significant-figure fixture price, which round-trips exactly through `float`. The test could not fail. | "Tests must be able to fail" | `8a18067` |
+| 2 | `reject()` accepted `idx` and never used it, so two malformed rows produced identical blocking messages. `product_id` was not stripped while the adjacent `side` was. | Fail loud (a rejection you cannot attribute); the named twin-invariant defect | `8234ccb` |
+| 3 | `body.get("fills") or []` — a 200 response missing `fills` silently became an empty terminal page, returning a partial result that looked complete. Same pattern in `importers/coinbase_api.py`. | "Fail loud, never fail empty" — the exact §10 gap 5 shape this subsystem exists to prevent | `3687969` |
+| 3 | `CoinbaseCredentials` rendered the PEM private key in its generated `__repr__`. | "No credential value may leak into an exception message or log line" | `3687969` |
+| 3 | The repeating-cursor test distinguished its guard from `_MAX_PAGES` only by matching the word "cursor" — a lexical coincidence. | "Tests must be able to fail" | `3687969` |
+
+The pattern worth carrying forward: every one of these was a *constraint stated correctly
+in prose and then violated by the code written beneath it*. A plan's Global Constraints
+section is not decoration, and the code blocks under it deserve the same review the
+implementation gets.
+
+---
+
 ## Self-Review
 
 **Spec coverage.** A2-16 (Advanced Trade fills source) → Tasks 1–3, 5. §10 gap 6 (cut-over) → Task 4, precondition re-checked in Task 5 Step 1. §10 gap 5 (credentials, fail-loud) → Task 3, Task 7. §9's "gated against a mutant" → a mutation step in every code task. **Deliberately not covered:** A2-16's claim that the API replaces the CSV importer wholesale — contradicted by the endpoint surface, see the deviation note, and the residue is recorded as a new gap in Task 7.
