@@ -84,5 +84,29 @@ def test_positions_are_grouped_by_instrument_and_stably_ordered():
     assert [p.trade_count for p in ps] == [2, 1]
 
 
+def test_symbol_collision_is_broken_by_instrument_id_not_insertion_order():
+    """`instrument.symbol` is NOT unique in this schema -- only
+    `instrument.natural_key` is (see ledger/types.py:instrument_natural_key,
+    e.g. the same ticker on two chains, or a delisted-and-relisted equity).
+    Two instruments can legitimately share a symbol, and when they do, the
+    `str(instrument_id)` tiebreaker in the sort key is the only thing making
+    the output order deterministic. Without it, sort falls back to whatever
+    order plain dict iteration happened to produce, so `deadband positions`
+    could print the two rows in a different order on two runs over identical
+    data -- a spurious diff for the user, and an intermittent failure for any
+    test that isn't careful, both miserable to track down.
+
+    The input below inserts I2 before I1, the OPPOSITE of the expected
+    (sorted-by-instrument_id) output order, so insertion order and correct
+    order genuinely disagree. A test that inserted them in id order could
+    pass by accident even with the tiebreaker removed.
+    """
+    ps = aggregate_positions([
+        row(instrument_id=I2, symbol="DUPE"),
+        row(instrument_id=I1, symbol="DUPE"),
+    ])
+    assert [p.instrument_id for p in ps] == [I1, I2]
+
+
 def test_no_rows_is_no_positions_not_an_error():
     assert aggregate_positions([]) == ()
