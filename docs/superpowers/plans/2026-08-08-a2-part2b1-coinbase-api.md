@@ -93,6 +93,7 @@ from datetime import UTC, datetime
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from venues.coinbase_auth import build_jwt
@@ -106,9 +107,9 @@ def _keypair():
     a public repo is a leaked credential even when it opens nothing."""
     key = ec.generate_private_key(ec.SECP256R1())
     pem = key.private_bytes(
-        encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["x"]).Encoding.PEM,
-        format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["x"]).PrivateFormat.PKCS8,
-        encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization", fromlist=["x"]).NoEncryption(),
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
     ).decode()
     return pem, key.public_key()
 
