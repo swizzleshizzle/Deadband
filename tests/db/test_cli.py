@@ -14,9 +14,11 @@ import pytest_asyncio
 
 import cli
 from db.accounts import create_account
+from db.fills import insert_fills
 from db.instruments import upsert_instrument
-from db.marks import latest_marks
-from ledger.types import AssetClass, Instrument
+from db.marks import latest_marks, set_mark
+from db.trades import regroup_account
+from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -1418,3 +1420,180 @@ async def test_marks_set_refuses_an_as_of_just_outside_the_future_tolerance(
     assert rc == 2
     assert "future" in capsys.readouterr().err.lower()
     assert await latest_marks(conn, [an_instrument_named_zxco]) == {}
+
+
+# --- cmd_positions -----------------------------------------------------------
+
+
+def _position_fill(acc, inst, *, side, quantity, price, ref):
+    """Same shape as tests/db/test_positions.py's own `_fill` helper --
+    reused conceptually, not imported, since that module keeps it private
+    and this file already owns its Fill-building conventions (see the marks
+    fixtures above)."""
+    return Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=datetime(2026, 8, 1, 9, 0, tzinfo=UTC),
+        side=side,
+        quantity=Decimal(quantity),
+        price=Decimal(price),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id=ref,
+        is_estimated=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def marked_position_account(conn):
+    """One account, one open long of 10 ZXCO at an average cost of 18.20,
+    marked fresh (now) -- (24.50 - 18.20) * 10 * 1 == 63.00, the exact figure
+    test_positions_shows_unrealized_where_a_mark_exists pins."""
+    acc = await create_account(conn, name="Marked", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="10", price="18.20", ref="pos-mk1")],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("24.50"), datetime.now(UTC))
+    return acc
+
+
+@pytest_asyncio.fixture
+async def unmarked_account(conn):
+    """One open position with no mark recorded at all -- latest_marks must
+    report it absent, not zero, and cmd_positions must render a placeholder,
+    never "0.00" (which mark_price_chk permits as a genuine price)."""
+    acc = await create_account(conn, name="Unmarked", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="NOMK", quote_currency="USD"),
+    )
+    # price/quantity chosen so no rendered field's decimal point is preceded
+    # by a '0' digit (e.g. "50.00...") -- that would make the "0.00" absence
+    # assertion pass or fail by accident of formatting rather than substance.
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="3", price="17", ref="pos-um1")],
+    )
+    await regroup_account(conn, acc)
+    return acc
+
+
+@pytest_asyncio.fixture
+async def spread_account(conn):
+    """One open position whose trade is a SPREAD -- unrealized_pnl() raises
+    NotImplementedError for this direction, so it must be listed with its
+    reason, never priced and never dropped.
+
+    The auto-grouper never produces Direction.SPREAD (see
+    tests/test_grouping_properties.py's own assertion of that), so there is
+    no ordinary import path that creates one here; the trade's direction is
+    flipped directly after an ordinary regroup, the same way
+    tests/db/test_positions.py's orphaned-trade fixtures reach into trade
+    state regroup_account itself would never leave a trade in."""
+    acc = await create_account(conn, name="Spread", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SPRD", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="5", price="10", ref="pos-sp1")],
+    )
+    await regroup_account(conn, acc)
+    await conn.execute("UPDATE trade SET direction = 'spread' WHERE account_id = $1", acc)
+    return acc
+
+
+@pytest_asyncio.fixture
+async def stale_mark_account(conn):
+    """One open position marked well over a month before this suite's other
+    fixtures' clock (2026-08-xx) -- old enough that rendering it identically
+    to a fresh mark would be misleading."""
+    acc = await create_account(conn, name="Stale", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="STLE", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [_position_fill(acc, inst, side=Side.BUY, quantity="4", price="12", ref="pos-st1")],
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("15"), datetime(2026, 7, 1, tzinfo=UTC))
+    return acc
+
+
+def _positions_args(*, account=None):
+    """Namespace helper for cmd_positions. Kept separate from this file's
+    `_args` (marks' symbol/price/as_of shape) rather than overloading it --
+    `_args` is a bare module-level function name resolved at call time, so a
+    second definition later in this module would silently replace the first
+    for every earlier test too."""
+    return argparse.Namespace(account=account)
+
+
+async def test_positions_shows_unrealized_where_a_mark_exists(
+    conn, monkeypatch, marked_position_account, capsys
+):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(marked_position_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "ZXCO" in out
+    assert "63.00" in out  # (24.50 - 18.20) * 10 * 1
+
+
+async def test_positions_an_unmarked_one_shows_a_placeholder_not_a_zero(
+    conn, monkeypatch, unmarked_account, capsys
+):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(unmarked_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "--" in out
+    assert "0.00" not in out
+
+
+async def test_positions_an_unvaluable_one_is_listed_with_its_reason(
+    conn, monkeypatch, spread_account, capsys
+):
+    """A position omitted from a position listing is the silent-loss shape
+    this codebase keeps rediscovering."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(spread_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "spread" in out
+
+
+async def test_positions_the_marks_age_is_shown(conn, monkeypatch, stale_mark_account, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(stale_mark_account)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "2026-07-01" in out or "d ago" in out

@@ -12,12 +12,14 @@ from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.importing import commit_batch, probe_duplicates, route_batch
-from db.marks import resolve_instrument_by_symbol, set_mark
+from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
+from db.positions import open_positions
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
+from ledger.pnl import unrealized_pnl
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
@@ -578,6 +580,58 @@ async def cmd_trades(args) -> int:
     return 0
 
 
+async def cmd_positions(args) -> int:
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            positions = await open_positions(
+                conn, UUID(args.account) if args.account else None
+            )
+            marks = await latest_marks(conn, [p.instrument_id for p in positions])
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    for p in positions:
+        mark = marks.get(p.instrument_id)
+        # Gate on unvaluable_reason, NEVER on direction and NEVER by catching
+        # unrealized_pnl's NotImplementedError(SPREAD): a position can carry a
+        # real, single-valued direction and still be unvaluable for another
+        # reason (e.g. an unknown quantity on one contributing trade), and
+        # catching the exception here would also swallow a future genuine
+        # bug in unrealized_pnl itself. A position with a reason set is still
+        # printed -- never filtered out -- because a position missing from a
+        # position listing is this project's recurring silent-loss shape.
+        if p.unvaluable_reason is not None:
+            unreal, mark_col = f"n/a ({p.unvaluable_reason})", "--"
+        elif mark is None:
+            # Absent from `marks`, not a zero -- db.marks.latest_marks never
+            # reports a zero for an unmarked instrument (mark_price_chk
+            # permits a genuine 0.00, so a placeholder must be visibly
+            # different from that, not just "0.00" again).
+            unreal, mark_col = "--", "--"
+        else:
+            price, as_of = mark
+            unreal = str(
+                unrealized_pnl(p.quantity, p.cost_basis, price, p.multiplier, p.direction)
+            )
+            # The mark's age rides along in the same column as its price: a
+            # month-old mark must never render identically to one from a
+            # minute ago, so the as_of date is always shown, not just the
+            # price.
+            mark_col = f"{price} @{as_of:%Y-%m-%d}"
+        estimated = " ~" if p.is_estimated else "  "
+        print(
+            f"{p.symbol:<10}{estimated}{p.quantity:>14} {p.cost_basis:>12} "
+            f"{mark_col:>22} {unreal}"
+        )
+    if not positions:
+        print("no open positions")
+    return 0
+
+
 # latest_marks (db/marks.py) treats the newest as_of as "the current price"
 # with nothing else checking plausibility -- a fat-fingered year or a bad
 # backfill would otherwise silently become today's price and produce a wrong
@@ -751,6 +805,12 @@ def main() -> int:
     p_trades = sub.add_parser("trades")
     p_trades.add_argument("--account")
     p_trades.set_defaults(fn=cmd_trades)
+
+    p_positions = sub.add_parser(
+        "positions", help="open positions, with unrealized P&L where marked"
+    )
+    p_positions.add_argument("--account")
+    p_positions.set_defaults(fn=cmd_positions)
 
     p_marks = sub.add_parser("marks", help="manual price marks")
     marks_sub = p_marks.add_subparsers(dest="marks_command", required=True)
