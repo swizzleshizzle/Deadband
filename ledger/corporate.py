@@ -54,6 +54,11 @@ class CorporateAction:
         if self.action_type in {ActionType.MERGER, ActionType.SPINOFF, ActionType.SYMBOL_CHANGE}:
             if self.resulting_instrument_id is None:
                 raise ValueError(f"{self.action_type} requires resulting_instrument_id")
+        if self.resulting_instrument_id == self.instrument_id:
+            raise ValueError(
+                f"{self.action_type} cannot produce itself "
+                "(resulting_instrument_id == instrument_id)"
+            )
         if self.action_type is ActionType.SPINOFF:
             if self.basis_allocation is None:
                 raise ValueError("spinoff requires basis_allocation")

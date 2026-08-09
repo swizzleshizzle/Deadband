@@ -169,6 +169,41 @@ def test_zero_ratio_is_rejected():
         )
 
 
+def test_a_corporate_action_may_not_produce_its_own_instrument():
+    """resulting == instrument is nonsense: the action produces the thing it
+    consumes. It terminates safely today, but by coincidence of adjust_fills'
+    current shape rather than by design -- a self-referential spinoff would
+    allocate basis from an instrument to itself."""
+    for action_type, extra in (
+        (ActionType.MERGER, {}),
+        (ActionType.SPINOFF, {"basis_allocation": Decimal("0.2")}),
+        (ActionType.SYMBOL_CHANGE, {}),
+    ):
+        with pytest.raises(ValueError, match="itself|self"):
+            CorporateAction(
+                instrument_id=OLD,
+                action_type=action_type,
+                ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+                ratio_numerator=Decimal("1"),
+                ratio_denominator=Decimal("1"),
+                resulting_instrument_id=OLD,
+                **extra,
+            )
+
+
+def test_a_corporate_action_producing_a_different_instrument_is_accepted():
+    """The negative control: the guard must not reject legitimate actions."""
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("1"),
+        resulting_instrument_id=NEW,
+    )
+    assert action.resulting_instrument_id == NEW
+
+
 def test_precision_pinning_produces_exact_value():
     """I5: At ctx.prec=50, 100/3 must equal '33.' + 48 threes exactly.
     Without precision pinning, this value depends on ambient precision."""
