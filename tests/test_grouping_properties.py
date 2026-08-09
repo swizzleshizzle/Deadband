@@ -1,5 +1,6 @@
 """Property-based tests for fill grouping invariants."""
 
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -9,11 +10,16 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from ledger.grouping import group_fills
+from ledger.pnl import compute_pnl
 from ledger.types import Direction, Fill, FillSource, Side, TradeStatus
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 INST = UUID("00000000-0000-0000-0000-0000000000b1")
 T0 = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+
+# Both fill strategies below emit a single instrument. A multiplier of 1 keeps
+# the comparison in price terms, which is what the independent walk computes.
+MULTIPLIERS = {INST: Decimal(1)}
 
 quantities = st.decimals(
     min_value=Decimal("0.01"), max_value=Decimal("1000"), places=2, allow_nan=False
@@ -230,3 +236,103 @@ def test_direction_matches_opening_fill_wide_magnitude(fills):
             assert g.direction is Direction.LONG
         else:  # Side.SELL
             assert g.direction is Direction.SHORT
+
+
+# --- Spec §9: grouping must conserve VALUE, not just quantity ----------------
+#
+# gross_realized_from_fills below is a second, deliberately separate
+# implementation of "total gross realized P&L for this set of fills". It must
+# not share code with the production path, or the property it feeds is green by
+# construction. Specifically it does NOT call group_fills, does NOT import
+# anything from ledger.pnl, and does not reuse ledger.grouping's position walk;
+# it re-derives trade boundaries itself from the signed position and computes
+# value with an explicit running average cost. It also works in exact rational
+# arithmetic (Fraction) rather than Decimal, so it borrows none of the
+# production path's precision conventions either.
+
+
+def gross_realized_from_fills(fills: list[Fill]) -> Fraction:
+    """Total gross realized P&L computed straight from the fills, no grouper.
+
+    Per (account, instrument), walk fills in time order maintaining a signed
+    position and the cost of the currently-open position. Every unit that is
+    closed contributes (exit_price - avg_cost) * qty, sign-flipped for shorts.
+    Basis resets to zero whenever position returns to flat, which is what makes
+    this comparable to a per-trade average-cost computation: the partition into
+    trades is exactly the set of flat-to-flat segments, so a continuous walk
+    that resets at flat is the partition-free statement of the same quantity.
+
+    Exact: Fraction never rounds, so any disagreement with the production sum
+    beyond the documented quantization is a real misattribution, not drift.
+    """
+    buckets: dict[tuple[UUID, UUID], list[Fill]] = defaultdict(list)
+    for f in fills:
+        buckets[(f.account_id, f.instrument_id)].append(f)
+
+    total = Fraction(0)
+    for key in sorted(buckets, key=lambda k: (str(k[0]), str(k[1]))):
+        position = Fraction(0)  # signed: + long, - short
+        basis = Fraction(0)  # cost of the open position, in price*qty terms
+        for f in sorted(buckets[key], key=_sort_key):
+            remaining = Fraction(f.quantity)
+            price = Fraction(f.price)
+            sign = 1 if f.side is Side.BUY else -1
+            while remaining > 0:
+                if position == 0 or (position > 0) == (sign > 0):
+                    # Opening or scaling in: the whole remainder joins the basis.
+                    basis += remaining * price
+                    position += sign * remaining
+                    remaining = Fraction(0)
+                else:
+                    # Reducing, possibly through zero. Only the part that fits
+                    # against the open position realizes P&L; any excess re-enters
+                    # the loop and opens a position the other way.
+                    closed = min(remaining, abs(position))
+                    avg_cost = basis / abs(position)
+                    if position > 0:
+                        total += (price - avg_cost) * closed
+                    else:
+                        total += (avg_cost - price) * closed
+                    basis -= avg_cost * closed
+                    position += sign * closed
+                    remaining -= closed
+                    if position == 0:
+                        basis = Fraction(0)
+    return total
+
+
+# ledger.pnl quantizes each trade's gross to this scale (_QUANT) before
+# returning it, so a sum over N trades can differ from the exact total by at
+# most N half-quanta. Restated here rather than imported: the whole point of
+# the helper above is not to share code with the thing it checks. The bound is
+# ~1e-17 for the 25-fill lists this strategy produces, while the smallest value
+# misattribution these strategies can express is (0.01 price) x (0.01 qty) =
+# 1e-4 -- thirteen orders of magnitude of daylight.
+_PNL_QUANTUM = Fraction(Decimal("1E-18"))
+
+
+@given(fill_lists())
+@settings(max_examples=200, deadline=None)
+def test_sum_of_per_trade_realized_pnl_equals_the_total_from_fills(fills):
+    """Spec §9. The only property tying GROUPING to VALUATION: every other
+    property in this file checks conservation within a single trade, so an
+    allocation that conserves quantity while misattributing value between two
+    trades is invisible to all of them.
+
+    Compared gross, not net: fee allocation across trades is its own convention
+    and folding it in here would make a failure ambiguous between two causes.
+    (The strategies emit fee=0 anyway, so gross is the whole story.)"""
+    by_id = {f.id: f for f in fills}
+    groups = group_fills(fills)
+    per_trade = sum(
+        (
+            Fraction(compute_pnl(g.allocations, by_id, MULTIPLIERS, g.direction).gross_realized_pnl)
+            for g in groups
+        ),
+        Fraction(0),
+    )
+    total = gross_realized_from_fills(fills)
+    assert abs(per_trade - total) <= _PNL_QUANTUM * len(groups), (
+        f"grouping moved {per_trade - total} of value: per-trade sum {per_trade} "
+        f"!= {total} computed directly from fills across {len(groups)} trades"
+    )
