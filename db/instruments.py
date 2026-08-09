@@ -14,19 +14,36 @@ from ledger.types import Instrument, instrument_natural_key
 async def upsert_instrument(conn: asyncpg.Connection, instrument: Instrument) -> UUID:
     """Insert or fetch by natural key. Two spellings of one contract collapse to one row.
 
-    `natural_key` is built from asset_class, underlying, expiry, strike,
-    option_right, quote_currency (and, for non-derivative rows, symbol or
-    contract_address/chain) -- see instrument_natural_key(). Those fields
-    cannot drift on an existing row by construction: a different value there
-    hashes to a different key, so it lands as a different row entirely
-    rather than a conflict on this one.
+    Which columns sit inside vs. outside the natural key is NOT fixed --
+    instrument_natural_key() varies it by asset_class (see ledger/types.py).
+    Whatever is inside the key cannot drift on an existing row by
+    construction: a different value there hashes to a different key, so it
+    lands as a different row entirely rather than a conflict on this one.
 
-    The remaining columns (symbol, root, chain, contract_address,
-    contract_multiplier) sit outside the key and were previously frozen at
-    whatever the first insert wrote -- so a wrong value was permanent. Of
-    these, contract_multiplier is the one that costs money: it silently
-    scales every option P&L on the instrument. All five are therefore
-    repainted from EXCLUDED on every upsert, not just symbol.
+    For the shapes this codebase currently mints -- option, equity, crypto
+    spot -- the key is asset_class, underlying, expiry, strike, option_right,
+    quote_currency (options) or asset_class, symbol/contract_address/chain,
+    quote_currency (equity, crypto spot). The columns repainted below
+    (symbol, root, chain, contract_address, contract_multiplier) are exactly
+    the ones outside that key, and were previously frozen at whatever the
+    first insert wrote -- so a wrong value was permanent. Of these,
+    contract_multiplier is the one that costs money: it silently scales
+    every option P&L on the instrument. All five are therefore repainted
+    from EXCLUDED on every upsert, not just symbol.
+
+    This scoping does NOT hold for every asset_class, and whoever adds the
+    next one must re-check it, not assume it:
+    - FUTURE puts `root` inside the key (see instrument_natural_key), so
+      repainting `root` there is a no-op, not a correction -- harmless, but
+      worth knowing before reading it as evidence root can drift.
+    - No asset_class currently repaints `underlying`, `strike`, or
+      `option_right` -- for OPTION rows that's correct, because those three
+      are inside the key and cannot drift. But if a future asset_class ever
+      puts any of them outside its key, they would freeze exactly the way
+      contract_multiplier used to, silently, with no test to catch it.
+    Today nothing mints FUTURE or CRYPTO_PERP instruments, so none of this
+    is live risk yet -- but it will be the first thing a futures importer
+    needs to get right.
 
     This restates history: repainting contract_multiplier changes how every
     existing fill on this instrument is valued, with no record that the
