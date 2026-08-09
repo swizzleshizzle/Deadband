@@ -117,7 +117,7 @@ In `CorporateAction.__post_init__`, immediately after the existing "requires res
 ```python
         if self.resulting_instrument_id == self.instrument_id:
             raise ValueError(
-                f"{self.action_type} cannot produce its own instrument "
+                f"{self.action_type} cannot produce itself "
                 "(resulting_instrument_id == instrument_id)"
             )
 ```
