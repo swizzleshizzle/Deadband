@@ -1,3 +1,4 @@
+import hashlib
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -80,6 +81,42 @@ def test_hash_escapes_percent_in_symbol():
     # (this would be a pathological real-world symbol, but tests the injectivity)
     h2 = content_hash(ACC, T, "A%7CB", "buy", Decimal("10"), Decimal("500"))
     assert h1 != h2, "escaped pipe must not collide with literal %7C in symbol"
+
+
+def test_hash_escapes_delimiter_in_side():
+    """The twin of test_hash_escapes_delimiter_in_symbol. `side` is escaped
+    in the implementation, and a gap note records the escaping as currently
+    non-exploitable -- but that proof rests on `side` being followed only by
+    numeric fields (quantity, price, occurrence), none of which can ever
+    render a literal '|'. Because of that, no pair of content_hash() calls
+    that vary only `side` can be made to collide today: the escaped symbol
+    to its left has no '|' either, so the boundary on both sides of `side`
+    is unambiguous regardless of what `side` contains, escaped or not. A
+    black-box collision test (the shape used for symbol) would therefore
+    stay green even with escaping removed entirely, proving nothing.
+
+    So this test instead pins the actual payload shape: it reconstructs the
+    expected pre-hash string by hand, with `side` escaped the way
+    importers/base.py documents doing it, and asserts content_hash() matches
+    that digest exactly. That makes the escaping load-bearing on its own
+    terms rather than on the accident of field order that currently masks
+    its absence -- if a future field lands after `side` with free-text
+    values, the escaping (or its removal) will already be under test here.
+    """
+    payload = "|".join(
+        [
+            str(ACC),
+            T.astimezone(UTC).isoformat(),
+            "ZXCO",
+            "buy%7Cx",  # "buy|x" with '|' escaped to '%7C', as _escape does
+            "1",
+            "1",
+            "0",
+        ]
+    )
+    expected = hashlib.sha256(payload.encode()).hexdigest()
+    actual = content_hash(ACC, T, "ZXCO", "buy|x", Decimal("1"), Decimal("1"))
+    assert actual == expected
 
 
 def test_hash_normalizes_timezones_to_utc():
