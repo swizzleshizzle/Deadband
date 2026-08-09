@@ -1,6 +1,5 @@
 """Property-based tests for fill grouping invariants."""
 
-from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -254,60 +253,87 @@ def test_direction_matches_opening_fill_wide_magnitude(fills):
 def gross_realized_from_fills(fills: list[Fill]) -> Fraction:
     """Total gross realized P&L computed straight from the fills, no grouper.
 
-    Per (account, instrument), walk fills in time order maintaining a signed
-    position and the cost of the currently-open position. Every unit that is
-    closed contributes (exit_price - avg_cost) * qty, sign-flipped for shorts.
-    Basis resets to zero whenever position returns to flat, which is what makes
-    this comparable to a per-trade average-cost computation: the partition into
-    trades is exactly the set of flat-to-flat segments, so a continuous walk
-    that resets at flat is the partition-free statement of the same quantity.
+    ASSUMES ONE (account, instrument). Both strategies in this file emit the
+    single pair (ACC, INST), so bucketing by key here would be a branch that
+    never runs twice -- untested code inside the thing whose only job is to be
+    trustworthy. The assertion below states the assumption instead of silently
+    relying on it. Cross-instrument value conservation is consequently NOT
+    covered by this oracle; giving it a second instrument means giving this
+    file a fill strategy that emits one.
+
+    Walk fills in time order maintaining a signed position and the cost of the
+    currently-open position. Every unit that is closed contributes
+    (exit_price - avg_cost) * qty, sign-flipped for shorts. Basis resets to
+    zero whenever position returns to flat, which is what makes this comparable
+    to a per-trade average-cost computation: the partition into trades is
+    exactly the set of flat-to-flat segments, so a continuous walk that resets
+    at flat is the partition-free statement of the same quantity.
 
     Exact: Fraction never rounds, so any disagreement with the production sum
     beyond the documented quantization is a real misattribution, not drift.
     """
-    buckets: dict[tuple[UUID, UUID], list[Fill]] = defaultdict(list)
-    for f in fills:
-        buckets[(f.account_id, f.instrument_id)].append(f)
+    assert len({(f.account_id, f.instrument_id) for f in fills}) <= 1, (
+        "gross_realized_from_fills handles a single (account, instrument); "
+        "it was handed more than one"
+    )
 
     total = Fraction(0)
-    for key in sorted(buckets, key=lambda k: (str(k[0]), str(k[1]))):
-        position = Fraction(0)  # signed: + long, - short
-        basis = Fraction(0)  # cost of the open position, in price*qty terms
-        for f in sorted(buckets[key], key=_sort_key):
-            remaining = Fraction(f.quantity)
-            price = Fraction(f.price)
-            sign = 1 if f.side is Side.BUY else -1
-            while remaining > 0:
-                if position == 0 or (position > 0) == (sign > 0):
-                    # Opening or scaling in: the whole remainder joins the basis.
-                    basis += remaining * price
-                    position += sign * remaining
-                    remaining = Fraction(0)
+    position = Fraction(0)  # signed: + long, - short
+    basis = Fraction(0)  # cost of the open position, in price*qty terms
+    for f in sorted(fills, key=_sort_key):
+        remaining = Fraction(f.quantity)
+        price = Fraction(f.price)
+        sign = 1 if f.side is Side.BUY else -1
+        while remaining > 0:
+            if position == 0 or (position > 0) == (sign > 0):
+                # Opening or scaling in: the whole remainder joins the basis.
+                basis += remaining * price
+                position += sign * remaining
+                remaining = Fraction(0)
+            else:
+                # Reducing, possibly through zero. Only the part that fits
+                # against the open position realizes P&L; any excess re-enters
+                # the loop and opens a position the other way.
+                closed = min(remaining, abs(position))
+                avg_cost = basis / abs(position)
+                if position > 0:
+                    total += (price - avg_cost) * closed
                 else:
-                    # Reducing, possibly through zero. Only the part that fits
-                    # against the open position realizes P&L; any excess re-enters
-                    # the loop and opens a position the other way.
-                    closed = min(remaining, abs(position))
-                    avg_cost = basis / abs(position)
-                    if position > 0:
-                        total += (price - avg_cost) * closed
-                    else:
-                        total += (avg_cost - price) * closed
-                    basis -= avg_cost * closed
-                    position += sign * closed
-                    remaining -= closed
-                    if position == 0:
-                        basis = Fraction(0)
+                    total += (avg_cost - price) * closed
+                basis -= avg_cost * closed
+                position += sign * closed
+                remaining -= closed
+                if position == 0:
+                    basis = Fraction(0)
     return total
 
 
 # ledger.pnl quantizes each trade's gross to this scale (_QUANT) before
-# returning it, so a sum over N trades can differ from the exact total by at
-# most N half-quanta. Restated here rather than imported: the whole point of
-# the helper above is not to share code with the thing it checks. The bound is
-# ~1e-17 for the 25-fill lists this strategy produces, while the smallest value
-# misattribution these strategies can express is (0.01 price) x (0.01 qty) =
-# 1e-4 -- thirteen orders of magnitude of daylight.
+# returning it. Restated here rather than imported: the whole point of the
+# helper above is not to share code with the thing it checks.
+#
+# The tolerance below is HALF a quantum per trade, not a whole one, and that is
+# a provable bound rather than an empirical margin: Decimal.quantize defaults to
+# ROUND_HALF_EVEN, so a single quantization moves a value by at most half the
+# quantum -- with equality only at an exact tie, which the <= admits -- and N
+# independent quantizations by at most N halves. The one gap in the proof is
+# that the prec=50 arithmetic performed before quantizing contributes a further
+# ~1e-40, so the bound could in principle be exceeded by a value sitting within
+# 1e-40 of an exact tie; that needs a ~50-significant-digit division result to
+# land exactly on the 19th decimal, which these strategies cannot produce.
+# Measured over 5000 examples: 3437 drift at all, and the worst observed was
+# 0.9999 of this bound, approaching the supremum from below without reaching
+# it. It is tight, which is the point of asserting it rather than a round
+# number: the whole justification for a tolerance is that it is small.
+#
+# Headroom against a real fault is comfortable but is NOT proven. The mutation
+# this property was gated against moved 5e-5, which is the smallest
+# misattribution actually observed, not a floor: two lots averaged together
+# halve the delta (which is exactly why 5e-5 and not the 1e-4 that
+# 0.01 price x 0.01 qty suggests), and average costs are arbitrary rationals,
+# so an adversarial construction could put two averages far closer together.
+# What can be said is that the bound is ~1e-17 for a 25-fill list, and that
+# every fault seen in practice has been many orders of magnitude above it.
 _PNL_QUANTUM = Fraction(Decimal("1E-18"))
 
 
@@ -315,9 +341,25 @@ _PNL_QUANTUM = Fraction(Decimal("1E-18"))
 @settings(max_examples=200, deadline=None)
 def test_sum_of_per_trade_realized_pnl_equals_the_total_from_fills(fills):
     """Spec §9. The only property tying GROUPING to VALUATION: every other
-    property in this file checks conservation within a single trade, so an
-    allocation that conserves quantity while misattributing value between two
-    trades is invisible to all of them.
+    property in this file checks conservation within a single trade.
+
+    READ THE LIMITATION BEFORE TRUSTING THIS. It does not close the whole
+    "quantity conserved, value misattributed" gap, and it is easy to assume it
+    does. For any FULLY CLOSED trade, gross reduces exactly to
+    (sum of closing-side notional - sum of opening-side notional), independent
+    of ordering, of averaging, and even of direction. Those terms are the same
+    terms whichever trade they are filed under, so they cancel in the sum: if
+    every trade closes, ANY repartition of the fills gives the same total and
+    this property sees nothing. Concretely, BUY 1@10, BUY 1@100, SELL 1@20,
+    SELL 1@300 partitioned two ways gives per-trade grosses [10, 200] or
+    [290, -80] -- a 280-unit misattribution -- and a total of 210 either way.
+
+    What survives the cancellation is exactly one thing: the RESIDUAL OPEN
+    POSITION'S COST BASIS, which depends on the averaging path and so on where
+    the grouper reset to flat. That is the entire discriminating quantity here.
+    This property is therefore sensitive only where a residual open position
+    exists, and catching a repartition among fully-closed trades needs a
+    per-trade oracle, not a total.
 
     Compared gross, not net: fee allocation across trades is its own convention
     and folding it in here would make a failure ambiguous between two causes.
@@ -332,7 +374,7 @@ def test_sum_of_per_trade_realized_pnl_equals_the_total_from_fills(fills):
         Fraction(0),
     )
     total = gross_realized_from_fills(fills)
-    assert abs(per_trade - total) <= _PNL_QUANTUM * len(groups), (
+    assert abs(per_trade - total) <= _PNL_QUANTUM * len(groups) / 2, (
         f"grouping moved {per_trade - total} of value: per-trade sum {per_trade} "
         f"!= {total} computed directly from fills across {len(groups)} trades"
     )
