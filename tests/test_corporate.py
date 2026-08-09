@@ -180,11 +180,19 @@ def test_a_corporate_action_may_not_produce_its_own_instrument():
     shape (an id round-tripped through the database, JSON, or a CLI argument
     is never the same object as the one in memory), so the guard must catch
     it by value, not by identity -- an `is` comparison here would be a live
-    bug, not a theoretical one."""
+    bug, not a theoretical one.
+
+    SPLIT is included precisely because it does NOT require a resulting id:
+    the guard lives outside the MERGER/SPINOFF/SYMBOL_CHANGE conditional on
+    purpose, since a self-referential id is meaningless on any action type
+    that carries one at all. Without this case, moving the check inside that
+    conditional -- a plausible "tidying" refactor -- would silently narrow
+    its scope and this test would not notice."""
     for action_type, extra in (
         (ActionType.MERGER, {}),
         (ActionType.SPINOFF, {"basis_allocation": Decimal("0.2")}),
         (ActionType.SYMBOL_CHANGE, {}),
+        (ActionType.SPLIT, {}),
     ):
         with pytest.raises(ValueError, match="itself|self"):
             CorporateAction(
