@@ -51,6 +51,20 @@ async def upsert_instrument(conn: asyncpg.Connection, instrument: Instrument) ->
     can never be corrected is worse -- but it is a real effect, tracked as
     a gap for a later task (an audit trail / migration is a separate,
     larger design question, not taken here).
+
+    That framing is one-directional and understates the risk: the same
+    repaint also runs when the caller got it right the first time and wrong
+    the second. contract_multiplier is now last-write-wins, and
+    Instrument.contract_multiplier defaults to Decimal(1) -- correct for
+    equity and crypto spot, silently 100x wrong for an option. Any future
+    caller that mints an AssetClass.OPTION instrument without explicitly
+    passing the multiplier will overwrite a correct 100 with 1 on this very
+    upsert, retroactively revaluing every fill on the instrument, with no
+    error and no log line. `Instrument.__post_init__` (ledger/types.py)
+    guards exactly this by requiring an explicit contract_multiplier for
+    OPTION instruments -- but that guard only fires at construction, so it
+    protects a future Instrument(...) call site, not a hand-built row or a
+    caller that constructs the object some other way.
     """
     key = instrument_natural_key(instrument)
     return await conn.fetchval(

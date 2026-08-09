@@ -100,6 +100,18 @@ def _ordered_actions(actions: Sequence[CorporateAction]) -> list[CorporateAction
             if a.resulting_instrument_id is not None:
                 produced[a.resulting_instrument_id].append(i)
 
+        # `if i != j` guards against a self-dependency: without it, an action
+        # that both targets instrument X and produces instrument X (i.e. `i`
+        # is `j` itself) would depend on itself and the topo-sort below would
+        # treat it as permanently un-ready, mistaking it for the circular
+        # case. That shape is now unreachable --
+        # CorporateAction.__post_init__ rejects resulting_instrument_id ==
+        # instrument_id unconditionally (gap #4, closed 2026-08-09) -- so this
+        # exclusion currently never fires. Left in rather than deleted: it is
+        # the "terminates safely by coincidence" mechanism that let this gap
+        # stay open before the constructor guard existed, and removing it
+        # would silently restore the old failure mode for any future path
+        # that builds a CorporateAction without going through __post_init__.
         deps = {
             j: {i for i in produced.get(b.instrument_id, []) if i != j} for j, b in enumerate(group)
         }

@@ -334,6 +334,11 @@ def gross_realized_from_fills(fills: list[Fill]) -> Fraction:
 # so an adversarial construction could put two averages far closer together.
 # What can be said is that the bound is ~1e-17 for a 25-fill list, and that
 # every fault seen in practice has been many orders of magnitude above it.
+#
+# This tolerance has no empirical slack, so a future change to _QUANT, the
+# rounding mode, or the number of quantizations per trade will fail this
+# test and LOOK like a misattribution. The printed magnitude is the tell:
+# ~1e-19 means a convention change, ~1e-5 or larger means a real fault.
 _PNL_QUANTUM = Fraction(Decimal("1E-18"))
 
 

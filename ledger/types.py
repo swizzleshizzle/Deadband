@@ -62,9 +62,29 @@ class Instrument:
     expiry: date | None = None
     option_right: str | None = None  # "call" | "put"
     root: str | None = None
-    contract_multiplier: Decimal = Decimal(1)
+    # None means "not supplied" and is resolved in __post_init__, not "no
+    # multiplier" -- Decimal has no way to represent an omitted value, so a
+    # sentinel is required to tell "caller left this out" (unsafe for an
+    # option) apart from "caller explicitly passed 1" (fine, if unusual).
+    contract_multiplier: Decimal | None = None
     chain: str | None = None
     contract_address: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.contract_multiplier is None:
+            if self.asset_class is AssetClass.OPTION:
+                # db/instruments.py's upsert now repaints contract_multiplier
+                # from every call (see its docstring): an omitted value here
+                # no longer just mints a wrong row once, it can silently
+                # overwrite a correct stored multiplier with the equity/spot
+                # default of 1 on a later import -- a 100x P&L error with no
+                # error and no log line. Loud beats silent, so this crashes.
+                raise ValueError(
+                    "OPTION instruments require an explicit contract_multiplier; "
+                    "there is no safe default (equity/crypto's default of 1 would "
+                    "silently misvalue every fill on this contract)"
+                )
+            object.__setattr__(self, "contract_multiplier", Decimal(1))
 
 
 @dataclass(frozen=True, slots=True)
