@@ -173,7 +173,14 @@ def test_a_corporate_action_may_not_produce_its_own_instrument():
     """resulting == instrument is nonsense: the action produces the thing it
     consumes. It terminates safely today, but by coincidence of adjust_fills'
     current shape rather than by design -- a self-referential spinoff would
-    allocate basis from an instrument to itself."""
+    allocate basis from an instrument to itself.
+
+    resulting_instrument_id is built as UUID(str(OLD)) rather than reused as
+    the same OLD object: a value-equal but distinct UUID is the realistic
+    shape (an id round-tripped through the database, JSON, or a CLI argument
+    is never the same object as the one in memory), so the guard must catch
+    it by value, not by identity -- an `is` comparison here would be a live
+    bug, not a theoretical one."""
     for action_type, extra in (
         (ActionType.MERGER, {}),
         (ActionType.SPINOFF, {"basis_allocation": Decimal("0.2")}),
@@ -186,7 +193,7 @@ def test_a_corporate_action_may_not_produce_its_own_instrument():
                 ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
                 ratio_numerator=Decimal("1"),
                 ratio_denominator=Decimal("1"),
-                resulting_instrument_id=OLD,
+                resulting_instrument_id=UUID(str(OLD)),
                 **extra,
             )
 
