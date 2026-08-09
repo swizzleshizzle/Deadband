@@ -102,6 +102,23 @@ def test_hash_escapes_delimiter_in_side():
     terms rather than on the accident of field order that currently masks
     its absence -- if a future field lands after `side` with free-text
     values, the escaping (or its removal) will already be under test here.
+
+    The hardcoded `payload` below is a deliberate STRUCTURAL PIN, not just
+    a convenient expected value. Because it is a full 7-field literal
+    compared as a whole hash, this test is sensitive to any change in the
+    payload's shape -- a field inserted anywhere, a reorder, a different
+    join character, a different digest -- not only to a regression in
+    escaping. If this test fails for a reason unrelated to `side`, that is
+    the signal, not a false alarm: it means the field layout has changed,
+    which is exactly the precondition under which `side`'s escaping stops
+    being safe (see the gap note this test closes). Re-derive whether
+    `side` can still collide with its neighbours under the new layout
+    BEFORE updating the expected string -- do not just patch `payload`
+    until this goes green again, or the guard this test exists to provide
+    is silently discarded. Relatedly, `"buy%7Cx"` below is hand-typed
+    rather than produced by calling the real `_escape()` -- using
+    production's own escaper to build the expected value would make this
+    test tautological against a bug in `_escape` itself.
     """
     payload = "|".join(
         [
