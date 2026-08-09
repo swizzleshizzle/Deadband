@@ -26,6 +26,25 @@ def option(strike="500") -> Instrument:
     )
 
 
+def option_instrument(**overrides) -> Instrument:
+    """A valid option Instrument with every natural-key field populated, so
+    each test can vary exactly one thing (usually contract_multiplier or
+    strike) via overrides without touching the rest."""
+    fields = dict(
+        id=None,
+        asset_class=AssetClass.OPTION,
+        symbol="SPY 26SEP19 500 C",
+        quote_currency="USD",
+        underlying="SPY",
+        strike=Decimal("500"),
+        expiry=datetime(2026, 9, 19, tzinfo=UTC).date(),
+        option_right="call",
+        contract_multiplier=Decimal("100"),
+    )
+    fields.update(overrides)
+    return Instrument(**fields)
+
+
 async def test_upsert_returns_the_same_id_for_the_same_instrument(conn):
     first = await upsert_instrument(conn, equity())
     second = await upsert_instrument(conn, equity())
@@ -62,3 +81,37 @@ async def test_multipliers_are_fetched_for_pnl(conn):
     mults = await get_multipliers(conn, [opt, eq])
     assert mults[opt] == Decimal("100")
     assert mults[eq] == Decimal("1")
+
+
+# --- Task 4: repaint an instrument's non-key fields on upsert (gap #1) ------
+
+
+async def test_a_stale_contract_multiplier_is_corrected_on_reimport(conn):
+    """The money case. A wrong multiplier stored on first insert is otherwise
+    permanent, and silently scales every option P&L on that instrument."""
+    wrong = option_instrument(contract_multiplier=Decimal("1"))
+    iid = await upsert_instrument(conn, wrong)
+    right = option_instrument(contract_multiplier=Decimal("100"))
+    assert await upsert_instrument(conn, right) == iid, "must be the same row"
+    row = await conn.fetchrow("SELECT contract_multiplier FROM instrument WHERE id = $1", iid)
+    assert row["contract_multiplier"] == Decimal("100")
+
+
+async def test_repainting_does_not_mint_a_second_row(conn):
+    """Scoped to this instrument's own natural_key -- the instrument table is
+    global and shared, so an unqualified count would be meaningless here."""
+    inst = option_instrument(contract_multiplier=Decimal("1"))
+    key = instrument_natural_key(inst)
+    await upsert_instrument(conn, inst)
+    await upsert_instrument(conn, option_instrument(contract_multiplier=Decimal("100")))
+    n = await conn.fetchval("SELECT count(*) FROM instrument WHERE natural_key = $1", key)
+    assert n == 1
+
+
+async def test_key_fields_cannot_drift_because_they_make_a_different_row(conn):
+    """Not a repaint case at all, and worth pinning so nobody tries to 'fix'
+    it: a different strike is a different natural key, hence a different
+    instrument -- not a stale field on the same one."""
+    a = await upsert_instrument(conn, option_instrument(strike=Decimal("100")))
+    b = await upsert_instrument(conn, option_instrument(strike=Decimal("110")))
+    assert a != b
