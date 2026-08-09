@@ -712,6 +712,30 @@ def test_spinoff_parent_clears_dedupe_keys():
     assert parent.content_hash is None
 
 
+def test_spinoff_child_clears_dedupe_keys():
+    """The twin of test_spinoff_parent_clears_dedupe_keys, and the more
+    dangerous half. A child carrying the parent's venue_fill_id violates
+    fill_venue_id_uniq on insert -- loud. A child carrying the parent's
+    content_hash dedupes AGAINST the parent and vanishes, reported as a
+    successful skip -- silent, and the position simply never appears."""
+    before = fill("10", "100", 1, venue_fill_id="V-123", content_hash="deadbeef")
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.20"),
+    )
+    child = [f for f in adjust_fills([before], [action]) if f.instrument_id == NEW][0]
+    assert child.venue_fill_id is None
+    assert child.content_hash is None
+    # And it is a real fill, not an empty shell -- otherwise the assertions
+    # above would pass on something that carries no position either.
+    assert child.quantity > 0
+
+
 # ============================================================================
 # Remap chain dependency: actions targeting produced instruments
 # ============================================================================
