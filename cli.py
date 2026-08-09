@@ -6,16 +6,20 @@ import argparse
 import asyncio
 import pathlib
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.importing import commit_batch, probe_duplicates, route_batch
+from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
+from db.positions import open_positions
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
+from ledger.pnl import unrealized_pnl
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
@@ -576,6 +580,253 @@ async def cmd_trades(args) -> int:
     return 0
 
 
+# Display-only scale bounds for `deadband positions`. NOTHING below this
+# comment changes what ledger/ computes or what the database stores -- the
+# pure layer keeps its full 50-digit precision and the numerics keep theirs;
+# only the string handed to print() is bounded.
+#
+# Why a bound is needed at all: `cost_basis` is a division (weighted notional
+# / quantity) evaluated at ctx.prec = 50, so an ordinary two-lot position
+# whose weighted average does not terminate (1 @ 10 + 2 @ 20) renders a
+# 50-digit basis and, downstream, a 28-digit unrealized. Those digits assert a
+# precision the inputs never had and wrap the row off a normal terminal.
+#
+# Why 8 dp and not 2: a 2-dp display quantum would print a satoshi-scale
+# crypto price or quantity as "0.00" -- a silently wrong number, which is the
+# outcome this project ranks worst. 8 dp covers every price and quantity scale
+# the importers actually produce.
+_DISPLAY_QUANT = Decimal("1E-8")
+
+# ...and a floor, so a genuine zero renders "0.00" rather than "0". The
+# unmarked-position placeholder is "--"; a real zero has to be visibly a
+# number, since mark_price_chk permits a genuine 0 price.
+_DISPLAY_MIN_DP = 2
+
+
+def _fmt_decimal(value: Decimal) -> str:
+    """Render a Decimal for a positions row: bounded scale, no exponent.
+
+    Trailing zeros beyond two decimal places are trimmed, so an exact 25
+    prints "25.00" and not "25.00000000".
+
+    Two escape hatches, both deliberately preferring a wide-but-true column
+    over a narrow-but-false one:
+
+    * a value too large to quantize (InvalidOperation) is printed in full;
+    * a non-zero value that would round to zero at 8 dp is printed in full,
+      because "0.00" for a position that is not flat is exactly the silent
+      lie the bound exists to avoid.
+    """
+    try:
+        q = value.quantize(_DISPLAY_QUANT)
+    except InvalidOperation:  # magnitude too large for the display scale
+        return str(value)
+    if q == 0:
+        # `value != 0` means rounding, not the value, produced the zero.
+        return str(value) if value != 0 else "0.00"
+    text = format(q, "f")
+    if "." in text:
+        whole, _, frac = text.rstrip("0").partition(".")
+        text = f"{whole}.{frac.ljust(_DISPLAY_MIN_DP, '0')}"
+    return text
+
+
+async def cmd_positions(args) -> int:
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            positions = await open_positions(
+                conn, UUID(args.account) if args.account else None
+            )
+            marks = await latest_marks(conn, [p.instrument_id for p in positions])
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    for p in positions:
+        mark = marks.get(p.instrument_id)
+        # Gate on unvaluable_reason, NEVER on direction and NEVER by catching
+        # unrealized_pnl's NotImplementedError(SPREAD): a position can carry a
+        # real, single-valued direction and still be unvaluable for another
+        # reason (e.g. an unknown quantity on one contributing trade), and
+        # catching the exception here would also swallow a future genuine
+        # bug in unrealized_pnl itself. A position with a reason set is still
+        # printed -- never filtered out -- because a position missing from a
+        # position listing is this project's recurring silent-loss shape.
+        if p.unvaluable_reason is not None:
+            unreal, mark_col = f"n/a ({p.unvaluable_reason})", "--"
+            # The quantity and cost basis go to "--" too, not just the mark
+            # and unrealized columns. For a mixed-direction group `quantity`
+            # is the sum of MAGNITUDES (long 10 + short 4 = 14: not the net,
+            # not either leg, not gross exposure in any direction) and
+            # `cost_basis` averages a long basis with a short one. For an
+            # "open quantity unknown" group it is a partial sum over only the
+            # priced contributors. Both are fabricated figures in the two
+            # columns a reader parses first, and the "n/a (reason)"
+            # disclaimer sits four fields to their right where it reads as
+            # "we can't price this", not "the 14 is meaningless too".
+            #
+            # The row itself is still printed -- a position missing from a
+            # position listing is this project's recurring silent-loss shape.
+            # Blanking the numbers is the opposite of hiding the row: it
+            # leaves the symbol, the reason, and nothing that could be
+            # mistaken for a holding.
+            qty_col = basis_col = "--"
+        elif mark is None:
+            # Absent from `marks`, not a zero -- db.marks.latest_marks never
+            # reports a zero for an unmarked instrument (mark_price_chk
+            # permits a genuine 0.00, so a placeholder must be visibly
+            # different from that, not just "0.00" again).
+            unreal, mark_col = "--", "--"
+            qty_col, basis_col = _fmt_decimal(p.quantity), _fmt_decimal(p.cost_basis)
+        else:
+            price, as_of = mark
+            unreal = _fmt_decimal(
+                unrealized_pnl(p.quantity, p.cost_basis, price, p.multiplier, p.direction)
+            )
+            # The mark's age rides along in the same column as its price: a
+            # month-old mark must never render identically to one from a
+            # minute ago, so the as_of date is always shown, not just the
+            # price.
+            mark_col = f"{_fmt_decimal(price)} @{as_of:%Y-%m-%d}"
+            qty_col, basis_col = _fmt_decimal(p.quantity), _fmt_decimal(p.cost_basis)
+        estimated = " ~" if p.is_estimated else "  "
+        # 21, not 10: an OCC option symbol is up to 21 characters
+        # ("SPY   260821C00500000"), and at width 10 every later column on an
+        # option row shifted right by whatever the symbol overflowed by.
+        # Deliberately widened rather than truncated -- a truncated contract
+        # symbol names a DIFFERENT contract (a different strike or expiry)
+        # just as plausibly as the real one, and a misread strike is a wrong
+        # position, whereas a wide column is only ugly. Anything longer than
+        # 21 still overflows, loudly, for the same reason.
+        # Account name, not just id: positions now group by (account,
+        # instrument) rather than instrument alone (a taxable and a
+        # retirement account's cost basis are not fungible), and --account
+        # filters that grouping rather than changing what a row means, so an
+        # unscoped listing can show the same symbol more than once, once per
+        # account -- the account column is what tells those rows apart.
+        # 15 wide, left-justified like the symbol column, and never
+        # truncated for the same reason the symbol column isn't: a
+        # truncated account name can read as a different, shorter-named
+        # account that happens to exist, which is a wrong answer dressed as
+        # a real one, whereas an overflowing column is only ugly. An
+        # explicit space follows it (unlike the symbol column, which relies
+        # on the estimated marker's own leading space) so a name at or past
+        # the 15-char width still can't run straight into the quantity
+        # column with no gap at all.
+        print(
+            f"{p.symbol:<21}{estimated} {p.account_name:<15} {qty_col:>14} {basis_col:>14} "
+            f"{mark_col:>22} {unreal}"
+        )
+    if not positions:
+        print("no open positions")
+    return 0
+
+
+# latest_marks (db/marks.py) treats the newest as_of as "the current price"
+# with nothing else checking plausibility -- a fat-fingered year or a bad
+# backfill would otherwise silently become today's price and produce a wrong
+# unrealized figure with no signal at all. The tolerance absorbs clock skew
+# between this box and the database, and the fact that "now" isn't identically
+# defined on two machines, without opening the door to a meaningfully wrong
+# future date. Two minutes comfortably covers ordinary clock drift for a
+# command that is typed by hand, not fired in a tight loop.
+_MARK_FUTURE_TOLERANCE = timedelta(minutes=2)
+
+
+async def cmd_marks_set(args) -> int:
+    # The clock lives here, in the I/O layer -- db/marks.py and everything
+    # under ledger/ are clock-free by design. This single `now` anchors both
+    # the omitted-as_of default and the future-date guard below, so the two
+    # measure against the exact same instant.
+    now = datetime.now(UTC)
+
+    # Decimal("abc") raises decimal.InvalidOperation, which does NOT descend
+    # from ValueError -- same class of gotcha the --account UUID parsing in
+    # main() works around below (see its comment): a bare `except ValueError`
+    # would let this crash through uncaught instead of becoming a clean
+    # message. Decimal("NaN") and Decimal("Infinity") construct successfully
+    # and slip past that catch entirely -- is_finite() is this codebase's
+    # established check for catching them afterward (see
+    # importers/fidelity.py, importers/coinbase_api.py); left unchecked,
+    # mark_price_chk would refuse them as an uncaught
+    # asyncpg.CheckViolationError instead of a clean CLI error. Parsed before
+    # opening the pool: whether this is a problem depends only on the
+    # argument, never on the database.
+    try:
+        price = Decimal(args.price)
+    except InvalidOperation:
+        print(f"error: --price {args.price!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not price.is_finite():
+        print(f"error: --price {args.price!r} must be a finite number", file=sys.stderr)
+        return 2
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            if args.symbol:
+                try:
+                    instrument_id = await resolve_instrument_by_symbol(conn, args.symbol)
+                except ValueError as exc:
+                    print(
+                        f"error: {exc} -- pass --natural-key instead of --symbol "
+                        "to name the exact instrument",
+                        file=sys.stderr,
+                    )
+                    return 2
+            else:
+                instrument_id = await conn.fetchval(
+                    "SELECT id FROM instrument WHERE natural_key = $1", args.natural_key
+                )
+                if instrument_id is None:
+                    print(
+                        f"error: no instrument with natural_key {args.natural_key!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
+
+            as_of = datetime.fromisoformat(args.as_of) if args.as_of else now
+
+            # A naive (timezone-less) as_of must be caught HERE, before the
+            # future-date comparison just below -- `as_of > now + tolerance`
+            # between an offset-naive and an offset-aware datetime raises a
+            # raw, uncaught TypeError ("can't compare offset-naive and
+            # offset-aware datetimes"), never reaching set_mark's own
+            # ValueError for exactly this case. Checking first means a
+            # fat-fingered timestamp with no offset always gets a clean
+            # message instead of a traceback.
+            if as_of.tzinfo is None:
+                print(
+                    f"error: --as-of {args.as_of!r} has no UTC offset "
+                    "(e.g. append +00:00 or Z)",
+                    file=sys.stderr,
+                )
+                return 2
+
+            # Refuse before writing: an ambiguous symbol, a naive as_of
+            # (above), or a future-dated as_of (below) must never half-apply.
+            # All of resolution and validation happens before set_mark is
+            # ever called.
+            if as_of > now + _MARK_FUTURE_TOLERANCE:
+                print(
+                    f"error: --as-of {as_of.isoformat()} is in the future "
+                    f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+                    file=sys.stderr,
+                )
+                return 2
+
+            await set_mark(conn, instrument_id, price, as_of)
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -647,6 +898,35 @@ def main() -> int:
     p_trades = sub.add_parser("trades")
     p_trades.add_argument("--account")
     p_trades.set_defaults(fn=cmd_trades)
+
+    p_positions = sub.add_parser(
+        "positions", help="open positions, with unrealized P&L where marked"
+    )
+    p_positions.add_argument("--account")
+    p_positions.set_defaults(fn=cmd_positions)
+
+    p_marks = sub.add_parser("marks", help="manual price marks")
+    marks_sub = p_marks.add_subparsers(dest="marks_command", required=True)
+    p_marks_set = marks_sub.add_parser("set", help="record a price mark for an instrument")
+    group = p_marks_set.add_mutually_exclusive_group(required=True)
+    group.add_argument("--symbol", help="instrument symbol; refused if it is ambiguous")
+    group.add_argument("--natural-key", help="exact instrument natural key")
+    # The unit matters and is not guessable: for an option the correct input
+    # is the per-share premium (2.50), not the per-contract cost (250). The
+    # contract multiplier is applied downstream by unrealized_pnl, so entering
+    # the per-contract figure produces a silently 100x wrong unrealized P&L.
+    p_marks_set.add_argument(
+        "--price",
+        required=True,
+        help=(
+            "price per unit, excluding the contract multiplier, "
+            "in the instrument's quote currency"
+        ),
+    )
+    p_marks_set.add_argument(
+        "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
+    )
+    p_marks_set.set_defaults(fn=cmd_marks_set)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether

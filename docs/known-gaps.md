@@ -335,10 +335,62 @@ this file is the project's memory.
 | 7 | Preview cannot report duplicates (spec §7 requires it) | Preview never opens a connection by design, so it structurally cannot. Needs an optional read-only dedupe probe. |
 | 8 | No property test for spec §9's "sum of per-trade realized P&L equals total from fills" | The only property tying grouping to P&L; would catch an allocation that conserves quantity but not value. |
 | 9 | `MarkSource` protocol (spec D7) does not exist | The `mark` table exists; the interface the spec names as the mechanism keeping D out of A was never written. |
-| 10 | `open_quantity` / `open_cost_basis` are computed but never persisted | `unrealized_pnl()` cannot obtain its inputs from the database without re-running the grouper. |
-| 11 | `fill.is_estimated` never propagates to `trade` | Spec §4 requires opening-balance trades to be excluded from R-multiple and win-rate stats. C cannot be built without it. |
-| 12 | `positions` command missing (spec §3, plan's Task 14 interfaces) | Replaced by `trades` during implementation and never recorded as a deferral. |
-| 13 | `reconcile` CLI command not implemented | Needs the `account_snapshot` write path. Deliberately not stubbed. |
+| 10 | ~~`open_quantity` / `open_cost_basis` are computed but never persisted~~ — CLOSED in A-2 part 1, recorded 2026-08-08 | `unrealized_pnl()` cannot obtain its inputs from the database without re-running the grouper. |
+| 11 | ~~`fill.is_estimated` never propagates to `trade`~~ — CLOSED in A-2 part 1, recorded 2026-08-08 | Spec §4 requires opening-balance trades to be excluded from R-multiple and win-rate stats. C cannot be built without it. |
+| 12 | ~~`positions` command missing (spec §3, plan's Task 14 interfaces)~~ — CLOSED, recorded 2026-08-08 | Replaced by `trades` during implementation and never recorded as a deferral. |
+| 13 | `reconcile` CLI command not implemented — unblocked, not closed | The `account_snapshot` write path is genuinely absent (the table exists in the schema; nothing writes it) — but that is not the only piece missing. See the note below gap #12: `db/positions.py::open_positions` returns `OpenPosition`, `ledger/reconcile.py::reconcile` consumes `Position`, and they are different types, not just different names. `Position` has no `unvaluable_reason` (or `direction`, or `is_estimated`) field at all, so an `OpenPosition` with a reason set has **no valid `Position` representation** — there is nothing to adapt it to. Wiring the two together needs both an adapter and a design decision, arguably the more interesting of the two: what should `reconcile` do with a position it cannot value — exclude it from computed equity and flag the exclusion, treat cost basis as a stale mark the way an unmarked-but-valuable position already does in `ledger/reconcile.py`'s own fallback, or refuse to reconcile the account at all until it is resolved? None of that is decided yet. |
+| 14 | Unrealized P&L is only as fresh as the last manual mark | There is no price feed, and that is deliberate (spec §3 keeps market data out of the foundation) — `positions` shows each mark's date alongside the valuation so staleness is visible rather than assumed. |
+
+> [!note] Gaps #10 and #11 were done and left on the list
+> Both landed in A-2 part 1, not part 2 — they were completed and never struck. The
+> evidence: `db/trades.py:115` rolls up `fill.is_estimated` across a trade's allocations
+> with `any()` (not `all()` — a single estimated fill taints the whole trade, per spec
+> §4); `db/trades.py:128` persists `open_quantity` and `open_cost_basis` on insert and
+> `db/trades.py:145-147` repaints them (alongside `is_estimated`) on every regroup's
+> `ON CONFLICT DO UPDATE`. Three tests in `tests/db/test_trades.py` guard the rollup
+> specifically: `test_a_trade_containing_an_estimated_fill_is_itself_estimated`,
+> `test_a_trade_of_only_exact_fills_is_not_estimated`, and
+> `test_a_trade_with_an_estimated_closing_fill_is_also_estimated`.
+>
+> A gap list that carries closed items is worse than no list — it reads as still-true and
+> costs the next reader a re-investigation to discover otherwise. That is exactly what it
+> cost here: this task opened assuming both were still open, checked the code, and found
+> both had been done a phase earlier. Worth writing down rather than quietly deleting the
+> two rows, for the same reason the rest of this file keeps closed entries visible instead
+> of pruning them.
+
+> [!note] Gap #12, closed — what `positions` actually does
+> `positions` groups open trades by **(account, instrument)**, not by instrument alone
+> (quantity-weighted average cost basis across trades sharing both an account and an
+> instrument) and rolls `is_estimated` up with the same `any()` convention as `trade`.
+> `--account` *filters* which rows are shown; it no longer changes what a row means, so an
+> unscoped listing can show one instrument more than once -- once per account holding it --
+> distinguished by an account-name column. This replaced an earlier instrument-only
+> grouping that blended a taxable account's cost basis with a retirement account's (no tax
+> consequence in one, the whole tax position in the other -- a blended figure answers no
+> question either account actually has) and could manufacture a "mixed direction" position
+> that exists nowhere in reality: long in one account and short in another is two ordinary,
+> individually valuable positions, not one unvaluable one. Mixed direction *within* a single
+> account is still real and is still reported exactly as before. Two separate mechanisms
+> decide what a row shows, and they must not be conflated:
+>
+> - **Structurally unvaluable**, decided by `aggregate_positions` (`ledger/positions.py`)
+>   without ever looking at a mark — marks are not even passed to it. It sets
+>   `unvaluable_reason` for exactly two conditions: an unknown open quantity (an orphaned
+>   trade whose instrument is unreachable), or a direction the contributing trades disagree
+>   on (spread, or genuinely mixed long/short). These rows render `n/a (<reason>)`.
+> - **Valuable but unmarked**, decided separately in `cli.py`'s `cmd_positions`: when
+>   `unvaluable_reason` is `None` but no manual mark exists for the instrument, the row
+>   renders `--` in both the mark and unrealized-P&L columns. `unvaluable_reason` stays
+>   `None` here — this is not a reason, it is an absence of data.
+>
+> Both kinds of row are listed rather than hidden — nothing is silently dropped — but only
+> the first kind carries a reason. A future reader (`reconcile`, most likely) that filters
+> on "does `unvaluable_reason` say anything" and treats everything else as valuable would
+> silently mishandle the unmarked case, since it produces no error and no reason string,
+> only a missing price.
+>
+> `reconcile` (gap #13) is now unblocked by this work, though still unbuilt — see below.
 
 ---
 
