@@ -17,8 +17,8 @@ from db.accounts import create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
-from db.snapshots import latest_snapshot
-from db.trades import regroup_account
+from db.snapshots import add_snapshot, latest_snapshot
+from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
@@ -2141,3 +2141,233 @@ async def test_snapshot_add_refuses_a_non_finite_figure_without_writing(
     )
     assert rc == 2
     assert await latest_snapshot(conn, an_account) is None
+
+
+# --- cmd_reconcile -------------------------------------------------------------
+#
+# The plan's own self-review flags this as the task most likely to run long on
+# fixtures, so these four reuse the account-state recipe already established
+# above and in tests/db/test_positions.py (create_account, upsert_instrument,
+# insert_fills, regroup_account, add_snapshot) rather than inventing a fifth
+# harness. There is no tests/db/conftest.py, so nothing here can be imported
+# from test_positions.py -- `_add_orphaned_position` below replicates that
+# file's `_make_orphaned_trade` recipe rather than importing it.
+
+_RECONCILE_AS_OF = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+
+
+async def _add_orphaned_position(conn, acc, *, symbol, ref):
+    """Same recipe as tests/db/test_positions.py's `_make_orphaned_trade`:
+    open one ordinary trade on a fresh instrument, then protect it (notes set
+    so regroup preserves it, its opening fill deleted, regrouped again). The
+    composite FK nulls opening_fill_id and the protection UPDATE nulls
+    open_quantity/open_cost_basis, while status stays 'open' -- an
+    unreachable-instrument position that still holds exposure.
+
+    Load-bearing for the direction-vs-unvaluable_reason mutation gate: the
+    resulting position keeps its ORIGINAL single direction (a plain BUY, so
+    Direction.SPREAD never enters the mix and the group never disagrees on
+    direction) while unvaluable_reason gets set from the null quantity --
+    exactly the "direction is set AND still unvaluable" case
+    ledger/positions.py's OpenPosition docstring warns about."""
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"),
+    )
+    fill = _position_fill(acc, inst, side=Side.BUY, quantity="5", price="10", ref=ref)
+    await insert_fills(conn, [fill])
+    await regroup_account(conn, acc)
+    trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == fill.id)
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
+    await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
+    await regroup_account(conn, acc)
+
+
+async def _deposit(conn, acc, amount):
+    """Cash in, via cash_movement directly (no importer in play here) -- the
+    same table db/cash.py's account_cash reads, inserted straight rather than
+    through the importer path since these fixtures never go near a CSV."""
+    await conn.execute(
+        """
+        INSERT INTO cash_movement (account_id, occurred_at, kind, amount, currency)
+        VALUES ($1, $2, 'deposit', $3, 'USD')
+        """,
+        acc, _RECONCILE_AS_OF, Decimal(amount),
+    )
+
+
+@pytest_asyncio.fixture
+async def reconcilable_account(conn):
+    """One priced position, one deposit, and a snapshot set to match the
+    computed totals exactly.
+
+    Arithmetic: deposit 10000; buy 10 RCON @ 50 (fee 0) spends 500, so
+    computed cash = 10000 - 500 = 9500. Marked at 60, market value =
+    10 * 60 * 1 = 600, so computed equity = 9500 + 600 = 10100. The snapshot
+    below is set to exactly (9500, 10100) -- reconcile's own arithmetic has
+    to reproduce those two figures for the OK verdict to hold, not just agree
+    with itself."""
+    acc = await create_account(conn, name="Reconcilable", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="RCON", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "10000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="10", price="50", ref="rc1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("60"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("9500"), total_equity=Decimal("10100")
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def unreliable_but_agreeing_account(conn):
+    """One priced position plus one orphaned (unvaluable) position, with the
+    snapshot set to match what reconcile computes from the priced position
+    and cash ALONE -- the orphaned position's quantity/cost_basis are forced
+    to None by the protection path (see _add_orphaned_position), so it
+    contributes nothing to either side of the arithmetic and the numbers
+    agree even though the account is not fully priceable.
+
+    Arithmetic: deposit 1000; buy 5 URLA @ 100 (fee 0) spends 500, so
+    computed cash = 1000 - 500 = 500. Marked at 100, market value =
+    5 * 100 * 1 = 500, so computed equity = 500 + 500 = 1000. Snapshot set to
+    exactly (500, 1000)."""
+    acc = await create_account(
+        conn, name="UnreliableAgree", venue="manual", account_type="cash"
+    )
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="URLA", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="5", price="100", ref="ura1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await _add_orphaned_position(conn, acc, symbol="URLB", ref="urb1")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("500"), total_equity=Decimal("1000")
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def unreliable_account(conn):
+    """One priced position plus one orphaned (unvaluable) position, with the
+    snapshot's reported equity set FAR from what reconcile computes -- as if
+    the broker statement includes real value for the position the ledger
+    cannot price, which the computed side necessarily excludes.
+
+    Arithmetic: deposit 1000; buy 2 URDA @ 100 (fee 0) spends 200, so
+    computed cash = 1000 - 200 = 800 (cash agrees with the snapshot below).
+    Marked at 100, market value = 2 * 100 * 1 = 200, so computed equity =
+    800 + 200 = 1000. The snapshot's reported equity is set to 6000 instead
+    of 1000 -- a -5000 equity_difference that is the EXPECTED shape of an
+    excluded position, not a defect, which is exactly what the rendered
+    output has to say."""
+    acc = await create_account(
+        conn, name="UnreliableDrift", venue="manual", account_type="cash"
+    )
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="URDA", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="2", price="100", ref="urd1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await _add_orphaned_position(conn, acc, symbol="URDB", ref="urdb1")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("800"), total_equity=Decimal("6000")
+    )
+    return acc
+
+
+def _reconcile_args(*, account, as_of, tolerance):
+    """Same pattern as `_args`/`_snapshot_args` above: a real
+    argparse.Namespace built by hand, not through parser.parse_args(). Named
+    distinctly from both so it cannot collide with -- or silently widen --
+    either of those two helpers."""
+    return argparse.Namespace(account=account, as_of=as_of, tolerance=tolerance)
+
+
+async def test_reconcile_agrees_and_exits_zero(conn, reconcilable_account, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of=None, tolerance=None)
+    )
+    assert rc == 0
+    assert "ok" in capsys.readouterr().out.lower()
+
+
+async def test_reconcile_refuses_an_account_with_no_snapshot(
+    conn, an_account, monkeypatch, capsys
+):
+    """Reporting zero drift against nothing is the silent-success shape."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(an_account), as_of=None, tolerance=None)
+    )
+    assert rc == 2
+    assert "snapshot" in capsys.readouterr().err.lower()
+
+
+async def test_an_unvaluable_position_never_exits_zero_even_when_numbers_agree(
+    conn, unreliable_but_agreeing_account, monkeypatch, capsys
+):
+    """The whole point of the verdict. A caller reading is_within_tolerance
+    alone would print a clean pass here."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(_reconcile_args(
+        account=str(unreliable_but_agreeing_account), as_of=None, tolerance=None))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unreliable" in out.lower()
+
+
+async def test_an_unreliable_run_explains_why_its_drift_looks_large(
+    conn, unreliable_account, monkeypatch, capsys
+):
+    """computed_equity excludes the unvalued position, so the drift reads as a
+    big negative number that is expected. Saying so is the difference between a
+    useful report and a phantom hunt."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    await cli.cmd_reconcile(
+        _reconcile_args(account=str(unreliable_account), as_of=None, tolerance=None)
+    )
+    out = capsys.readouterr().out.lower()
+    assert "excluded" in out or "not included" in out
+
+
+async def test_reconcile_refuses_an_unknown_account(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of=None, tolerance=None)
+    )
+    assert rc == 2

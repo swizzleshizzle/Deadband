@@ -11,16 +11,18 @@ from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
+from db.cash import MixedCurrencyError, account_cash
 from db.importing import commit_batch, probe_duplicates, route_batch
 from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.positions import open_positions
-from db.snapshots import add_snapshot
+from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
 from ledger.pnl import unrealized_pnl
+from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
@@ -924,6 +926,185 @@ async def cmd_snapshot_add(args) -> int:
     return 0
 
 
+async def cmd_reconcile(args) -> int:
+    """Compare the ledger against a stored broker-statement snapshot and
+    report one trustworthy verdict (spec §7). This is the command the whole
+    branch exists for -- see ledger/reconcile.py for the pure comparison and
+    its Drift.verdict field, which is THE thing rendered below.
+    """
+    # The clock lives here, in the I/O layer -- same reasoning as
+    # cmd_marks_set's and cmd_snapshot_add's identical comments.
+    now = datetime.now(UTC)
+
+    as_of = now
+    if args.as_of:
+        try:
+            as_of = datetime.fromisoformat(args.as_of)
+        except ValueError:
+            print(f"error: --as-of {args.as_of!r} is not a valid timestamp", file=sys.stderr)
+            return 2
+        # Same TypeError hazard cmd_marks_set's identical comment describes:
+        # a naive datetime compared against an aware one downstream (here,
+        # inside latest_snapshot's own `as_of <= $2` bind) would raise
+        # asyncpg's own confusing error instead of a clean one naming the flag.
+        if as_of.tzinfo is None:
+            print(
+                f"error: --as-of {args.as_of!r} has no UTC offset "
+                "(e.g. append +00:00 or Z)",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Same InvalidOperation/is_finite guards cmd_marks_set and cmd_snapshot_add
+    # already have for their own Decimal arguments.
+    tolerance = Decimal("0.01")
+    if args.tolerance is not None:
+        try:
+            tolerance = Decimal(args.tolerance)
+        except InvalidOperation:
+            print(
+                f"error: --tolerance {args.tolerance!r} is not a valid number",
+                file=sys.stderr,
+            )
+            return 2
+        if not tolerance.is_finite():
+            print(
+                f"error: --tolerance {args.tolerance!r} must be a finite number",
+                file=sys.stderr,
+            )
+            return 2
+
+    account_id = UUID(args.account)
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            # 1. Resolve the account. Unknown id refuses, exit 2 -- same
+            # get_account-then-check-None shape cmd_import already uses for
+            # its own --account, rather than letting a foreign-key violation
+            # surface later as a raw traceback.
+            account = await get_account(conn, account_id)
+            if account is None:
+                print(f"error: no account with id {account_id}", file=sys.stderr)
+                return 2
+
+            # 2. latest_snapshot. None refuses, exit 2 -- reporting "zero
+            # drift" against nothing is the silent-success shape this whole
+            # command exists to avoid.
+            snap_row = await latest_snapshot(conn, account_id, as_of)
+            if snap_row is None:
+                print(
+                    f"error: no snapshot on or before {as_of.isoformat()} for "
+                    f"account {account_id} -- record one with `snapshot add`",
+                    file=sys.stderr,
+                )
+                return 2
+            snapshot = Snapshot(
+                account_id=account_id,
+                as_of=snap_row["as_of"],
+                cash_balance=snap_row["cash_balance"],
+                total_equity=snap_row["total_equity"],
+            )
+
+            # 3-4. open_positions, then partition on unvaluable_reason --
+            # NEVER on direction. A group can agree on a single direction and
+            # still be unvaluable for another reason (ledger/positions.py's
+            # own OpenPosition docstring), so a non-None direction here is not
+            # a signal that pricing is safe.
+            open_pos = await open_positions(conn, account_id)
+            positions: list[Position] = []
+            unvaluable: list[UnvaluableRef] = []
+            for p in open_pos:
+                if p.unvaluable_reason is None:
+                    positions.append(
+                        Position(
+                            instrument_id=p.instrument_id,
+                            quantity=p.quantity,
+                            cost_basis=p.cost_basis,
+                            multiplier=p.multiplier,
+                        )
+                    )
+                else:
+                    unvaluable.append(
+                        UnvaluableRef(
+                            instrument_id=p.instrument_id,
+                            symbol=p.symbol,
+                            reason=p.unvaluable_reason,
+                        )
+                    )
+
+            # 5. latest_marks for the valuable instrument ids only, mapped to
+            # JUST the price. latest_marks returns a (price, timestamp) tuple
+            # per instrument (db/marks.py) -- reconcile() wants a bare
+            # Mapping[UUID, Decimal], so passing the tuple straight through
+            # would misvalue every marked position. An instrument absent from
+            # this dict (never present with a zero -- a genuine 0 mark is
+            # legal) falls back to cost basis inside reconcile() itself.
+            raw_marks = await latest_marks(conn, [p.instrument_id for p in positions])
+            marks = {instrument_id: price for instrument_id, (price, _as_of) in raw_marks.items()}
+
+            # 6. account_cash; MixedCurrencyError refuses, exit 2.
+            try:
+                computed_cash = await account_cash(conn, account_id)
+            except MixedCurrencyError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    # 7. reconcile() -> Drift. Pure, no I/O, no clock.
+    drift = reconcile(
+        snapshot, positions, marks, computed_cash, unvaluable=unvaluable, tolerance=tolerance
+    )
+
+    # 8. Render by verdict -- THE field callers render (see Drift's own
+    # docstring). is_within_tolerance answers only "do the numbers agree" and
+    # is a component, never the answer: rendering it alone would print a
+    # clean pass on an account with unvalued positions.
+    print(f"account {account_id}  as of {drift.as_of.isoformat()}")
+    print(f"  verdict: {drift.verdict.value}")
+    print(
+        f"  equity: computed {drift.computed_equity}  reported {drift.reported_equity}  "
+        f"diff {drift.equity_difference}"
+    )
+    print(
+        f"  cash:   computed {drift.computed_cash}  reported {drift.reported_cash}  "
+        f"diff {drift.cash_difference}"
+    )
+    if drift.unmarked_instruments:
+        print(
+            f"  {len(drift.unmarked_instruments)} position(s) valued at cost basis -- "
+            "no mark on file"
+        )
+    if drift.unvaluable_positions:
+        # The output must explain the alarming number: computed_equity above
+        # EXCLUDES these positions entirely (they were never turned into a
+        # Position), so a large equity_difference here is expected, not
+        # necessarily a defect -- saying so is the difference between a
+        # useful report and a phantom hunt.
+        print(
+            f"  {len(drift.unvaluable_positions)} position(s) excluded from "
+            "computed equity above (not included in the totals -- cannot be priced):"
+        )
+        for u in drift.unvaluable_positions:
+            print(f"    {u.symbol}: {u.reason}")
+
+    if drift.verdict == ReconcileVerdict.OK:
+        return 0
+    if drift.verdict == ReconcileVerdict.DRIFT:
+        print("drift: the ledger and the statement disagree outside tolerance", file=sys.stderr)
+        return 1
+    print(
+        "unreliable: one or more positions could not be priced, so this verdict "
+        "cannot be trusted as a clean pass or a clean drift",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1034,6 +1215,14 @@ def main() -> int:
     p_snap_add.add_argument("--cash", required=True, help="cash balance the broker reports")
     p_snap_add.add_argument("--note", default=None)
     p_snap_add.set_defaults(fn=cmd_snapshot_add)
+
+    p_reconcile = sub.add_parser(
+        "reconcile", help="compare the ledger against a statement snapshot"
+    )
+    p_reconcile.add_argument("--account", required=True)
+    p_reconcile.add_argument("--as-of", default=None, help="ISO-8601; defaults to now")
+    p_reconcile.add_argument("--tolerance", default=None, help="default 0.01")
+    p_reconcile.set_defaults(fn=cmd_reconcile)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether
