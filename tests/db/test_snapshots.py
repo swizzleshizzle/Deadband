@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
 import pytest_asyncio
 
 from db.accounts import create_account
@@ -67,3 +68,9 @@ async def test_snapshots_are_scoped_to_their_account(conn, two_accounts):
     await add_snapshot(conn, a, datetime(2026, 7, 31, tzinfo=UTC),
                        Decimal("10"), Decimal("100"))
     assert await latest_snapshot(conn, b) is None
+
+
+async def test_add_snapshot_rejects_a_naive_as_of(conn, an_account):
+    naive = datetime(2026, 7, 31, 12, 0)
+    with pytest.raises(ValueError):
+        await add_snapshot(conn, an_account, naive, Decimal("1"), Decimal("1"))
