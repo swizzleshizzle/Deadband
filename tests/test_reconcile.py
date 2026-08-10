@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
 from decimal import Decimal, getcontext
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from ledger.reconcile import Position, Snapshot, reconcile
+from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 SPY = UUID("00000000-0000-0000-0000-0000000000b1")
@@ -195,3 +195,91 @@ def test_precision_pinning_works_across_ambient_precisions():
         assert results[3] == expected_equity_str
     finally:
         getcontext().prec = ambient_prec
+
+
+def unvaluable_ref(reason="open quantity unknown"):
+    return UnvaluableRef(instrument_id=uuid4(), symbol="ZXCO", reason=reason)
+
+
+def test_agreement_with_nothing_unvaluable_is_ok():
+    d = reconcile(snapshot(cash="1000", equity="1000"), [], {}, Decimal("1000"))
+    assert d.verdict is ReconcileVerdict.OK
+    assert d.is_within_tolerance is True
+    assert d.unvaluable_positions == ()
+
+
+def test_disagreement_with_nothing_unvaluable_is_drift():
+    d = reconcile(snapshot(cash="1000", equity="1000"), [], {}, Decimal("900"))
+    assert d.verdict is ReconcileVerdict.DRIFT
+    assert d.is_within_tolerance is False
+
+
+def test_any_unvaluable_position_makes_the_run_unreliable():
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("1000"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+    assert len(d.unvaluable_positions) == 1
+
+
+def test_unreliable_outranks_drift():
+    """Both conditions at once. The numeric gap cannot be attributed -- it may be
+    entirely the unvalued position, or may hide a real defect on top -- so
+    reporting DRIFT would imply a precision the data does not support."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("900"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+
+
+def test_an_unreliable_run_still_reports_its_numbers():
+    """The numbers are still useful for judging whether the gap explains the
+    drift. Refusing to compute them would make one orphaned trade disable the
+    check for the whole account."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("900"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.computed_cash == Decimal("900")
+    assert d.equity_difference == Decimal("-100")
+
+
+def test_is_within_tolerance_still_answers_only_the_numeric_question():
+    """It is a COMPONENT of the verdict, never the answer. On an unreliable run
+    whose numbers happen to agree it is still True -- which is exactly why a
+    caller must render `verdict` and not this."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("1000"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.is_within_tolerance is True
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+
+
+def test_an_unmarked_but_valuable_position_does_not_make_the_run_unreliable():
+    """The distinction the whole design turns on. Unmarked = known quantity,
+    missing price; cost basis is a defensible stale proxy. Unvaluable = unknown
+    quantity, for which no proxy exists."""
+    pos = Position(
+        instrument_id=uuid4(),
+        quantity=Decimal("10"),
+        cost_basis=Decimal("100"),
+        multiplier=Decimal("1"),
+    )
+    d = reconcile(snapshot(cash="1000", equity="2000"), [pos], {}, Decimal("1000"))
+    assert d.unmarked_instruments == (pos.instrument_id,)
+    assert d.verdict is not ReconcileVerdict.UNRELIABLE

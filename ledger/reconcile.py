@@ -6,7 +6,25 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, localcontext
+from enum import StrEnum
 from uuid import UUID
+
+
+class ReconcileVerdict(StrEnum):
+    OK = "ok"
+    DRIFT = "drift"
+    UNRELIABLE = "unreliable"
+
+
+@dataclass(frozen=True, slots=True)
+class UnvaluableRef:
+    """A position the ledger holds but cannot value. `instrument_id` may be a
+    grouping key rather than a real instrument id -- db/positions.py uses a
+    trade's own id when its instrument is unreachable -- so never look one up."""
+
+    instrument_id: UUID
+    symbol: str
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +55,13 @@ class Drift:
     cash_difference: Decimal  # computed - reported
     unmarked_instruments: tuple[UUID, ...]
     is_within_tolerance: bool
+    unvaluable_positions: tuple[UnvaluableRef, ...]
+    # THE field callers render. `is_within_tolerance` above answers only "do the
+    # numbers agree" -- a component of this, never the answer. A caller reading
+    # it alone would print a clean pass on an account with unvalued positions,
+    # which is the misuse docs/known-gaps.md's gap #12 note already warns about
+    # for `unvaluable_reason`. An enum cannot be half-read.
+    verdict: ReconcileVerdict
 
 
 def reconcile(
@@ -44,6 +69,7 @@ def reconcile(
     positions: Sequence[Position],
     marks: Mapping[UUID, Decimal],
     computed_cash: Decimal,
+    unvaluable: Sequence[UnvaluableRef] = (),
     tolerance: Decimal = Decimal("0.01"),
 ) -> Drift:
     """Value positions at their marks, add cash, and compare to the statement.
@@ -69,6 +95,17 @@ def reconcile(
         equity_difference = computed_equity - snapshot.total_equity
         cash_difference = computed_cash - snapshot.cash_balance
 
+        within = abs(equity_difference) <= tolerance and abs(cash_difference) <= tolerance
+        if unvaluable:
+            # UNRELIABLE outranks DRIFT: with something unvalued, a numeric gap
+            # cannot be attributed. It may be entirely the missing position, or
+            # may hide a real defect on top.
+            verdict = ReconcileVerdict.UNRELIABLE
+        elif within:
+            verdict = ReconcileVerdict.OK
+        else:
+            verdict = ReconcileVerdict.DRIFT
+
         return Drift(
             account_id=snapshot.account_id,
             as_of=snapshot.as_of,
@@ -79,6 +116,7 @@ def reconcile(
             reported_cash=snapshot.cash_balance,
             cash_difference=cash_difference,
             unmarked_instruments=tuple(unmarked),
-            is_within_tolerance=abs(equity_difference) <= tolerance
-            and abs(cash_difference) <= tolerance,
+            is_within_tolerance=within,
+            unvaluable_positions=tuple(unvaluable),
+            verdict=verdict,
         )
