@@ -169,6 +169,56 @@ def test_zero_ratio_is_rejected():
         )
 
 
+def test_a_corporate_action_may_not_produce_its_own_instrument():
+    """resulting == instrument is nonsense: the action produces the thing it
+    consumes. It terminates safely today, but by coincidence of adjust_fills'
+    current shape rather than by design -- a self-referential spinoff would
+    allocate basis from an instrument to itself.
+
+    resulting_instrument_id is built as UUID(str(OLD)) rather than reused as
+    the same OLD object: a value-equal but distinct UUID is the realistic
+    shape (an id round-tripped through the database, JSON, or a CLI argument
+    is never the same object as the one in memory), so the guard must catch
+    it by value, not by identity -- an `is` comparison here would be a live
+    bug, not a theoretical one.
+
+    SPLIT is included precisely because it does NOT require a resulting id:
+    the guard lives outside the MERGER/SPINOFF/SYMBOL_CHANGE conditional on
+    purpose, since a self-referential id is meaningless on any action type
+    that carries one at all. Without this case, moving the check inside that
+    conditional -- a plausible "tidying" refactor -- would silently narrow
+    its scope and this test would not notice."""
+    for action_type, extra in (
+        (ActionType.MERGER, {}),
+        (ActionType.SPINOFF, {"basis_allocation": Decimal("0.2")}),
+        (ActionType.SYMBOL_CHANGE, {}),
+        (ActionType.SPLIT, {}),
+    ):
+        with pytest.raises(ValueError, match="itself|self"):
+            CorporateAction(
+                instrument_id=OLD,
+                action_type=action_type,
+                ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+                ratio_numerator=Decimal("1"),
+                ratio_denominator=Decimal("1"),
+                resulting_instrument_id=UUID(str(OLD)),
+                **extra,
+            )
+
+
+def test_a_corporate_action_producing_a_different_instrument_is_accepted():
+    """The negative control: the guard must not reject legitimate actions."""
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("1"),
+        resulting_instrument_id=NEW,
+    )
+    assert action.resulting_instrument_id == NEW
+
+
 def test_precision_pinning_produces_exact_value():
     """I5: At ctx.prec=50, 100/3 must equal '33.' + 48 threes exactly.
     Without precision pinning, this value depends on ambient precision."""
@@ -660,6 +710,30 @@ def test_spinoff_parent_clears_dedupe_keys():
     parent = [f for f in adjusted if f.instrument_id == OLD][0]
     assert parent.venue_fill_id is None
     assert parent.content_hash is None
+
+
+def test_spinoff_child_clears_dedupe_keys():
+    """The twin of test_spinoff_parent_clears_dedupe_keys, and the more
+    dangerous half. A child carrying the parent's venue_fill_id violates
+    fill_venue_id_uniq on insert -- loud. A child carrying the parent's
+    content_hash dedupes AGAINST the parent and vanishes, reported as a
+    successful skip -- silent, and the position simply never appears."""
+    before = fill("10", "100", 1, venue_fill_id="V-123", content_hash="deadbeef")
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 15, tzinfo=UTC).date(),
+        ratio_numerator=Decimal("1"),
+        ratio_denominator=Decimal("5"),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.20"),
+    )
+    child = [f for f in adjust_fills([before], [action]) if f.instrument_id == NEW][0]
+    assert child.venue_fill_id is None
+    assert child.content_hash is None
+    # And it is a real fill, not an empty shell -- otherwise the assertions
+    # above would pass on something that carries no position either.
+    assert child.quantity > 0
 
 
 # ============================================================================

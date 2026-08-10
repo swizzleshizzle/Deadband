@@ -101,6 +101,51 @@ def test_option_natural_key_is_stable_across_strike_formatting():
     assert a == b
 
 
+def test_option_without_explicit_multiplier_is_rejected():
+    """The money case for I1: db/instruments.py's upsert repaints
+    contract_multiplier last-write-wins, and Instrument's default is
+    Decimal(1) -- correct for equity/crypto, silently 100x wrong for an
+    option. An OPTION minted without an explicit multiplier must crash here,
+    not fall through to that default."""
+    with pytest.raises(ValueError, match="contract_multiplier"):
+        Instrument(
+            id=None,
+            asset_class=AssetClass.OPTION,
+            symbol="SPY 26SEP19 500 C",
+            quote_currency="USD",
+            underlying="SPY",
+            strike=Decimal("500"),
+            expiry=datetime(2026, 9, 19, tzinfo=UTC).date(),
+            option_right="call",
+        )
+
+
+def test_non_option_instrument_still_defaults_multiplier_to_one():
+    """The guard must not widen beyond OPTION: equity/crypto callers that
+    never mention contract_multiplier keep getting the Decimal(1) default."""
+    inst = Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SPY", quote_currency="USD")
+    assert inst.contract_multiplier == Decimal(1)
+
+
+def test_option_with_explicit_multiplier_of_one_is_allowed():
+    """Distinguishes 'omitted' from 'explicitly passed 1': the guard must key
+    off whether the caller supplied a value at all, not off which value they
+    supplied -- an explicit 1 is unusual but not the caller's mistake to be
+    second-guessed here."""
+    inst = Instrument(
+        id=None,
+        asset_class=AssetClass.OPTION,
+        symbol="SPY 26SEP19 500 C",
+        quote_currency="USD",
+        underlying="SPY",
+        strike=Decimal("500"),
+        expiry=datetime(2026, 9, 19, tzinfo=UTC).date(),
+        option_right="call",
+        contract_multiplier=Decimal("1"),
+    )
+    assert inst.contract_multiplier == Decimal(1)
+
+
 def test_onchain_natural_key_lowercases_address():
     inst = Instrument(
         id=None,
