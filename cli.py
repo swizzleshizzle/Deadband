@@ -973,6 +973,20 @@ async def cmd_reconcile(args) -> int:
                 file=sys.stderr,
             )
             return 2
+        # is_finite() above rejects NaN/Infinity but not a negative number.
+        # A negative tolerance makes `abs(difference) <= tolerance`
+        # unsatisfiable, so EVERY run -- even a perfectly reconciled account
+        # -- would report DRIFT: a confidently wrong verdict produced from a
+        # silently accepted bad input, the same failure class the
+        # mixed-currency refusal below exists to avoid. Checked here, before
+        # the pool is ever opened, same as every other argument guard above.
+        if tolerance < 0:
+            print(
+                f"error: --tolerance {args.tolerance!r} must not be negative "
+                "-- a negative tolerance would make every comparison read as drift",
+                file=sys.stderr,
+            )
+            return 2
 
     account_id = UUID(args.account)
 
@@ -1064,7 +1078,19 @@ async def cmd_reconcile(args) -> int:
     # docstring). is_within_tolerance answers only "do the numbers agree" and
     # is a component, never the answer: rendering it alone would print a
     # clean pass on an account with unvalued positions.
-    print(f"account {account_id}  as of {drift.as_of.isoformat()}")
+    print(f"account {account_id}")
+    # Two DIFFERENT clocks, deliberately labelled apart: drift.as_of is the
+    # STATEMENT's date (snapshot.as_of, ledger/reconcile.py), but
+    # computed_cash, open_positions and latest_marks above all read CURRENT
+    # ledger state -- open_positions and latest_marks take no `as_of` at all.
+    # A single "as of <statement date>" header above numbers that are
+    # actually current would misrepresent a week of ordinary trading since
+    # the statement as drift "as of" a date before any of it happened -- the
+    # same phantom-hunt shape the unvaluable-exclusion message above exists
+    # to prevent. `now` was captured at the very top of this function, so it
+    # is the same instant the future-date guards above measured against.
+    print(f"  statement as of {drift.as_of.isoformat()}")
+    print(f"  ledger as of    {now.isoformat()}")
     print(f"  verdict: {drift.verdict.value}")
     print(
         f"  equity: computed {drift.computed_equity}  reported {drift.reported_equity}  "

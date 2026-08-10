@@ -2183,16 +2183,18 @@ async def _add_orphaned_position(conn, acc, *, symbol, ref):
     await regroup_account(conn, acc)
 
 
-async def _deposit(conn, acc, amount):
+async def _deposit(conn, acc, amount, *, currency="USD"):
     """Cash in, via cash_movement directly (no importer in play here) -- the
     same table db/cash.py's account_cash reads, inserted straight rather than
-    through the importer path since these fixtures never go near a CSV."""
+    through the importer path since these fixtures never go near a CSV.
+    `currency` defaults to USD and is only ever overridden by the
+    mixed-currency fixture below -- every other caller stays single-currency."""
     await conn.execute(
         """
         INSERT INTO cash_movement (account_id, occurred_at, kind, amount, currency)
-        VALUES ($1, $2, 'deposit', $3, 'USD')
+        VALUES ($1, $2, 'deposit', $3, $4)
         """,
-        acc, _RECONCILE_AS_OF, Decimal(amount),
+        acc, _RECONCILE_AS_OF, Decimal(amount), currency,
     )
 
 
@@ -2291,6 +2293,25 @@ async def unreliable_account(conn):
     return acc
 
 
+@pytest_asyncio.fixture
+async def mixed_currency_account(conn):
+    """Two cash movements on the same account in different currencies (USD
+    and EUR) -- same shape as tests/db/test_cash.py's own
+    `mixed_currency_account`, replicated here rather than imported (no
+    tests/db/conftest.py to share it through, and this file already owns its
+    own cash_movement-inserting `_deposit`), plus a snapshot: without one,
+    cmd_reconcile's own step 2 refusal (no snapshot) would fire first and
+    account_cash -- and the MixedCurrencyError it raises -- would never be
+    reached at all."""
+    acc = await create_account(conn, name="MixedCurrency", venue="manual", account_type="cash")
+    await _deposit(conn, acc, "100", currency="USD")
+    await _deposit(conn, acc, "50", currency="EUR")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("0"), total_equity=Decimal("0")
+    )
+    return acc
+
+
 def _reconcile_args(*, account, as_of, tolerance):
     """Same pattern as `_args`/`_snapshot_args` above: a real
     argparse.Namespace built by hand, not through parser.parse_args(). Named
@@ -2367,7 +2388,99 @@ async def test_reconcile_refuses_an_unknown_account(conn, monkeypatch, capsys):
         return _FakePool(conn)
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    bogus = uuid4()
     rc = await cli.cmd_reconcile(
-        _reconcile_args(account=str(uuid4()), as_of=None, tolerance=None)
+        _reconcile_args(account=str(bogus), as_of=None, tolerance=None)
     )
     assert rc == 2
+    # Names the actual problem account, not just a bare "error: refused" --
+    # the same standard test_regroup_unknown_account_prints_a_clean_error_
+    # not_a_traceback holds cmd_regroup to for the identical situation.
+    assert str(bogus) in capsys.readouterr().err
+
+
+# --- Fix round 1: statement clock vs. ledger clock ---------------------------
+
+
+async def test_reconcile_labels_the_statement_and_ledger_clocks_separately(
+    conn, reconcilable_account, monkeypatch, capsys
+):
+    """account_cash, open_positions and latest_marks all read CURRENT ledger
+    state -- open_positions and latest_marks don't even take an `as_of`
+    parameter -- while the report's other clock is the STATEMENT's date
+    (snapshot.as_of). A single "as of <statement date>" header above numbers
+    that are actually current would misrepresent any ordinary trading since
+    the statement as drift "as of" a date before any of it happened: the same
+    phantom-hunt shape the brief requires for the unvaluable-exclusion case.
+    `reconcilable_account` pins its snapshot/fill/mark clock to a fixed past
+    instant (_RECONCILE_AS_OF); `ledger as of` is real wall-clock time at
+    test run, which is a different instant -- so the two labelled lines must
+    both appear, and must not carry the same timestamp."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    out = captured.out
+
+    assert "statement as of 2026-08-01t09:00:00+00:00" in out.lower()
+    assert "ledger as of" in out.lower()
+
+    statement_line = next(line for line in out.splitlines() if "statement as of" in line.lower())
+    ledger_line = next(line for line in out.splitlines() if "ledger as of" in line.lower())
+    statement_ts = statement_line.split("as of", 1)[1].strip()
+    ledger_ts = ledger_line.split("as of", 1)[1].strip()
+    assert statement_ts != ledger_ts
+
+
+# --- Fix round 1: a negative --tolerance ---------------------------------------
+
+
+async def test_reconcile_refuses_a_negative_tolerance_without_opening_a_connection(
+    conn, monkeypatch, capsys
+):
+    """is_finite() rejects NaN/Infinity but not a negative number. A negative
+    tolerance makes `abs(difference) <= tolerance` unsatisfiable, so EVERY
+    account -- even a perfectly reconciled one -- would report DRIFT: a
+    confidently wrong verdict from a silently accepted bad input. Refused
+    before the pool is ever opened, same as every other argument guard --
+    fake_create_pool raises if cmd_reconcile ever reaches it, so this also
+    proves the check runs early rather than merely returning 2 eventually."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of=None, tolerance="-1")
+    )
+    assert rc == 2
+    assert "tolerance" in capsys.readouterr().err.lower()
+
+
+# --- Fix round 1: MixedCurrencyError was implemented but unpinned ------------
+
+
+async def test_reconcile_refuses_a_mixed_currency_account(
+    conn, mixed_currency_account, monkeypatch, capsys
+):
+    """v1 does not model FX -- db/cash.py's account_cash already refuses a
+    mixed-currency account by raising MixedCurrencyError; cmd_reconcile must
+    catch it and print a clean, currency-naming error instead of letting it
+    propagate as an uncaught traceback."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(mixed_currency_account), as_of=None, tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "USD" in err and "EUR" in err
