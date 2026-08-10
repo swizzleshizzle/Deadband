@@ -67,6 +67,38 @@ points you at `sync coinbase` instead. CSV import remains the only path for Coin
 non-trade cash movements (deposits, withdrawals, transfers, rewards and staking income,
 interest); the Advanced Trade API has no endpoint for any of those.
 
+### Reconciliation
+
+`snapshot add` records a broker statement's figures by hand; `reconcile` compares the
+ledger against the most recent one on or before a date.
+
+```bash
+uv run python cli.py snapshot add --account <uuid> --as-of 2026-08-01 \
+    --equity 52340.00 --cash 1250.75 --note "August statement"
+
+uv run python cli.py reconcile --account <uuid>                          # as of now, tolerance 0.01
+uv run python cli.py reconcile --account <uuid> --as-of 2026-08-01 --tolerance 0.05
+```
+
+`snapshot add` takes `--account --as-of --equity --cash`, plus an optional `--note`.
+Re-adding the same `--account`/`--as-of` pair overwrites what was stored — correcting a
+mistyped figure is the point, and the table keeps no history. `reconcile` takes
+`--account`, plus optional `--as-of` (defaults to now) and `--tolerance` (defaults to
+`0.01`).
+
+Cash is derived from the account's cash movements *and* its fills — a buy spends cash as
+a fill, not a movement, so a balance built from movements alone would omit every trade —
+and an account whose movements or instruments span more than one currency is refused
+rather than summed incorrectly. A position `positions` cannot value (see `docs/known-gaps.md`
+gap #12's note) is excluded from computed equity and named in the output rather than
+silently dropped or silently priced.
+
+**`reconcile` exits 0 only when the verdict is `OK`.** `DRIFT` (numbers disagree beyond
+tolerance) and `UNRELIABLE` (something could not be valued, so the comparison cannot be
+trusted either way) both exit 1; a refusal — unknown account, no snapshot on file, or a
+mixed-currency account — exits 2. A script that only checks the exit code cannot tell
+`DRIFT` from `UNRELIABLE` apart; read the printed verdict for that.
+
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
 tests; set it to run them too).
 
