@@ -16,9 +16,15 @@ from ledger.types import Side
 
 
 class MixedCurrencyError(RuntimeError):
-    """Raised when an account's cash movements and/or fills span more than one
-    currency (spec §7/R7). v1 does not model FX, and summing across
-    currencies would produce a confident wrong number."""
+    """Raised when an account's cash movements or instruments span more than
+    one currency (spec §7/R7). v1 does not model FX, and summing across
+    currencies would produce a confident wrong number.
+
+    "movements or instruments" is exact, and narrower than "fills": a fill
+    carries TWO currencies, `instrument.quote_currency` (checked below) and
+    `fill.fee_currency` (NOT checked -- docs/known-gaps.md gap #24), so
+    claiming the refusal covers fills would over-promise on the half that is
+    unguarded. README.md words it the same way."""
 
 
 async def account_cash(conn: asyncpg.Connection, account_id: UUID) -> Decimal:
@@ -48,8 +54,8 @@ async def account_cash(conn: asyncpg.Connection, account_id: UUID) -> Decimal:
     currencies = {r["currency"] for r in movement_rows} | {r["quote_currency"] for r in fill_rows}
     if len(currencies) > 1:
         raise MixedCurrencyError(
-            f"account {account_id} has cash movements/fills in more than one "
-            f"currency: {', '.join(sorted(currencies))}"
+            f"account {account_id} has cash movements/instruments in more than "
+            f"one currency: {', '.join(sorted(currencies))}"
         )
 
     movements = [CashMovementRow(kind=r["kind"], amount=r["amount"]) for r in movement_rows]

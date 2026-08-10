@@ -2075,7 +2075,7 @@ def _snapshot_args(*, account, as_of, equity, cash, note=None):
     return argparse.Namespace(account=account, as_of=as_of, equity=equity, cash=cash, note=note)
 
 
-async def test_snapshot_add_stores_the_figures(conn, an_account, monkeypatch):
+async def test_snapshot_add_stores_the_figures(conn, an_account, monkeypatch, capsys):
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
 
@@ -2088,6 +2088,17 @@ async def test_snapshot_add_stores_the_figures(conn, an_account, monkeypatch):
         )
     )
     assert rc == 0
+    # Spec §7: "snapshot add writes one row and prints what it stored." A
+    # silent success is what makes the overwrite path (gap #21 -- re-adding
+    # the same as_of replaces a stored broker figure, with no history kept)
+    # invisible, and it is the only chance the typist gets to notice a
+    # fat-fingered figure before `reconcile` reports it as drift days later.
+    # Both figures and the resolved as_of, so a version echoing only one of
+    # them -- or echoing the argument instead of what was stored -- fails.
+    out = capsys.readouterr().out
+    assert "41203.18" in out
+    assert "2110.00" in out
+    assert "2026-07-31" in out
     row = await latest_snapshot(conn, an_account)
     assert row["total_equity"] == Decimal("41203.18")
     # "figures" is plural -- cash must be pinned too, not just equity.
@@ -2122,15 +2133,24 @@ async def test_snapshot_add_refuses_a_future_as_of_without_writing(
     assert await latest_snapshot(conn, an_account) is None
 
 
-async def test_snapshot_add_refuses_a_non_finite_figure_without_writing(
+async def test_snapshot_add_refuses_a_non_finite_figure_without_opening_a_connection(
     conn, an_account, monkeypatch
 ):
     """Decimal("NaN") constructs successfully and would otherwise reach the
     database as a broker figure -- is_finite() is this codebase's own
-    established guard against that (see cmd_marks_set's identical check)."""
+    established guard against that (see cmd_marks_set's identical check).
+
+    fake_create_pool RAISES rather than returning a stand-in pool, the same
+    idiom as test_reconcile_refuses_a_negative_tolerance_without_opening_a_
+    connection below: whether a figure is finite depends only on the
+    arguments, never on the database, so the refusal must happen before a
+    connection is opened. Merely returning 2 eventually would satisfy the old
+    version of this test even if the check had drifted below `create_pool()`.
+    The stored-row assertion stays as well -- never opening a connection
+    implies never writing, but the two failures read differently."""
 
     async def fake_create_pool(*_a, **_kw):
-        return _FakePool(conn)
+        raise AssertionError("must refuse before opening a connection")
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
 
@@ -2142,6 +2162,34 @@ async def test_snapshot_add_refuses_a_non_finite_figure_without_writing(
     )
     assert rc == 2
     assert await latest_snapshot(conn, an_account) is None
+
+
+async def test_snapshot_add_refuses_an_unknown_account(conn, monkeypatch, capsys):
+    """A well-formed but nonexistent account id used to reach
+    `account_snapshot.account_id`'s foreign key and escape as a raw
+    asyncpg.ForeignKeyViolationError traceback -- main() catches only OSError
+    -- which is worse than either sibling command's behaviour for the same
+    situation (docs/known-gaps.md gap #26). Refused cleanly with exit 2 now,
+    the same get_account-then-check-None shape cmd_reconcile uses, and naming
+    the offending id the way test_reconcile_refuses_an_unknown_account and
+    test_regroup_unknown_account_prints_a_clean_error_not_a_traceback both
+    require."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    bogus = uuid4()
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(bogus), as_of="2026-07-31",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert str(bogus) in capsys.readouterr().err
+    assert await latest_snapshot(conn, bogus) is None
 
 
 # --- cmd_reconcile -------------------------------------------------------------
@@ -2576,3 +2624,93 @@ async def test_reconcile_values_a_short_position_as_a_liability(
     # exactly what made the unsigned bug read as a pure equity problem.
     assert _computed("cash:") == Decimal("10500")
     assert _computed("equity:") == Decimal("9900")  # 11100 if valued unsigned
+
+
+# --- Final review: a bare-date --as-of, as README.md documents it -------------
+
+
+async def test_reconcile_accepts_a_bare_date_as_of(
+    conn, reconcilable_account, monkeypatch, capsys
+):
+    """README.md's own worked example passes a bare date to `snapshot add` on
+    one line and to `reconcile` on the next. `cmd_snapshot_add` accepted it
+    (date.fromisoformat -> midnight UTC) and `cmd_reconcile` did not:
+    datetime.fromisoformat parsed "2026-08-02" to a NAIVE midnight, the tz
+    guard fired, and the documented invocation exited 2. The two siblings now
+    read the same string the same way."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    # A day AFTER the fixture's snapshot instant (2026-08-01T09:00Z): a bare
+    # date becomes midnight, and midnight on the 1st precedes the snapshot,
+    # which would refuse for the unrelated "no snapshot on or before" reason
+    # and prove nothing about parsing.
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of="2026-08-02", tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "utc offset" not in captured.err.lower()
+    # It really resolved to the stored statement, not to "now".
+    assert "statement as of 2026-08-01t09:00:00+00:00" in captured.out.lower()
+
+
+# --- Final review: the DRIFT verdict itself ----------------------------------
+
+
+@pytest_asyncio.fixture
+async def drifting_account(conn):
+    """Everything valued, nothing unvaluable, and the numbers disagree.
+
+    Arithmetic: deposit 1000; buy 5 DRFT @ 100 (fee 0) spends 500, so computed
+    cash = 500. Marked at 100, market value = 5 * 100 * 1 = 500, so computed
+    equity = 1000. The snapshot reports cash 500 (agreeing exactly) and equity
+    900 -- a 100 equity difference, four orders of magnitude beyond the 0.01
+    default tolerance. Cash deliberately agrees so the drift can only come
+    from the equity comparison."""
+    acc = await create_account(conn, name="Drifting", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="DRFT", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="5", price="100", ref="dr1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("500"), total_equity=Decimal("900")
+    )
+    return acc
+
+
+async def test_reconcile_reports_plain_drift(conn, drifting_account, monkeypatch, capsys):
+    """The branch's second-most-important outcome, and until now the only
+    verdict no CLI test exercised: OK, UNRELIABLE and four refusals were
+    covered, plain DRIFT was not. Combined with a verdict chain that ended in
+    an unguarded `return 1` carrying the UNRELIABLE narration, deleting the
+    DRIFT branch entirely relabelled every drift as "could not be priced" --
+    a wrong explanation attached to a real number -- and the suite stayed
+    green. Hence the stderr assertions: the exit code and the `verdict:` line
+    are identical under that mutation; the narration is not."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(drifting_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    out, err = captured.out.lower(), captured.err.lower()
+
+    assert rc == 1
+    assert "verdict: drift" in out
+    # Nothing was unvaluable here, so the exclusion notice must NOT appear --
+    # this is a clean numeric disagreement, not an unattributable one.
+    assert "cannot be priced" not in out
+    assert "disagree outside tolerance" in err
+    assert "could not be priced" not in err

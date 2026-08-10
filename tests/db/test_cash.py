@@ -106,12 +106,29 @@ async def an_account(conn):
 
 @pytest_asyncio.fixture
 async def two_funded_accounts(conn):
-    """Two accounts, deposited different amounts (500.00 and 300.00) and
-    nothing else -- their cash must differ."""
+    """Two accounts with different cash, and -- load-bearing -- the second one
+    has a FILL as well as a deposit.
+
+    A: deposit 500.00, nothing else, so its cash is 500.00.
+    B: deposit 300.00 then buy 2 ZXCB at 25.00, spending 50.00 as a fill: 250.00.
+
+    The fill is what makes this fixture able to catch an unscoped fill query.
+    With deposits alone on both accounts, dropping `WHERE f.account_id = $1`
+    from account_cash's fill fetch changes nothing at all -- there are no
+    fills to leak -- so the scoping test would pass against code that summed
+    every account's trading into one balance. The movement predicate was
+    always pinned; this closes the asymmetry."""
     a = await create_account(conn, name="FundedA", venue="manual", account_type="cash")
     await _deposit(conn, a, amount="500.00")
     b = await create_account(conn, name="FundedB", venue="manual", account_type="cash")
     await _deposit(conn, b, amount="300.00")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCB", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn, [_fill(b, inst, side=Side.BUY, quantity="2", price="25.00", ref="zb1")]
+    )
     return a, b
 
 
@@ -162,8 +179,15 @@ async def test_an_account_with_nothing_has_zero_cash(conn, an_account):
 
 
 async def test_cash_is_scoped_to_its_account(conn, two_funded_accounts):
+    """Exact values, not `!=`: both the movement predicate and the FILL
+    predicate have to be pinned. `!=` passes for any two unequal numbers, so
+    an account_cash that summed B's fill into A's balance (450.00 vs 250.00)
+    would still satisfy it -- two wrong numbers that happen to differ."""
     a, b = two_funded_accounts
-    assert await account_cash(conn, a) != await account_cash(conn, b)
+    # A has no fills of its own; 500.00 only holds if B's is not summed in.
+    assert await account_cash(conn, a) == Decimal("500.00")
+    # 300.00 deposited - (2 * 25.00) spent as a fill.
+    assert await account_cash(conn, b) == Decimal("250.00")
 
 
 async def test_a_mixed_currency_account_is_refused(conn, mixed_currency_account):

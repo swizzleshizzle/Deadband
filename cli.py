@@ -907,12 +907,25 @@ async def cmd_snapshot_add(args) -> int:
         )
         return 2
 
+    account_id = UUID(args.account)
+
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
+            # Same get_account-then-check-None shape cmd_reconcile uses for
+            # its own --account (`cli.py`, step 1 below). Without it an
+            # unknown id reached account_snapshot.account_id's foreign key
+            # and escaped as a raw asyncpg.ForeignKeyViolationError
+            # traceback, since main() catches only OSError -- the worst of
+            # the three behaviours docs/known-gaps.md gap #26 compares.
+            account = await get_account(conn, account_id)
+            if account is None:
+                print(f"error: no account with id {account_id}", file=sys.stderr)
+                return 2
+
             await add_snapshot(
                 conn,
-                UUID(args.account),
+                account_id,
                 as_of,
                 cash_balance,
                 total_equity,
@@ -923,6 +936,18 @@ async def cmd_snapshot_add(args) -> int:
         # `async with pool.acquire()` block has exited, never from inside it,
         # or close() deadlocks waiting for a release that will never come.
         await pool.close()
+
+    # Spec §7: "snapshot add writes one row and prints what it stored." Not
+    # decoration -- `add_snapshot`'s ON CONFLICT DO UPDATE means re-adding the
+    # same (account, as_of) silently OVERWRITES a stored broker figure, which
+    # is the edit path gap #21 describes and the table keeps no history of.
+    # Echoing the stored figures is what lets the typist see a fat-fingered
+    # 523.40 before `reconcile` reports it as drift days later. Printed after
+    # the write, never before: it must report what the database accepted.
+    print(
+        f"snapshot stored for account {account_id}: as of {as_of.isoformat()}, "
+        f"equity {total_equity}, cash {cash_balance}"
+    )
     return 0
 
 
@@ -938,22 +963,39 @@ async def cmd_reconcile(args) -> int:
 
     as_of = now
     if args.as_of:
+        # The same bare-date fast path cmd_snapshot_add already has, and for
+        # the same reason: "2026-08-01" is the ordinary way to name a
+        # statement date, and it becomes midnight UTC. Without this,
+        # datetime.fromisoformat parses it to a NAIVE midnight, the tz guard
+        # below fires, and the two sibling commands disagree about the same
+        # string -- README.md's own worked example passes a bare date to
+        # `snapshot add` on one line and to `reconcile` on the next.
+        # date.fromisoformat accepts ONLY "YYYY-MM-DD", so anything carrying a
+        # time component falls through to the naive-timestamp check below,
+        # unchanged.
         try:
-            as_of = datetime.fromisoformat(args.as_of)
+            as_of = datetime.combine(date.fromisoformat(args.as_of), time.min, tzinfo=UTC)
         except ValueError:
-            print(f"error: --as-of {args.as_of!r} is not a valid timestamp", file=sys.stderr)
-            return 2
-        # Same TypeError hazard cmd_marks_set's identical comment describes:
-        # a naive datetime compared against an aware one downstream (here,
-        # inside latest_snapshot's own `as_of <= $2` bind) would raise
-        # asyncpg's own confusing error instead of a clean one naming the flag.
-        if as_of.tzinfo is None:
-            print(
-                f"error: --as-of {args.as_of!r} has no UTC offset "
-                "(e.g. append +00:00 or Z)",
-                file=sys.stderr,
-            )
-            return 2
+            try:
+                as_of = datetime.fromisoformat(args.as_of)
+            except ValueError:
+                print(
+                    f"error: --as-of {args.as_of!r} is not a valid date or timestamp",
+                    file=sys.stderr,
+                )
+                return 2
+            # Same TypeError hazard cmd_marks_set's identical comment
+            # describes: a naive datetime compared against an aware one
+            # downstream (here, inside latest_snapshot's own `as_of <= $2`
+            # bind) would raise asyncpg's own confusing error instead of a
+            # clean one naming the flag.
+            if as_of.tzinfo is None:
+                print(
+                    f"error: --as-of {args.as_of!r} has no UTC offset "
+                    "(e.g. append +00:00 or Z, or pass a bare date)",
+                    file=sys.stderr,
+                )
+                return 2
 
     # Same InvalidOperation/is_finite guards cmd_marks_set and cmd_snapshot_add
     # already have for their own Decimal arguments.
@@ -1135,17 +1177,27 @@ async def cmd_reconcile(args) -> int:
         for u in drift.unvaluable_positions:
             print(f"    {u.symbol}: {u.reason}")
 
+    # Exhaustive on purpose: every verdict is matched by name and anything
+    # unmatched crashes. The chain used to end in a bare `return 1` that
+    # printed the UNRELIABLE narration, so deleting the DRIFT branch would
+    # have relabelled every genuine drift as "could not be priced" -- a wrong
+    # explanation attached to a real number -- with nothing failing. A future
+    # ReconcileVerdict member would have inherited the same mislabelling
+    # silently; now it fails loudly at the one place that has to be updated.
     if drift.verdict == ReconcileVerdict.OK:
         return 0
-    if drift.verdict == ReconcileVerdict.DRIFT:
+    elif drift.verdict == ReconcileVerdict.DRIFT:
         print("drift: the ledger and the statement disagree outside tolerance", file=sys.stderr)
         return 1
-    print(
-        "unreliable: one or more positions could not be priced, so this verdict "
-        "cannot be trusted as a clean pass or a clean drift",
-        file=sys.stderr,
-    )
-    return 1
+    elif drift.verdict == ReconcileVerdict.UNRELIABLE:
+        print(
+            "unreliable: one or more positions could not be priced, so this verdict "
+            "cannot be trusted as a clean pass or a clean drift",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        raise AssertionError(f"unhandled verdict {drift.verdict}")
 
 
 def main() -> int:
