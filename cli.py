@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import pathlib
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
@@ -16,6 +16,7 @@ from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.positions import open_positions
+from db.snapshots import add_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
@@ -827,6 +828,102 @@ async def cmd_marks_set(args) -> int:
     return 0
 
 
+async def cmd_snapshot_add(args) -> int:
+    # The clock lives here, in the I/O layer -- db/snapshots.py is
+    # clock-free by design, same reasoning as cmd_marks_set's identical
+    # comment. This anchors the future-date guard below.
+    now = datetime.now(UTC)
+
+    # Same InvalidOperation/is_finite guards cmd_marks_set already has for
+    # --price, applied to both broker figures: Decimal("abc") raises
+    # InvalidOperation (not a ValueError), and Decimal("NaN") /
+    # Decimal("Infinity") construct successfully and would otherwise reach
+    # the database as a broker figure. Both parsed before opening the pool --
+    # whether this is a problem depends only on the arguments, never on the
+    # database.
+    try:
+        total_equity = Decimal(args.equity)
+    except InvalidOperation:
+        print(f"error: --equity {args.equity!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not total_equity.is_finite():
+        print(f"error: --equity {args.equity!r} must be a finite number", file=sys.stderr)
+        return 2
+
+    try:
+        cash_balance = Decimal(args.cash)
+    except InvalidOperation:
+        print(f"error: --cash {args.cash!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not cash_balance.is_finite():
+        print(f"error: --cash {args.cash!r} must be a finite number", file=sys.stderr)
+        return 2
+
+    # A bare date ("2026-07-31") is the ordinary way to enter a statement
+    # date and becomes midnight UTC -- but a naive TIMESTAMP is refused,
+    # matching marks_set exactly, because unlike a bare date it silently
+    # implies a wall-clock zone nobody named. date.fromisoformat accepts
+    # ONLY a bare "YYYY-MM-DD" string, so it cleanly tells the two apart:
+    # anything with a time component fails here and falls through to the
+    # naive-timestamp check below, unchanged from marks_set's behavior.
+    try:
+        as_of = datetime.combine(date.fromisoformat(args.as_of), time.min, tzinfo=UTC)
+    except ValueError:
+        try:
+            as_of = datetime.fromisoformat(args.as_of)
+        except ValueError:
+            print(
+                f"error: --as-of {args.as_of!r} is not a valid date or timestamp",
+                file=sys.stderr,
+            )
+            return 2
+        # Same TypeError hazard cmd_marks_set's identical comment describes:
+        # `as_of > now + tolerance` between an offset-naive and an
+        # offset-aware datetime raises an uncaught TypeError, never reaching
+        # add_snapshot's own ValueError for exactly this case. Checking here
+        # means a fat-fingered timestamp with no offset always gets a clean
+        # message instead of a traceback.
+        if as_of.tzinfo is None:
+            print(
+                f"error: --as-of {args.as_of!r} has no UTC offset "
+                "(e.g. append +00:00 or Z, or pass a bare date)",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Same reasoning as cmd_marks_set's identical guard: latest_snapshot
+    # treats the newest as_of as current, so a fat-fingered year would
+    # silently become the figure every reconciliation compares against.
+    # Reuses cmd_marks_set's tolerance constant rather than defining a
+    # second one -- both commands are typed by hand, not fired in a loop,
+    # and absorb the same clock skew for the same reason.
+    if as_of > now + _MARK_FUTURE_TOLERANCE:
+        print(
+            f"error: --as-of {as_of.isoformat()} is in the future "
+            f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+            file=sys.stderr,
+        )
+        return 2
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            await add_snapshot(
+                conn,
+                UUID(args.account),
+                as_of,
+                cash_balance,
+                total_equity,
+                note=args.note,
+            )
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -927,6 +1024,16 @@ def main() -> int:
         "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
     )
     p_marks_set.set_defaults(fn=cmd_marks_set)
+
+    p_snapshot = sub.add_parser("snapshot", help="broker statement figures")
+    snap_sub = p_snapshot.add_subparsers(dest="snapshot_command", required=True)
+    p_snap_add = snap_sub.add_parser("add", help="record a statement's equity and cash")
+    p_snap_add.add_argument("--account", required=True)
+    p_snap_add.add_argument("--as-of", required=True, help="ISO-8601 date or timestamp")
+    p_snap_add.add_argument("--equity", required=True, help="total equity the broker reports")
+    p_snap_add.add_argument("--cash", required=True, help="cash balance the broker reports")
+    p_snap_add.add_argument("--note", default=None)
+    p_snap_add.set_defaults(fn=cmd_snapshot_add)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether

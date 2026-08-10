@@ -17,6 +17,7 @@ from db.accounts import create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
+from db.snapshots import latest_snapshot
 from db.trades import regroup_account
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
@@ -2052,3 +2053,91 @@ async def test_positions_unscoped_shows_one_row_per_account_not_a_blend(
     ret_line = next(line for line in shrd_lines if "Retirement" in line)
     assert tax_line.split()[2] == "10.00"  # quantity, not blended with the other leg
     assert ret_line.split()[2] == "4.00"
+
+
+# --- cmd_snapshot_add ---------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def an_account(conn):
+    """A single account this test file owns, isolated by the rolled-back
+    `conn` transaction from tests/conftest.py -- it never persists."""
+    return await create_account(conn, name="Snap", venue="manual", account_type="cash")
+
+
+def _snapshot_args(*, account, as_of, equity, cash, note=None):
+    """Same pattern as `_args` above (marks-specific): a real
+    argparse.Namespace built by hand, not through parser.parse_args(). Named
+    distinctly from `_args` so it cannot collide with -- or silently widen --
+    the marks-only helper defined above; redefining that one would silently
+    break every marks test below it."""
+    return argparse.Namespace(account=account, as_of=as_of, equity=equity, cash=cash, note=note)
+
+
+async def test_snapshot_add_stores_the_figures(conn, an_account, monkeypatch):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2026-07-31",
+            equity="41203.18", cash="2110.00", note=None,
+        )
+    )
+    assert rc == 0
+    row = await latest_snapshot(conn, an_account)
+    assert row["total_equity"] == Decimal("41203.18")
+    # "figures" is plural -- cash must be pinned too, not just equity.
+    assert row["cash_balance"] == Decimal("2110.00")
+    # A bare date becomes midnight UTC: pins the "clock lives in the CLI"
+    # rule the same way test_marks_set_defaults_as_of_to_now_when_omitted
+    # pins its own clock rule -- a version that stored the date at local
+    # midnight, or dropped the offset, would fail this exact comparison.
+    assert row["as_of"] == datetime(2026, 7, 31, tzinfo=UTC)
+
+
+async def test_snapshot_add_refuses_a_future_as_of_without_writing(
+    conn, an_account, monkeypatch, capsys
+):
+    """Same reasoning as marks_set's identical guard: latest_snapshot treats
+    the newest as_of as current, so a fat-fingered year must be refused
+    before anything is written, not merely mis-recorded."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2099-01-01",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert "future" in capsys.readouterr().err.lower()
+    assert await latest_snapshot(conn, an_account) is None
+
+
+async def test_snapshot_add_refuses_a_non_finite_figure_without_writing(
+    conn, an_account, monkeypatch
+):
+    """Decimal("NaN") constructs successfully and would otherwise reach the
+    database as a broker figure -- is_finite() is this codebase's own
+    established guard against that (see cmd_marks_set's identical check)."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2026-07-31",
+            equity="NaN", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert await latest_snapshot(conn, an_account) is None
