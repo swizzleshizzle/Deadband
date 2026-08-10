@@ -17,9 +17,10 @@ from db.accounts import create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
+from db.positions import open_positions
 from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
-from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
+from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -2484,3 +2485,94 @@ async def test_reconcile_refuses_a_mixed_currency_account(
     assert rc == 2
     err = capsys.readouterr().err
     assert "USD" in err and "EUR" in err
+
+
+# --- Final review: a short position is a liability, not an asset --------------
+
+
+@pytest_asyncio.fixture
+async def short_reconcilable_account(conn):
+    """A genuine SHORT position, opened with a SELL, priced against a mark.
+
+    Named distinctly from `short_position_account` above (the cmd_positions
+    fixture) and using its own symbol: a second fixture reusing that name
+    would REDEFINE it at module scope and silently retarget every existing
+    test that requests it -- which is exactly what happened on the first
+    attempt here, reddening test_positions_values_a_short_in_the_right_
+    direction with this fixture's numbers.
+
+    Arithmetic: deposit 10000, then short 10 SHRT @ 50 -- the sale CREDITS
+    500 (net_cash is already direction-aware), so computed cash = 10500.
+    Marked at 60, the position is a liability worth -600, so computed equity =
+    10500 - 600 = 9900. The snapshot is set to exactly (10500, 9900).
+
+    Valued unsigned -- the bug this fixture exists to catch -- equity comes out
+    10500 + 600 = 11100: wrong by 1200, twice the market value, and reported
+    as DRIFT with the cash line agreeing to the cent, which reads as a pure
+    equity discrepancy and sends the reader hunting a phantom.
+
+    The fixture proves itself below rather than assuming: if this position
+    landed in the UNVALUABLE bucket instead (`unvaluable_reason` set), it would
+    never be turned into a `Position` at all, the verdict would be UNRELIABLE
+    for an unrelated reason, and the test would prove nothing about signing.
+    """
+    acc = await create_account(conn, name="ShortSeller", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRC", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "10000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.SELL, quantity="10", price="50", ref="shrc1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("60"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("10500"), total_equity=Decimal("9900")
+    )
+
+    (position,) = await open_positions(conn, acc)
+    assert position.direction is Direction.SHORT, (
+        f"fixture is not short: direction={position.direction!r}"
+    )
+    assert position.unvaluable_reason is None, (
+        "fixture landed in the unvaluable bucket "
+        f"({position.unvaluable_reason!r}) -- it would never be valued at all, "
+        "so a test built on it proves nothing about the direction sign"
+    )
+    # An unsigned MAGNITUDE, exactly as ledger/pnl.py:105 leaves it -- this is
+    # why `direction` has to travel alongside it.
+    assert position.quantity == Decimal("10")
+    return acc
+
+
+async def test_reconcile_values_a_short_position_as_a_liability(
+    conn, short_reconcilable_account, monkeypatch, capsys
+):
+    """End to end, through the real command: a short must SUBTRACT its market
+    value from equity. The sibling `positions` command has always passed
+    `direction` through to unrealized_pnl; `reconcile`'s adapter dropped it,
+    so every short was valued as though it were owned."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(short_reconcilable_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    out = captured.out
+    assert "verdict: ok" in out.lower()
+
+    # Parsed off the rendered line rather than string-matched, so the failure
+    # message names the wrong number instead of just "not found".
+    def _computed(label):
+        line = next(ln for ln in out.splitlines() if ln.strip().startswith(label))
+        return Decimal(line.split("computed", 1)[1].split()[0])
+
+    # Cash agrees to the cent whether or not the sign is applied -- which is
+    # exactly what made the unsigned bug read as a pure equity problem.
+    assert _computed("cash:") == Decimal("10500")
+    assert _computed("equity:") == Decimal("9900")  # 11100 if valued unsigned

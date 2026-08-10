@@ -1036,6 +1036,23 @@ async def cmd_reconcile(args) -> int:
                             quantity=p.quantity,
                             cost_basis=p.cost_basis,
                             multiplier=p.multiplier,
+                            # Load-bearing, not bookkeeping: `quantity` is an
+                            # unsigned magnitude for a short as much as a
+                            # long, so reconcile() needs this to know a short
+                            # SUBTRACTS from equity (see Position.direction).
+                            # Dropping it here valued shorts as assets --
+                            # equity wrong by twice the market value with the
+                            # cash line agreeing exactly, since account_cash
+                            # is already direction-aware.
+                            #
+                            # `p.direction` is Direction | None in general,
+                            # but never None on this branch:
+                            # ledger/positions.py appends an
+                            # unvaluable_reason for BOTH cases that leave it
+                            # unset (spread, mixed direction; :76-83 vs
+                            # :109-111), so `unvaluable_reason is None`
+                            # implies direction is exactly LONG or SHORT.
+                            direction=p.direction,
                         )
                     )
                 else:

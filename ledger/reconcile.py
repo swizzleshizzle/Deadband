@@ -9,6 +9,8 @@ from decimal import Decimal, localcontext
 from enum import StrEnum
 from uuid import UUID
 
+from ledger.types import Direction
+
 
 class ReconcileVerdict(StrEnum):
     OK = "ok"
@@ -33,6 +35,28 @@ class Position:
     quantity: Decimal
     cost_basis: Decimal  # per unit, excluding multiplier
     multiplier: Decimal
+    # REQUIRED, and deliberately given NO default. `quantity` above is an
+    # unsigned MAGNITUDE for a short exactly as much as for a long --
+    # ledger/pnl.py:105 adds every opening fill's quantity with `position +=
+    # qty` regardless of side, which is why unrealized_pnl takes `direction`
+    # as a separate argument and branches on it. So this field is the only
+    # thing that tells a 10-lot short from a 10-lot long, and valuing a short
+    # as an asset overstates equity by TWICE its market value while
+    # net_cash's own (direction-aware) figure still agrees to the cent -- a
+    # pure-looking equity discrepancy that sends the reader hunting a
+    # phantom. A default would make that failure silent on every call site
+    # that forgot the argument, which is the same trap docs/known-gaps.md
+    # gap #15 records for `Instrument.contract_multiplier` defaulting to 1
+    # ("silently 100x wrong for an option") and had to be guarded against
+    # with a crash.
+    #
+    # Only LONG and SHORT ever reach here. A caller builds these from
+    # `OpenPosition`s whose `unvaluable_reason is None`, and
+    # ledger/positions.py appends a reason for BOTH of the cases that leave
+    # `direction` unset or SPREAD (`:76-83` vs `:109-111`), so
+    # "unvaluable_reason is None" implies "direction is exactly LONG or
+    # SHORT". Anything else is a caller bug, not a case to model here.
+    direction: Direction
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +100,11 @@ def reconcile(
 
     Both equity_difference and cash_difference follow the convention:
     positive means the ledger computed MORE than the statement reported.
+
+    Verdict precedence: UNRELIABLE outranks DRIFT. With something unvalued, a
+    numeric gap cannot be attributed -- it may be entirely the missing
+    position, or may hide a real defect on top -- so reporting DRIFT would
+    claim a precision the data does not support.
     """
     with localcontext() as ctx:
         ctx.prec = 50
@@ -89,7 +118,18 @@ def reconcile(
                 # Falling back to cost basis is a knowingly stale valuation, not a zero.
                 price = p.cost_basis
                 unmarked.append(p.instrument_id)
-            market_value += p.quantity * price * p.multiplier
+            # SIGNED by direction, never bare. A short position is a
+            # liability: closing it costs its market value, so it SUBTRACTS
+            # from equity. `p.quantity` is an unsigned magnitude for both
+            # directions (see Position.direction's own comment), so without
+            # this sign a short is valued as though it were an asset --
+            # equity wrong by twice the position's market value, while the
+            # cash line still agrees to the cent because net_cash
+            # (ledger/cash.py) already credits a SELL. That combination
+            # reads as a pure equity discrepancy and sends the reader
+            # hunting a defect that is not there.
+            signed = -1 if p.direction is Direction.SHORT else 1
+            market_value += signed * p.quantity * price * p.multiplier
 
         computed_equity = computed_cash + market_value
         equity_difference = computed_equity - snapshot.total_equity
