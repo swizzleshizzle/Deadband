@@ -1,0 +1,154 @@
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import uuid4
+
+import pytest
+import pytest_asyncio
+
+from db.accounts import create_account
+from db.cash import MixedCurrencyError, account_cash
+from db.fills import insert_fills
+from db.importing import commit_batch
+from db.instruments import upsert_instrument
+from importers.base import CanonicalCash, ImportBatch
+from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
+from tests.conftest import requires_db
+
+pytestmark = requires_db
+
+T0 = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+
+
+def _fill(acc, inst, *, side, quantity, price, ref, fee="0"):
+    return Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=T0,
+        side=side,
+        quantity=Decimal(quantity),
+        price=Decimal(price),
+        fee=Decimal(fee),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id=ref,
+        is_estimated=False,
+    )
+
+
+async def _deposit(conn, acc, *, amount, currency="USD", kind="deposit"):
+    await commit_batch(
+        conn,
+        acc,
+        ImportBatch(
+            cash=(
+                CanonicalCash(
+                    occurred_at=T0,
+                    kind=kind,
+                    amount=Decimal(amount),
+                    currency=currency,
+                ),
+            )
+        ),
+        source="csv",
+    )
+
+
+@pytest_asyncio.fixture
+async def funded_account(conn):
+    """Deposit 1000.00, then buy 5 shares at 51.00 (spends 255.00 as a FILL,
+    not a movement). Net cash: 1000.00 - 255.00 = 745.00."""
+    acc = await create_account(conn, name="Funded", venue="manual", account_type="cash")
+    await _deposit(conn, acc, amount="1000.00")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="5", price="51.00", ref="zx1")]
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def option_account(conn):
+    """One buy of 2 option contracts at 3.50, contract_multiplier 100 -- no
+    deposit, so the account's cash is entirely the fill's notional: -(2 * 3.50
+    * 100) = -700.00. Every other fixture in this file uses AssetClass.EQUITY,
+    whose multiplier is 1, so nothing here distinguishes "read the column"
+    from "assume 1"."""
+    acc = await create_account(conn, name="Option", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(
+            id=None,
+            asset_class=AssetClass.OPTION,
+            symbol="ZXCO  261218C00050000",
+            quote_currency="USD",
+            underlying="ZXCO",
+            strike=Decimal("50"),
+            expiry=datetime(2026, 12, 18, tzinfo=UTC).date(),
+            option_right="call",
+            contract_multiplier=Decimal("100"),
+        ),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="2", price="3.50", ref="opt1")]
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def an_account(conn):
+    """No movements, no fills."""
+    return await create_account(conn, name="Empty", venue="manual", account_type="cash")
+
+
+@pytest_asyncio.fixture
+async def two_funded_accounts(conn):
+    """Two accounts, deposited different amounts (500.00 and 300.00) and
+    nothing else -- their cash must differ."""
+    a = await create_account(conn, name="FundedA", venue="manual", account_type="cash")
+    await _deposit(conn, a, amount="500.00")
+    b = await create_account(conn, name="FundedB", venue="manual", account_type="cash")
+    await _deposit(conn, b, amount="300.00")
+    return a, b
+
+
+@pytest_asyncio.fixture
+async def mixed_currency_account(conn):
+    """Two cash movements on the same account in different currencies -- USD
+    and EUR. v1 does not model FX."""
+    acc = await create_account(conn, name="Mixed", venue="manual", account_type="cash")
+    await _deposit(conn, acc, amount="100.00", currency="USD")
+    await _deposit(conn, acc, amount="50.00", currency="EUR")
+    return acc
+
+
+async def test_cash_combines_movements_and_fills(conn, funded_account):
+    """A buy spends cash as a FILL, not a movement -- a balance built from
+    movements alone would omit every trade."""
+    assert await account_cash(conn, funded_account) == Decimal("745.00")
+
+
+async def test_an_option_fill_uses_its_contract_multiplier(conn, option_account):
+    """2 contracts at 3.50 with x100 costs 700, not 7. Dropping the multiplier
+    makes the balance wrong by a hundredfold on every option trade."""
+    assert await account_cash(conn, option_account) == Decimal("-700.00")
+
+
+async def test_an_account_with_nothing_has_zero_cash(conn, an_account):
+    assert await account_cash(conn, an_account) == Decimal(0)
+
+
+async def test_cash_is_scoped_to_its_account(conn, two_funded_accounts):
+    a, b = two_funded_accounts
+    assert await account_cash(conn, a) != await account_cash(conn, b)
+
+
+async def test_a_mixed_currency_account_is_refused(conn, mixed_currency_account):
+    """v1 does not model FX. Summing across currencies produces a confident
+    wrong number, which is the failure class this project exists to avoid."""
+    with pytest.raises(MixedCurrencyError) as exc:
+        await account_cash(conn, mixed_currency_account)
+    assert "USD" in str(exc.value) and "EUR" in str(exc.value)
