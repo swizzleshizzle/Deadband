@@ -2549,7 +2549,7 @@ async def short_reconcilable_account(conn):
     attempt here, reddening test_positions_values_a_short_in_the_right_
     direction with this fixture's numbers.
 
-    Arithmetic: deposit 10000, then short 10 SHRT @ 50 -- the sale CREDITS
+    Arithmetic: deposit 10000, then short 10 SHRC @ 50 -- the sale CREDITS
     500 (net_cash is already direction-aware), so computed cash = 10500.
     Marked at 60, the position is a liability worth -600, so computed equity =
     10500 - 600 = 9900. The snapshot is set to exactly (10500, 9900).

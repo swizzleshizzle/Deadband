@@ -1091,8 +1091,8 @@ async def cmd_reconcile(args) -> int:
                             # but never None on this branch:
                             # ledger/positions.py appends an
                             # unvaluable_reason for BOTH cases that leave it
-                            # unset (spread, mixed direction; :76-83 vs
-                            # :109-111), so `unvaluable_reason is None`
+                            # unset (spread, mixed direction; :79-83 vs
+                            # :110-112), so `unvaluable_reason is None`
                             # implies direction is exactly LONG or SHORT.
                             direction=p.direction,
                         )
