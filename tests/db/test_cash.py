@@ -125,6 +125,26 @@ async def mixed_currency_account(conn):
     return acc
 
 
+@pytest_asyncio.fixture
+async def mixed_currency_instrument_account(conn):
+    """The mismatch lives entirely on the OTHER source this time: every
+    cash_movement here is USD, but the account's only fill is on an
+    instrument whose quote_currency is EUR. Spec §8 requires checking both
+    sources independently -- an account can be single-currency in one and
+    not the other -- so this fixture must trip the refusal via the
+    instrument side alone, with the movement side never varying."""
+    acc = await create_account(conn, name="MixedInstrument", venue="manual", account_type="cash")
+    await _deposit(conn, acc, amount="100.00", currency="USD")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="EURX", quote_currency="EUR"),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="1", price="10.00", ref="eu1")]
+    )
+    return acc
+
+
 async def test_cash_combines_movements_and_fills(conn, funded_account):
     """A buy spends cash as a FILL, not a movement -- a balance built from
     movements alone would omit every trade."""
@@ -151,4 +171,17 @@ async def test_a_mixed_currency_account_is_refused(conn, mixed_currency_account)
     wrong number, which is the failure class this project exists to avoid."""
     with pytest.raises(MixedCurrencyError) as exc:
         await account_cash(conn, mixed_currency_account)
+    assert "USD" in str(exc.value) and "EUR" in str(exc.value)
+
+
+async def test_a_mixed_currency_account_is_refused_via_instrument_quote_currency(
+    conn, mixed_currency_instrument_account
+):
+    """The mismatch this time comes from instrument.quote_currency, not
+    cash_movement.currency -- every movement on this account is USD. Spec §8
+    requires checking both sources independently ("an account can be
+    single-currency in one and not the other"); a gate pinned only on the
+    movement side would let this account straight through."""
+    with pytest.raises(MixedCurrencyError) as exc:
+        await account_cash(conn, mixed_currency_instrument_account)
     assert "USD" in str(exc.value) and "EUR" in str(exc.value)
