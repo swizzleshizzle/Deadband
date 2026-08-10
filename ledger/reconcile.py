@@ -53,7 +53,7 @@ class Position:
     # Only LONG and SHORT ever reach here. A caller builds these from
     # `OpenPosition`s whose `unvaluable_reason is None`, and
     # ledger/positions.py appends a reason for BOTH of the cases that leave
-    # `direction` unset or SPREAD (`:76-83` vs `:109-111`), so
+    # `direction` unset or SPREAD (`:79-83` vs `:110-112`), so
     # "unvaluable_reason is None" implies "direction is exactly LONG or
     # SHORT". Anything else is a caller bug, not a case to model here.
     direction: Direction
