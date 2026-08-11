@@ -98,6 +98,7 @@ tolerance) and `UNRELIABLE` (something could not be valued, so the comparison ca
 trusted either way) both exit 1. Exit 2 is a refusal — nothing was compared — and the
 complete list of them is:
 
+- `--account` is not a well-formed UUID (checked before the command runs at all);
 - `--as-of` is neither a valid date nor a valid timestamp;
 - `--as-of` is a timestamp carrying no UTC offset (a bare date is fine — it means midnight
   UTC);
@@ -105,12 +106,17 @@ complete list of them is:
 - `--tolerance` is negative (it would make every comparison read as drift);
 - no account with that id;
 - no snapshot on or before the effective `--as-of`;
-- the account is mixed-currency (see the paragraph above).
+- the account is mixed-currency (see the paragraph above);
+- the database could not be reached — any `OSError` escaping the run is reported as a
+  one-line `error: …` rather than a traceback. Not a judgement about your data like the
+  rest of the list, but it exits 2 and compares nothing, so it belongs here.
 
 That list is meant to be exhaustive, because a script branching on the exit code gets no
-other contract. A script that only checks the exit code cannot tell `DRIFT` from
-`UNRELIABLE` apart, nor one refusal from another; read stderr and the printed verdict for
-that.
+other contract. One deliberate exclusion: **argparse usage errors also exit 2** — a missing
+`--account`, an unknown subcommand — but those are Python CLI convention rather than this
+command's contract, and they fail before `reconcile` starts. A script that only checks the
+exit code cannot tell `DRIFT` from `UNRELIABLE` apart, nor one refusal from another; read
+stderr and the printed verdict for that.
 
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
 tests; set it to run them too).
