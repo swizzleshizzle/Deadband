@@ -830,6 +830,62 @@ async def cmd_marks_set(args) -> int:
     return 0
 
 
+def _parse_as_of(raw: str) -> datetime | None:
+    """Parse `--as-of` for `snapshot add` and `reconcile`: a bare date becomes
+    midnight UTC, a timestamp is taken as written, and anything else -- or a
+    timestamp with no UTC offset -- is refused. Returns None after printing the
+    refusal to stderr; the caller turns that into `return 2`. The flag name is
+    hardcoded rather than a parameter because both callers spell it `--as-of`
+    and both refusal messages were already byte-identical; a third caller under
+    a different flag name would be the moment to parametrise it, not before.
+
+    ONE parser for both commands, deliberately. They used to carry
+    near-identical copies, and the copies are exactly how the two drifted apart
+    once already: `snapshot add` accepted the bare date README.md's own worked
+    example passes, `reconcile` did not, and the documented two-line invocation
+    exited 2 on its second line. `cmd_marks_set` is intentionally NOT a caller
+    -- it accepts a timestamp only, and widening it to bare dates would be a
+    behaviour change, not a refactor.
+
+    The property the timestamp fallback depends on is that
+    `date.fromisoformat` rejects anything carrying a TIME COMPONENT -- verified
+    on this interpreter (3.12) for `2026-07-31T12:00`, `2026-07-31 12:00` and
+    `2026-07-31T12:00+00:00`, all ValueError. That, not "it accepts only
+    YYYY-MM-DD", is what makes the fallthrough sound: since 3.11 it also
+    accepts `20260801` and `2026-W31-1`, and the older comment here claimed
+    otherwise. Both of those are legitimate ways to name a day and correctly
+    become midnight UTC, so the widening costs nothing; what would break the
+    two-step is a time-carrying string being swallowed by the first branch and
+    never reaching the tz guard, and that cannot happen.
+    """
+    try:
+        return datetime.combine(date.fromisoformat(raw), time.min, tzinfo=UTC)
+    except ValueError:
+        pass
+
+    try:
+        as_of = datetime.fromisoformat(raw)
+    except ValueError:
+        print(f"error: --as-of {raw!r} is not a valid date or timestamp", file=sys.stderr)
+        return None
+
+    # Same TypeError hazard cmd_marks_set's identical comment describes: an
+    # offset-naive datetime compared against an offset-aware one downstream
+    # (`as_of > now + tolerance` in snapshot add, latest_snapshot's own
+    # `as_of <= $2` bind in reconcile) raises an uncaught TypeError or an
+    # asyncpg error rather than reaching a clean refusal. A bare DATE is
+    # exempt -- it is given UTC above rather than implying an unnamed
+    # wall-clock zone the way a bare timestamp does.
+    if as_of.tzinfo is None:
+        print(
+            f"error: --as-of {raw!r} has no UTC offset "
+            "(e.g. append +00:00 or Z, or pass a bare date)",
+            file=sys.stderr,
+        )
+        return None
+    return as_of
+
+
 async def cmd_snapshot_add(args) -> int:
     # The clock lives here, in the I/O layer -- db/snapshots.py is
     # clock-free by design, same reasoning as cmd_marks_set's identical
@@ -861,37 +917,15 @@ async def cmd_snapshot_add(args) -> int:
         print(f"error: --cash {args.cash!r} must be a finite number", file=sys.stderr)
         return 2
 
-    # A bare date ("2026-07-31") is the ordinary way to enter a statement
-    # date and becomes midnight UTC -- but a naive TIMESTAMP is refused,
-    # matching marks_set exactly, because unlike a bare date it silently
-    # implies a wall-clock zone nobody named. date.fromisoformat accepts
-    # ONLY a bare "YYYY-MM-DD" string, so it cleanly tells the two apart:
-    # anything with a time component fails here and falls through to the
-    # naive-timestamp check below, unchanged from marks_set's behavior.
-    try:
-        as_of = datetime.combine(date.fromisoformat(args.as_of), time.min, tzinfo=UTC)
-    except ValueError:
-        try:
-            as_of = datetime.fromisoformat(args.as_of)
-        except ValueError:
-            print(
-                f"error: --as-of {args.as_of!r} is not a valid date or timestamp",
-                file=sys.stderr,
-            )
-            return 2
-        # Same TypeError hazard cmd_marks_set's identical comment describes:
-        # `as_of > now + tolerance` between an offset-naive and an
-        # offset-aware datetime raises an uncaught TypeError, never reaching
-        # add_snapshot's own ValueError for exactly this case. Checking here
-        # means a fat-fingered timestamp with no offset always gets a clean
-        # message instead of a traceback.
-        if as_of.tzinfo is None:
-            print(
-                f"error: --as-of {args.as_of!r} has no UTC offset "
-                "(e.g. append +00:00 or Z, or pass a bare date)",
-                file=sys.stderr,
-            )
-            return 2
+    # A bare date ("2026-07-31") is the ordinary way to enter a statement date
+    # and becomes midnight UTC; a naive TIMESTAMP is refused, matching
+    # marks_set exactly, because unlike a bare date it silently implies a
+    # wall-clock zone nobody named. Both rules -- and the refusal messages --
+    # live in _parse_as_of, shared with cmd_reconcile so the two commands
+    # cannot read the same string differently again.
+    as_of = _parse_as_of(args.as_of)
+    if as_of is None:
+        return 2
 
     # Same reasoning as cmd_marks_set's identical guard: latest_snapshot
     # treats the newest as_of as current, so a fat-fingered year would
@@ -927,8 +961,8 @@ async def cmd_snapshot_add(args) -> int:
                 conn,
                 account_id,
                 as_of,
-                cash_balance,
-                total_equity,
+                cash_balance=cash_balance,
+                total_equity=total_equity,
                 note=args.note,
             )
     finally:
@@ -963,39 +997,15 @@ async def cmd_reconcile(args) -> int:
 
     as_of = now
     if args.as_of:
-        # The same bare-date fast path cmd_snapshot_add already has, and for
-        # the same reason: "2026-08-01" is the ordinary way to name a
-        # statement date, and it becomes midnight UTC. Without this,
-        # datetime.fromisoformat parses it to a NAIVE midnight, the tz guard
-        # below fires, and the two sibling commands disagree about the same
-        # string -- README.md's own worked example passes a bare date to
-        # `snapshot add` on one line and to `reconcile` on the next.
-        # date.fromisoformat accepts ONLY "YYYY-MM-DD", so anything carrying a
-        # time component falls through to the naive-timestamp check below,
-        # unchanged.
-        try:
-            as_of = datetime.combine(date.fromisoformat(args.as_of), time.min, tzinfo=UTC)
-        except ValueError:
-            try:
-                as_of = datetime.fromisoformat(args.as_of)
-            except ValueError:
-                print(
-                    f"error: --as-of {args.as_of!r} is not a valid date or timestamp",
-                    file=sys.stderr,
-                )
-                return 2
-            # Same TypeError hazard cmd_marks_set's identical comment
-            # describes: a naive datetime compared against an aware one
-            # downstream (here, inside latest_snapshot's own `as_of <= $2`
-            # bind) would raise asyncpg's own confusing error instead of a
-            # clean one naming the flag.
-            if as_of.tzinfo is None:
-                print(
-                    f"error: --as-of {args.as_of!r} has no UTC offset "
-                    "(e.g. append +00:00 or Z, or pass a bare date)",
-                    file=sys.stderr,
-                )
-                return 2
+        # Shared with cmd_snapshot_add -- see _parse_as_of. "2026-08-01" is the
+        # ordinary way to name a statement date and must mean the same thing in
+        # both commands: README.md's own worked example passes a bare date to
+        # `snapshot add` on one line and to `reconcile` on the next, and before
+        # the two parsers were unified the second line exited 2.
+        parsed = _parse_as_of(args.as_of)
+        if parsed is None:
+            return 2
+        as_of = parsed
 
     # Same InvalidOperation/is_finite guards cmd_marks_set and cmd_snapshot_add
     # already have for their own Decimal arguments.
@@ -1072,6 +1082,31 @@ async def cmd_reconcile(args) -> int:
             unvaluable: list[UnvaluableRef] = []
             for p in open_pos:
                 if p.unvaluable_reason is None:
+                    # ENFORCED, not merely documented. The comment on
+                    # `direction=` below argues the invariant holds today, and
+                    # it does -- but if it ever stops holding, nothing here
+                    # notices: `None is Direction.SHORT` is simply False inside
+                    # ledger/reconcile.py, so a direction-less position is
+                    # valued as a LONG. That is the exact silent 2x-market-value
+                    # equity error this branch just spent a fix wave removing,
+                    # and it would return with the cash line still agreeing to
+                    # the cent -- the shape that sends a reader hunting a
+                    # phantom. This repo's precedent for that class of hazard is
+                    # to crash rather than default (Instrument.__post_init__ on
+                    # an option's contract_multiplier; Position.direction given
+                    # no default at all).
+                    #
+                    # An explicit `raise`, NEVER `assert`: `python -O` strips
+                    # asserts, and a guard that vanishes under an optimisation
+                    # flag is exactly the one that must not.
+                    if p.direction is None:
+                        raise AssertionError(
+                            f"open position {p.instrument_id} ({p.symbol}) has "
+                            "unvaluable_reason None but direction None -- "
+                            "ledger/positions.py must record an unvaluable_reason "
+                            "for every position whose direction it leaves unset; "
+                            "valuing it here would silently price a short as a long"
+                        )
                     positions.append(
                         Position(
                             instrument_id=p.instrument_id,

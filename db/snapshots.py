@@ -14,6 +14,7 @@ async def add_snapshot(
     conn: asyncpg.Connection,
     account_id: UUID,
     as_of: datetime,
+    *,
     cash_balance: Decimal,
     total_equity: Decimal,
     source: str = "statement",
@@ -21,7 +22,16 @@ async def add_snapshot(
 ) -> None:
     """Record what the broker reported. Re-adding the same `as_of` UPDATES it --
     correcting a mistyped figure is the point, and the table has no history
-    columns. Same reasoning as db/marks.py's set_mark."""
+    columns. Same reasoning as db/marks.py's set_mark.
+
+    The two figures are KEYWORD-ONLY, and the `*` above is load-bearing. They
+    are adjacent parameters of the same type with no way to tell them apart at
+    a call site: transposed positionally, cash is stored as equity and equity
+    as cash, both are valid NUMERIC, nothing raises, and `reconcile` reports
+    the swap days later as unexplained drift on both lines at once -- a
+    confidently wrong number with a plausible-looking cause. db/marks.py's
+    set_mark needs no such guard because it takes a single figure; the hazard
+    is the pair, not the type."""
     if as_of.tzinfo is None:
         raise ValueError("snapshot as_of must be timezone-aware")
     await conn.execute(
