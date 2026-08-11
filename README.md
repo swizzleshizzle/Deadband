@@ -88,16 +88,29 @@ mistyped figure is the point, and the table keeps no history. `reconcile` takes
 
 Cash is derived from the account's cash movements *and* its fills — a buy spends cash as
 a fill, not a movement, so a balance built from movements alone would omit every trade —
-and an account whose movements or instruments span more than one currency is refused
-rather than summed incorrectly. A position `positions` cannot value (see `docs/known-gaps.md`
-gap #12's note) is excluded from computed equity and named in the output rather than
-silently dropped or silently priced.
+and an account whose cash movements, instruments, or nonzero fill fees span more than one
+currency is refused rather than summed incorrectly. A position `positions` cannot value
+(see `docs/known-gaps.md` gap #12's note) is excluded from computed equity and named in
+the output rather than silently dropped or silently priced.
 
 **`reconcile` exits 0 only when the verdict is `OK`.** `DRIFT` (numbers disagree beyond
 tolerance) and `UNRELIABLE` (something could not be valued, so the comparison cannot be
-trusted either way) both exit 1; a refusal — unknown account, no snapshot on file, or a
-mixed-currency account — exits 2. A script that only checks the exit code cannot tell
-`DRIFT` from `UNRELIABLE` apart; read the printed verdict for that.
+trusted either way) both exit 1. Exit 2 is a refusal — nothing was compared — and the
+complete list of them is:
+
+- `--as-of` is neither a valid date nor a valid timestamp;
+- `--as-of` is a timestamp carrying no UTC offset (a bare date is fine — it means midnight
+  UTC);
+- `--tolerance` is not a valid number, or is `NaN`/`Infinity`;
+- `--tolerance` is negative (it would make every comparison read as drift);
+- no account with that id;
+- no snapshot on or before the effective `--as-of`;
+- the account is mixed-currency (see the paragraph above).
+
+That list is meant to be exhaustive, because a script branching on the exit code gets no
+other contract. A script that only checks the exit code cannot tell `DRIFT` from
+`UNRELIABLE` apart, nor one refusal from another; read stderr and the printed verdict for
+that.
 
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
 tests; set it to run them too).
