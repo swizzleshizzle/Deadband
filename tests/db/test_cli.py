@@ -2231,6 +2231,32 @@ async def _add_orphaned_position(conn, acc, *, symbol, ref):
     await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
     await regroup_account(conn, acc)
 
+    # The fixture proves itself, the same way short_reconcilable_account below
+    # does. Everything the UNRELIABLE tests assert rests on this position being
+    # unvaluable, and that rests on two things nothing else here pins: that
+    # regroup_account PRESERVES a trade whose `notes` are set (rather than
+    # reaping it with the rest), and that the composite FK nulls
+    # `opening_fill_id` when the opening fill is deleted, which is what makes
+    # db/positions.py force quantity/cost_basis to None.
+    #
+    # If either changes, this call quietly yields a VALUABLE position: the
+    # verdict becomes OK or DRIFT instead of UNRELIABLE and the tests built on
+    # it fail with a bare verdict mismatch that names nothing -- or, worse,
+    # unreliable_but_agreeing_account's numbers still add up and it passes for
+    # the wrong reason. The protected trade keeps its own id through the
+    # protection UPDATE, and db/positions.py substitutes that id for the
+    # unreachable instrument's, so it is the exact key to find the row by.
+    (orphaned,) = [
+        p for p in await open_positions(conn, acc) if p.instrument_id == trade["id"]
+    ]
+    assert orphaned.unvaluable_reason is not None, (
+        f"orphaned position for {symbol!r} came back VALUABLE "
+        f"(direction={orphaned.direction!r}, quantity={orphaned.quantity!r}) -- "
+        "the UNRELIABLE tests built on this fixture would prove nothing, since "
+        "the position would be valued normally and the verdict would never be "
+        "UNRELIABLE for the reason they claim"
+    )
+
 
 async def _deposit(conn, acc, amount, *, currency="USD"):
     """Cash in, via cash_movement directly (no importer in play here) -- the
@@ -2714,3 +2740,101 @@ async def test_reconcile_reports_plain_drift(conn, drifting_account, monkeypatch
     assert "cannot be priced" not in out
     assert "disagree outside tolerance" in err
     assert "could not be priced" not in err
+
+
+# --- Review round 2: the --as-of refusal branches, in both commands ----------
+#
+# `snapshot add` and `cmd_reconcile` now share ONE parser (cli._parse_as_of),
+# so two of these four exercise the same helper as the other two. They are kept
+# per-command deliberately: what each test pins is that ITS command routes
+# --as-of through the parser at all and turns a None into exit 2. A future edit
+# that inlined the parse back into one command, or dropped the `if ... is None:
+# return 2` on one side, would leave the helper's own behaviour untouched and
+# would only ever be caught by the per-command pair.
+#
+# Both refusals were reachable and both printed a distinct message with nothing
+# asserting on either -- deleting either branch left the suite green.
+#
+# fake_create_pool RAISES rather than returning a stand-in: whether a string
+# parses depends only on the argument, never on the database, so the refusal has
+# to land before a connection is opened. That also makes these tests independent
+# of any fixture -- a bogus account id is fine, because nothing ever looks it up.
+
+
+async def test_snapshot_add_refuses_a_naive_as_of_timestamp(conn, monkeypatch, capsys):
+    """A timestamp with no offset silently implies a wall-clock zone nobody
+    named, and would reach `as_of > now + tolerance` -- an offset-naive vs
+    offset-aware comparison -- as an uncaught TypeError. A bare DATE is
+    deliberately still accepted (it means midnight UTC), so the message has to
+    say what is missing rather than "not a valid date"."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(uuid4()), as_of="2026-07-31T12:00",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "utc offset" in err
+    # Not the unparseable message: the two branches must stay distinguishable
+    # to a reader, since the fix for each is different.
+    assert "not a valid date or timestamp" not in err
+
+
+async def test_snapshot_add_refuses_an_unparseable_as_of(conn, monkeypatch, capsys):
+    """Neither a date nor a timestamp. Distinct from the naive-timestamp
+    refusal above: nothing here can be fixed by appending an offset."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(uuid4()), as_of="not-a-date",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "not a valid date or timestamp" in err
+    assert "not-a-date" in err
+
+
+async def test_reconcile_refuses_a_naive_as_of_timestamp(conn, monkeypatch, capsys):
+    """Same string, same refusal, on the sibling command -- the two disagreeing
+    about how to read one --as-of value is exactly the defect the shared parser
+    exists to prevent (it happened once already, with a bare date). Here a naive
+    timestamp would otherwise reach latest_snapshot's `as_of <= $2` bind and
+    surface as an asyncpg error instead of a clean message."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of="2026-07-31T12:00", tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "utc offset" in err
+    assert "not a valid date or timestamp" not in err
+
+
+async def test_reconcile_refuses_an_unparseable_as_of(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of="not-a-date", tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "not a valid date or timestamp" in err
+    assert "not-a-date" in err
