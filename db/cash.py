@@ -73,8 +73,8 @@ async def account_cash(conn: asyncpg.Connection, account_id: UUID) -> Decimal:
     )
     if len(currencies) > 1:
         raise MixedCurrencyError(
-            f"account {account_id} has cash movements/instruments/fill fees in "
-            f"more than one currency: {', '.join(sorted(currencies))}"
+            f"account {account_id} has cash movements/instruments/nonzero fill "
+            f"fees in more than one currency: {', '.join(sorted(currencies))}"
         )
 
     movements = [CashMovementRow(kind=r["kind"], amount=r["amount"]) for r in movement_rows]
