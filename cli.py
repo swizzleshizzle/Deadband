@@ -6,20 +6,23 @@ import argparse
 import asyncio
 import pathlib
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
+from db.cash import MixedCurrencyError, account_cash
 from db.importing import commit_batch, probe_duplicates, route_batch
 from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.positions import open_positions
+from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
 from ledger.pnl import unrealized_pnl
+from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
@@ -827,6 +830,411 @@ async def cmd_marks_set(args) -> int:
     return 0
 
 
+def _parse_as_of(raw: str) -> datetime | None:
+    """Parse `--as-of` for `snapshot add` and `reconcile`: a bare date becomes
+    midnight UTC, a timestamp is taken as written, and anything else -- or a
+    timestamp with no UTC offset -- is refused. Returns None after printing the
+    refusal to stderr; the caller turns that into `return 2`. The flag name is
+    hardcoded rather than a parameter because both callers spell it `--as-of`
+    and both refusal messages were already byte-identical; a third caller under
+    a different flag name would be the moment to parametrise it, not before.
+
+    ONE parser for both commands, deliberately. They used to carry
+    near-identical copies, and the copies are exactly how the two drifted apart
+    once already: `snapshot add` accepted the bare date README.md's own worked
+    example passes, `reconcile` did not, and the documented two-line invocation
+    exited 2 on its second line. `cmd_marks_set` is intentionally NOT a caller
+    -- it accepts a timestamp only, and widening it to bare dates would be a
+    behaviour change, not a refactor.
+
+    The property the timestamp fallback depends on is that
+    `date.fromisoformat` rejects anything carrying a TIME COMPONENT -- verified
+    on this interpreter (3.12) for `2026-07-31T12:00`, `2026-07-31 12:00` and
+    `2026-07-31T12:00+00:00`, all ValueError. That, not "it accepts only
+    YYYY-MM-DD", is what makes the fallthrough sound: since 3.11 it also
+    accepts `20260801` and `2026-W31-1`, and the older comment here claimed
+    otherwise. Both of those are legitimate ways to name a day and correctly
+    become midnight UTC, so the widening costs nothing; what would break the
+    two-step is a time-carrying string being swallowed by the first branch and
+    never reaching the tz guard, and that cannot happen.
+    """
+    try:
+        return datetime.combine(date.fromisoformat(raw), time.min, tzinfo=UTC)
+    except ValueError:
+        pass
+
+    try:
+        as_of = datetime.fromisoformat(raw)
+    except ValueError:
+        print(f"error: --as-of {raw!r} is not a valid date or timestamp", file=sys.stderr)
+        return None
+
+    # Same TypeError hazard cmd_marks_set's identical comment describes: an
+    # offset-naive datetime compared against an offset-aware one downstream
+    # (`as_of > now + tolerance` in snapshot add, latest_snapshot's own
+    # `as_of <= $2` bind in reconcile) raises an uncaught TypeError or an
+    # asyncpg error rather than reaching a clean refusal. A bare DATE is
+    # exempt -- it is given UTC above rather than implying an unnamed
+    # wall-clock zone the way a bare timestamp does.
+    if as_of.tzinfo is None:
+        print(
+            f"error: --as-of {raw!r} has no UTC offset "
+            "(e.g. append +00:00 or Z, or pass a bare date)",
+            file=sys.stderr,
+        )
+        return None
+    return as_of
+
+
+async def cmd_snapshot_add(args) -> int:
+    # The clock lives here, in the I/O layer -- db/snapshots.py is
+    # clock-free by design, same reasoning as cmd_marks_set's identical
+    # comment. This anchors the future-date guard below.
+    now = datetime.now(UTC)
+
+    # Same InvalidOperation/is_finite guards cmd_marks_set already has for
+    # --price, applied to both broker figures: Decimal("abc") raises
+    # InvalidOperation (not a ValueError), and Decimal("NaN") /
+    # Decimal("Infinity") construct successfully and would otherwise reach
+    # the database as a broker figure. Both parsed before opening the pool --
+    # whether this is a problem depends only on the arguments, never on the
+    # database.
+    try:
+        total_equity = Decimal(args.equity)
+    except InvalidOperation:
+        print(f"error: --equity {args.equity!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not total_equity.is_finite():
+        print(f"error: --equity {args.equity!r} must be a finite number", file=sys.stderr)
+        return 2
+
+    try:
+        cash_balance = Decimal(args.cash)
+    except InvalidOperation:
+        print(f"error: --cash {args.cash!r} is not a valid number", file=sys.stderr)
+        return 2
+    if not cash_balance.is_finite():
+        print(f"error: --cash {args.cash!r} must be a finite number", file=sys.stderr)
+        return 2
+
+    # A bare date ("2026-07-31") is the ordinary way to enter a statement date
+    # and becomes midnight UTC; a naive TIMESTAMP is refused, matching
+    # marks_set exactly, because unlike a bare date it silently implies a
+    # wall-clock zone nobody named. Both rules -- and the refusal messages --
+    # live in _parse_as_of, shared with cmd_reconcile so the two commands
+    # cannot read the same string differently again.
+    as_of = _parse_as_of(args.as_of)
+    if as_of is None:
+        return 2
+
+    # Same reasoning as cmd_marks_set's identical guard: latest_snapshot
+    # treats the newest as_of as current, so a fat-fingered year would
+    # silently become the figure every reconciliation compares against.
+    # Reuses cmd_marks_set's tolerance constant rather than defining a
+    # second one -- both commands are typed by hand, not fired in a loop,
+    # and absorb the same clock skew for the same reason.
+    if as_of > now + _MARK_FUTURE_TOLERANCE:
+        print(
+            f"error: --as-of {as_of.isoformat()} is in the future "
+            f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+            file=sys.stderr,
+        )
+        return 2
+
+    account_id = UUID(args.account)
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            # Same get_account-then-check-None shape cmd_reconcile uses for
+            # its own --account (`cli.py`, step 1 below). Without it an
+            # unknown id reached account_snapshot.account_id's foreign key
+            # and escaped as a raw asyncpg.ForeignKeyViolationError
+            # traceback, since main() catches only OSError -- the worst of
+            # the three behaviours docs/known-gaps.md gap #26 compares.
+            account = await get_account(conn, account_id)
+            if account is None:
+                print(f"error: no account with id {account_id}", file=sys.stderr)
+                return 2
+
+            await add_snapshot(
+                conn,
+                account_id,
+                as_of,
+                cash_balance=cash_balance,
+                total_equity=total_equity,
+                note=args.note,
+            )
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    # Spec §7: "snapshot add writes one row and prints what it stored." Not
+    # decoration -- `add_snapshot`'s ON CONFLICT DO UPDATE means re-adding the
+    # same (account, as_of) silently OVERWRITES a stored broker figure, which
+    # is the edit path gap #21 describes and the table keeps no history of.
+    # Echoing the stored figures is what lets the typist see a fat-fingered
+    # 523.40 before `reconcile` reports it as drift days later. Printed after
+    # the write, never before: it must report what the database accepted.
+    print(
+        f"snapshot stored for account {account_id}: as of {as_of.isoformat()}, "
+        f"equity {total_equity}, cash {cash_balance}"
+    )
+    return 0
+
+
+async def cmd_reconcile(args) -> int:
+    """Compare the ledger against a stored broker-statement snapshot and
+    report one trustworthy verdict (spec §7). This is the command the whole
+    branch exists for -- see ledger/reconcile.py for the pure comparison and
+    its Drift.verdict field, which is THE thing rendered below.
+    """
+    # The clock lives here, in the I/O layer -- same reasoning as
+    # cmd_marks_set's and cmd_snapshot_add's identical comments.
+    now = datetime.now(UTC)
+
+    as_of = now
+    if args.as_of:
+        # Shared with cmd_snapshot_add -- see _parse_as_of. "2026-08-01" is the
+        # ordinary way to name a statement date and must mean the same thing in
+        # both commands: README.md's own worked example passes a bare date to
+        # `snapshot add` on one line and to `reconcile` on the next, and before
+        # the two parsers were unified the second line exited 2.
+        parsed = _parse_as_of(args.as_of)
+        if parsed is None:
+            return 2
+        as_of = parsed
+
+    # Same InvalidOperation/is_finite guards cmd_marks_set and cmd_snapshot_add
+    # already have for their own Decimal arguments.
+    tolerance = Decimal("0.01")
+    if args.tolerance is not None:
+        try:
+            tolerance = Decimal(args.tolerance)
+        except InvalidOperation:
+            print(
+                f"error: --tolerance {args.tolerance!r} is not a valid number",
+                file=sys.stderr,
+            )
+            return 2
+        if not tolerance.is_finite():
+            print(
+                f"error: --tolerance {args.tolerance!r} must be a finite number",
+                file=sys.stderr,
+            )
+            return 2
+        # is_finite() above rejects NaN/Infinity but not a negative number.
+        # A negative tolerance makes `abs(difference) <= tolerance`
+        # unsatisfiable, so EVERY run -- even a perfectly reconciled account
+        # -- would report DRIFT: a confidently wrong verdict produced from a
+        # silently accepted bad input, the same failure class the
+        # mixed-currency refusal below exists to avoid. Checked here, before
+        # the pool is ever opened, same as every other argument guard above.
+        if tolerance < 0:
+            print(
+                f"error: --tolerance {args.tolerance!r} must not be negative "
+                "-- a negative tolerance would make every comparison read as drift",
+                file=sys.stderr,
+            )
+            return 2
+
+    account_id = UUID(args.account)
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            # 1. Resolve the account. Unknown id refuses, exit 2 -- same
+            # get_account-then-check-None shape cmd_import already uses for
+            # its own --account, rather than letting a foreign-key violation
+            # surface later as a raw traceback.
+            account = await get_account(conn, account_id)
+            if account is None:
+                print(f"error: no account with id {account_id}", file=sys.stderr)
+                return 2
+
+            # 2. latest_snapshot. None refuses, exit 2 -- reporting "zero
+            # drift" against nothing is the silent-success shape this whole
+            # command exists to avoid.
+            snap_row = await latest_snapshot(conn, account_id, as_of)
+            if snap_row is None:
+                print(
+                    f"error: no snapshot on or before {as_of.isoformat()} for "
+                    f"account {account_id} -- record one with `snapshot add`",
+                    file=sys.stderr,
+                )
+                return 2
+            snapshot = Snapshot(
+                account_id=account_id,
+                as_of=snap_row["as_of"],
+                cash_balance=snap_row["cash_balance"],
+                total_equity=snap_row["total_equity"],
+            )
+
+            # 3-4. open_positions, then partition on unvaluable_reason --
+            # NEVER on direction. A group can agree on a single direction and
+            # still be unvaluable for another reason (ledger/positions.py's
+            # own OpenPosition docstring), so a non-None direction here is not
+            # a signal that pricing is safe.
+            open_pos = await open_positions(conn, account_id)
+            positions: list[Position] = []
+            unvaluable: list[UnvaluableRef] = []
+            for p in open_pos:
+                if p.unvaluable_reason is None:
+                    # ENFORCED, not merely documented. The comment on
+                    # `direction=` below argues the invariant holds today, and
+                    # it does -- but if it ever stops holding, nothing here
+                    # notices: `None is Direction.SHORT` is simply False inside
+                    # ledger/reconcile.py, so a direction-less position is
+                    # valued as a LONG. That is the exact silent 2x-market-value
+                    # equity error this branch just spent a fix wave removing,
+                    # and it would return with the cash line still agreeing to
+                    # the cent -- the shape that sends a reader hunting a
+                    # phantom. This repo's precedent for that class of hazard is
+                    # to crash rather than default (Instrument.__post_init__ on
+                    # an option's contract_multiplier; Position.direction given
+                    # no default at all).
+                    #
+                    # An explicit `raise`, NEVER `assert`: `python -O` strips
+                    # asserts, and a guard that vanishes under an optimisation
+                    # flag is exactly the one that must not.
+                    if p.direction is None:
+                        raise AssertionError(
+                            f"open position {p.instrument_id} ({p.symbol}) has "
+                            "unvaluable_reason None but direction None -- "
+                            "ledger/positions.py must record an unvaluable_reason "
+                            "for every position whose direction it leaves unset; "
+                            "valuing it here would silently price a short as a long"
+                        )
+                    positions.append(
+                        Position(
+                            instrument_id=p.instrument_id,
+                            quantity=p.quantity,
+                            cost_basis=p.cost_basis,
+                            multiplier=p.multiplier,
+                            # Load-bearing, not bookkeeping: `quantity` is an
+                            # unsigned magnitude for a short as much as a
+                            # long, so reconcile() needs this to know a short
+                            # SUBTRACTS from equity (see Position.direction).
+                            # Dropping it here valued shorts as assets --
+                            # equity wrong by twice the market value with the
+                            # cash line agreeing exactly, since account_cash
+                            # is already direction-aware.
+                            #
+                            # `p.direction` is Direction | None in general,
+                            # but never None on this branch:
+                            # ledger/positions.py appends an
+                            # unvaluable_reason for BOTH cases that leave it
+                            # unset (spread, mixed direction; :79-83 vs
+                            # :110-112), so `unvaluable_reason is None`
+                            # implies direction is exactly LONG or SHORT.
+                            direction=p.direction,
+                        )
+                    )
+                else:
+                    unvaluable.append(
+                        UnvaluableRef(
+                            instrument_id=p.instrument_id,
+                            symbol=p.symbol,
+                            reason=p.unvaluable_reason,
+                        )
+                    )
+
+            # 5. latest_marks for the valuable instrument ids only, mapped to
+            # JUST the price. latest_marks returns a (price, timestamp) tuple
+            # per instrument (db/marks.py) -- reconcile() wants a bare
+            # Mapping[UUID, Decimal], so passing the tuple straight through
+            # would misvalue every marked position. An instrument absent from
+            # this dict (never present with a zero -- a genuine 0 mark is
+            # legal) falls back to cost basis inside reconcile() itself.
+            raw_marks = await latest_marks(conn, [p.instrument_id for p in positions])
+            marks = {instrument_id: price for instrument_id, (price, _as_of) in raw_marks.items()}
+
+            # 6. account_cash; MixedCurrencyError refuses, exit 2.
+            try:
+                computed_cash = await account_cash(conn, account_id)
+            except MixedCurrencyError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    # 7. reconcile() -> Drift. Pure, no I/O, no clock.
+    drift = reconcile(
+        snapshot, positions, marks, computed_cash, unvaluable=unvaluable, tolerance=tolerance
+    )
+
+    # 8. Render by verdict -- THE field callers render (see Drift's own
+    # docstring). is_within_tolerance answers only "do the numbers agree" and
+    # is a component, never the answer: rendering it alone would print a
+    # clean pass on an account with unvalued positions.
+    print(f"account {account_id}")
+    # Two DIFFERENT clocks, deliberately labelled apart: drift.as_of is the
+    # STATEMENT's date (snapshot.as_of, ledger/reconcile.py), but
+    # computed_cash, open_positions and latest_marks above all read CURRENT
+    # ledger state -- open_positions and latest_marks take no `as_of` at all.
+    # A single "as of <statement date>" header above numbers that are
+    # actually current would misrepresent a week of ordinary trading since
+    # the statement as drift "as of" a date before any of it happened -- the
+    # same phantom-hunt shape the unvaluable-exclusion message above exists
+    # to prevent. `now` was captured at the very top of this function, so it
+    # is the same instant the future-date guards above measured against.
+    print(f"  statement as of {drift.as_of.isoformat()}")
+    print(f"  ledger as of    {now.isoformat()}")
+    print(f"  verdict: {drift.verdict.value}")
+    print(
+        f"  equity: computed {drift.computed_equity}  reported {drift.reported_equity}  "
+        f"diff {drift.equity_difference}"
+    )
+    print(
+        f"  cash:   computed {drift.computed_cash}  reported {drift.reported_cash}  "
+        f"diff {drift.cash_difference}"
+    )
+    if drift.unmarked_instruments:
+        print(
+            f"  {len(drift.unmarked_instruments)} position(s) valued at cost basis -- "
+            "no mark on file"
+        )
+    if drift.unvaluable_positions:
+        # The output must explain the alarming number: computed_equity above
+        # EXCLUDES these positions entirely (they were never turned into a
+        # Position), so a large equity_difference here is expected, not
+        # necessarily a defect -- saying so is the difference between a
+        # useful report and a phantom hunt.
+        print(
+            f"  {len(drift.unvaluable_positions)} position(s) excluded from "
+            "computed equity above (not included in the totals -- cannot be priced):"
+        )
+        for u in drift.unvaluable_positions:
+            print(f"    {u.symbol}: {u.reason}")
+
+    # Exhaustive on purpose: every verdict is matched by name and anything
+    # unmatched crashes. The chain used to end in a bare `return 1` that
+    # printed the UNRELIABLE narration, so deleting the DRIFT branch would
+    # have relabelled every genuine drift as "could not be priced" -- a wrong
+    # explanation attached to a real number -- with nothing failing. A future
+    # ReconcileVerdict member would have inherited the same mislabelling
+    # silently; now it fails loudly at the one place that has to be updated.
+    if drift.verdict == ReconcileVerdict.OK:
+        return 0
+    elif drift.verdict == ReconcileVerdict.DRIFT:
+        print("drift: the ledger and the statement disagree outside tolerance", file=sys.stderr)
+        return 1
+    elif drift.verdict == ReconcileVerdict.UNRELIABLE:
+        print(
+            "unreliable: one or more positions could not be priced, so this verdict "
+            "cannot be trusted as a clean pass or a clean drift",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        raise AssertionError(f"unhandled verdict {drift.verdict}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -927,6 +1335,24 @@ def main() -> int:
         "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
     )
     p_marks_set.set_defaults(fn=cmd_marks_set)
+
+    p_snapshot = sub.add_parser("snapshot", help="broker statement figures")
+    snap_sub = p_snapshot.add_subparsers(dest="snapshot_command", required=True)
+    p_snap_add = snap_sub.add_parser("add", help="record a statement's equity and cash")
+    p_snap_add.add_argument("--account", required=True)
+    p_snap_add.add_argument("--as-of", required=True, help="ISO-8601 date or timestamp")
+    p_snap_add.add_argument("--equity", required=True, help="total equity the broker reports")
+    p_snap_add.add_argument("--cash", required=True, help="cash balance the broker reports")
+    p_snap_add.add_argument("--note", default=None)
+    p_snap_add.set_defaults(fn=cmd_snapshot_add)
+
+    p_reconcile = sub.add_parser(
+        "reconcile", help="compare the ledger against a statement snapshot"
+    )
+    p_reconcile.add_argument("--account", required=True)
+    p_reconcile.add_argument("--as-of", default=None, help="ISO-8601; defaults to now")
+    p_reconcile.add_argument("--tolerance", default=None, help="default 0.01")
+    p_reconcile.set_defaults(fn=cmd_reconcile)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether

@@ -17,8 +17,10 @@ from db.accounts import create_account
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
-from db.trades import regroup_account
-from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
+from db.positions import open_positions
+from db.snapshots import add_snapshot, latest_snapshot
+from db.trades import list_trades, regroup_account
+from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
 pytestmark = requires_db
@@ -2052,3 +2054,787 @@ async def test_positions_unscoped_shows_one_row_per_account_not_a_blend(
     ret_line = next(line for line in shrd_lines if "Retirement" in line)
     assert tax_line.split()[2] == "10.00"  # quantity, not blended with the other leg
     assert ret_line.split()[2] == "4.00"
+
+
+# --- cmd_snapshot_add ---------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def an_account(conn):
+    """A single account this test file owns, isolated by the rolled-back
+    `conn` transaction from tests/conftest.py -- it never persists."""
+    return await create_account(conn, name="Snap", venue="manual", account_type="cash")
+
+
+def _snapshot_args(*, account, as_of, equity, cash, note=None):
+    """Same pattern as `_args` above (marks-specific): a real
+    argparse.Namespace built by hand, not through parser.parse_args(). Named
+    distinctly from `_args` so it cannot collide with -- or silently widen --
+    the marks-only helper defined above; redefining that one would silently
+    break every marks test below it."""
+    return argparse.Namespace(account=account, as_of=as_of, equity=equity, cash=cash, note=note)
+
+
+async def test_snapshot_add_stores_the_figures(conn, an_account, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2026-07-31",
+            equity="41203.18", cash="2110.00", note=None,
+        )
+    )
+    assert rc == 0
+    # Spec §7: "snapshot add writes one row and prints what it stored." A
+    # silent success is what makes the overwrite path (gap #21 -- re-adding
+    # the same as_of replaces a stored broker figure, with no history kept)
+    # invisible, and it is the only chance the typist gets to notice a
+    # fat-fingered figure before `reconcile` reports it as drift days later.
+    # Both figures and the resolved as_of, so a version echoing only one of
+    # them -- or echoing the argument instead of what was stored -- fails.
+    out = capsys.readouterr().out
+    assert "41203.18" in out
+    assert "2110.00" in out
+    assert "2026-07-31" in out
+    row = await latest_snapshot(conn, an_account)
+    assert row["total_equity"] == Decimal("41203.18")
+    # "figures" is plural -- cash must be pinned too, not just equity.
+    assert row["cash_balance"] == Decimal("2110.00")
+    # A bare date becomes midnight UTC: pins the "clock lives in the CLI"
+    # rule the same way test_marks_set_defaults_as_of_to_now_when_omitted
+    # pins its own clock rule -- a version that stored the date at local
+    # midnight, or dropped the offset, would fail this exact comparison.
+    assert row["as_of"] == datetime(2026, 7, 31, tzinfo=UTC)
+
+
+async def test_snapshot_add_refuses_a_future_as_of_without_writing(
+    conn, an_account, monkeypatch, capsys
+):
+    """Same reasoning as marks_set's identical guard: latest_snapshot treats
+    the newest as_of as current, so a fat-fingered year must be refused
+    before anything is written, not merely mis-recorded."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2099-01-01",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert "future" in capsys.readouterr().err.lower()
+    assert await latest_snapshot(conn, an_account) is None
+
+
+async def test_snapshot_add_refuses_a_non_finite_figure_without_opening_a_connection(
+    conn, an_account, monkeypatch
+):
+    """Decimal("NaN") constructs successfully and would otherwise reach the
+    database as a broker figure -- is_finite() is this codebase's own
+    established guard against that (see cmd_marks_set's identical check).
+
+    fake_create_pool RAISES rather than returning a stand-in pool, the same
+    idiom as test_reconcile_refuses_a_negative_tolerance_without_opening_a_
+    connection below: whether a figure is finite depends only on the
+    arguments, never on the database, so the refusal must happen before a
+    connection is opened. Merely returning 2 eventually would satisfy the old
+    version of this test even if the check had drifted below `create_pool()`.
+    The stored-row assertion stays as well -- never opening a connection
+    implies never writing, but the two failures read differently."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(an_account), as_of="2026-07-31",
+            equity="NaN", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert await latest_snapshot(conn, an_account) is None
+
+
+async def test_snapshot_add_refuses_an_unknown_account(conn, monkeypatch, capsys):
+    """A well-formed but nonexistent account id used to reach
+    `account_snapshot.account_id`'s foreign key and escape as a raw
+    asyncpg.ForeignKeyViolationError traceback -- main() catches only OSError
+    -- which is worse than either sibling command's behaviour for the same
+    situation (docs/known-gaps.md gap #26). Refused cleanly with exit 2 now,
+    the same get_account-then-check-None shape cmd_reconcile uses, and naming
+    the offending id the way test_reconcile_refuses_an_unknown_account and
+    test_regroup_unknown_account_prints_a_clean_error_not_a_traceback both
+    require."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    bogus = uuid4()
+
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(bogus), as_of="2026-07-31",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    assert str(bogus) in capsys.readouterr().err
+    assert await latest_snapshot(conn, bogus) is None
+
+
+# --- cmd_reconcile -------------------------------------------------------------
+#
+# The plan's own self-review flags this as the task most likely to run long on
+# fixtures, so these four reuse the account-state recipe already established
+# above and in tests/db/test_positions.py (create_account, upsert_instrument,
+# insert_fills, regroup_account, add_snapshot) rather than inventing a fifth
+# harness. There is no tests/db/conftest.py, so nothing here can be imported
+# from test_positions.py -- `_add_orphaned_position` below replicates that
+# file's `_make_orphaned_trade` recipe rather than importing it.
+
+_RECONCILE_AS_OF = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+
+
+async def _add_orphaned_position(conn, acc, *, symbol, ref):
+    """Same recipe as tests/db/test_positions.py's `_make_orphaned_trade`:
+    open one ordinary trade on a fresh instrument, then protect it (notes set
+    so regroup preserves it, its opening fill deleted, regrouped again). The
+    composite FK nulls opening_fill_id and the protection UPDATE nulls
+    open_quantity/open_cost_basis, while status stays 'open' -- an
+    unreachable-instrument position that still holds exposure.
+
+    Load-bearing for the direction-vs-unvaluable_reason mutation gate: the
+    resulting position keeps its ORIGINAL single direction (a plain BUY, so
+    Direction.SPREAD never enters the mix and the group never disagrees on
+    direction) while unvaluable_reason gets set from the null quantity --
+    exactly the "direction is set AND still unvaluable" case
+    ledger/positions.py's OpenPosition docstring warns about."""
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"),
+    )
+    fill = _position_fill(acc, inst, side=Side.BUY, quantity="5", price="10", ref=ref)
+    await insert_fills(conn, [fill])
+    await regroup_account(conn, acc)
+    trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == fill.id)
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
+    await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
+    await regroup_account(conn, acc)
+
+    # The fixture proves itself, the same way short_reconcilable_account below
+    # does. Everything the UNRELIABLE tests assert rests on this position being
+    # unvaluable, and that rests on two things nothing else here pins: that
+    # regroup_account PRESERVES a trade whose `notes` are set (rather than
+    # reaping it with the rest), and that the composite FK nulls
+    # `opening_fill_id` when the opening fill is deleted, which is what makes
+    # db/positions.py force quantity/cost_basis to None.
+    #
+    # If either changes, this call quietly yields a VALUABLE position: the
+    # verdict becomes OK or DRIFT instead of UNRELIABLE and the tests built on
+    # it fail with a bare verdict mismatch that names nothing -- or, worse,
+    # unreliable_but_agreeing_account's numbers still add up and it passes for
+    # the wrong reason. The protected trade keeps its own id through the
+    # protection UPDATE, and db/positions.py substitutes that id for the
+    # unreachable instrument's, so it is the exact key to find the row by.
+    (orphaned,) = [
+        p for p in await open_positions(conn, acc) if p.instrument_id == trade["id"]
+    ]
+    assert orphaned.unvaluable_reason is not None, (
+        f"orphaned position for {symbol!r} came back VALUABLE "
+        f"(direction={orphaned.direction!r}, quantity={orphaned.quantity!r}) -- "
+        "the UNRELIABLE tests built on this fixture would prove nothing, since "
+        "the position would be valued normally and the verdict would never be "
+        "UNRELIABLE for the reason they claim"
+    )
+
+
+async def _deposit(conn, acc, amount, *, currency="USD"):
+    """Cash in, via cash_movement directly (no importer in play here) -- the
+    same table db/cash.py's account_cash reads, inserted straight rather than
+    through the importer path since these fixtures never go near a CSV.
+    `currency` defaults to USD and is only ever overridden by the
+    mixed-currency fixture below -- every other caller stays single-currency."""
+    await conn.execute(
+        """
+        INSERT INTO cash_movement (account_id, occurred_at, kind, amount, currency)
+        VALUES ($1, $2, 'deposit', $3, $4)
+        """,
+        acc, _RECONCILE_AS_OF, Decimal(amount), currency,
+    )
+
+
+@pytest_asyncio.fixture
+async def reconcilable_account(conn):
+    """One priced position, one deposit, and a snapshot set to match the
+    computed totals exactly.
+
+    Arithmetic: deposit 10000; buy 10 RCON @ 50 (fee 0) spends 500, so
+    computed cash = 10000 - 500 = 9500. Marked at 60, market value =
+    10 * 60 * 1 = 600, so computed equity = 9500 + 600 = 10100. The snapshot
+    below is set to exactly (9500, 10100) -- reconcile's own arithmetic has
+    to reproduce those two figures for the OK verdict to hold, not just agree
+    with itself."""
+    acc = await create_account(conn, name="Reconcilable", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="RCON", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "10000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="10", price="50", ref="rc1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("60"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("9500"), total_equity=Decimal("10100")
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def unreliable_but_agreeing_account(conn):
+    """One priced position plus one orphaned (unvaluable) position, with the
+    snapshot set to match what reconcile computes from the priced position
+    and cash ALONE -- the orphaned position's quantity/cost_basis are forced
+    to None by the protection path (see _add_orphaned_position), so it
+    contributes nothing to either side of the arithmetic and the numbers
+    agree even though the account is not fully priceable.
+
+    Arithmetic: deposit 1000; buy 5 URLA @ 100 (fee 0) spends 500, so
+    computed cash = 1000 - 500 = 500. Marked at 100, market value =
+    5 * 100 * 1 = 500, so computed equity = 500 + 500 = 1000. Snapshot set to
+    exactly (500, 1000)."""
+    acc = await create_account(
+        conn, name="UnreliableAgree", venue="manual", account_type="cash"
+    )
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="URLA", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="5", price="100", ref="ura1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await _add_orphaned_position(conn, acc, symbol="URLB", ref="urb1")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("500"), total_equity=Decimal("1000")
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def unreliable_account(conn):
+    """One priced position plus one orphaned (unvaluable) position, with the
+    snapshot's reported equity set FAR from what reconcile computes -- as if
+    the broker statement includes real value for the position the ledger
+    cannot price, which the computed side necessarily excludes.
+
+    Arithmetic: deposit 1000; buy 2 URDA @ 100 (fee 0) spends 200, so
+    computed cash = 1000 - 200 = 800 (cash agrees with the snapshot below).
+    Marked at 100, market value = 2 * 100 * 1 = 200, so computed equity =
+    800 + 200 = 1000. The snapshot's reported equity is set to 6000 instead
+    of 1000 -- a -5000 equity_difference that is the EXPECTED shape of an
+    excluded position, not a defect, which is exactly what the rendered
+    output has to say."""
+    acc = await create_account(
+        conn, name="UnreliableDrift", venue="manual", account_type="cash"
+    )
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="URDA", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="2", price="100", ref="urd1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await _add_orphaned_position(conn, acc, symbol="URDB", ref="urdb1")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("800"), total_equity=Decimal("6000")
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def mixed_currency_account(conn):
+    """Two cash movements on the same account in different currencies (USD
+    and EUR) -- same shape as tests/db/test_cash.py's own
+    `mixed_currency_account`, replicated here rather than imported (no
+    tests/db/conftest.py to share it through, and this file already owns its
+    own cash_movement-inserting `_deposit`), plus a snapshot: without one,
+    cmd_reconcile's own step 2 refusal (no snapshot) would fire first and
+    account_cash -- and the MixedCurrencyError it raises -- would never be
+    reached at all."""
+    acc = await create_account(conn, name="MixedCurrency", venue="manual", account_type="cash")
+    await _deposit(conn, acc, "100", currency="USD")
+    await _deposit(conn, acc, "50", currency="EUR")
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("0"), total_equity=Decimal("0")
+    )
+    return acc
+
+
+def _reconcile_args(*, account, as_of, tolerance):
+    """Same pattern as `_args`/`_snapshot_args` above: a real
+    argparse.Namespace built by hand, not through parser.parse_args(). Named
+    distinctly from both so it cannot collide with -- or silently widen --
+    either of those two helpers."""
+    return argparse.Namespace(account=account, as_of=as_of, tolerance=tolerance)
+
+
+async def test_reconcile_agrees_and_exits_zero(conn, reconcilable_account, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of=None, tolerance=None)
+    )
+    assert rc == 0
+    assert "ok" in capsys.readouterr().out.lower()
+
+
+async def test_reconcile_refuses_an_account_with_no_snapshot(
+    conn, an_account, monkeypatch, capsys
+):
+    """Reporting zero drift against nothing is the silent-success shape."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(an_account), as_of=None, tolerance=None)
+    )
+    assert rc == 2
+    assert "snapshot" in capsys.readouterr().err.lower()
+
+
+async def test_an_unvaluable_position_never_exits_zero_even_when_numbers_agree(
+    conn, unreliable_but_agreeing_account, monkeypatch, capsys
+):
+    """The whole point of the verdict. A caller reading is_within_tolerance
+    alone would print a clean pass here."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(_reconcile_args(
+        account=str(unreliable_but_agreeing_account), as_of=None, tolerance=None))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unreliable" in out.lower()
+
+
+async def test_an_unreliable_run_explains_why_its_drift_looks_large(
+    conn, unreliable_account, monkeypatch, capsys
+):
+    """computed_equity excludes the unvalued position, so the drift reads as a
+    big negative number that is expected. Saying so is the difference between a
+    useful report and a phantom hunt."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    await cli.cmd_reconcile(
+        _reconcile_args(account=str(unreliable_account), as_of=None, tolerance=None)
+    )
+    out = capsys.readouterr().out.lower()
+    assert "excluded" in out or "not included" in out
+
+
+async def test_reconcile_refuses_an_unknown_account(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    bogus = uuid4()
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(bogus), as_of=None, tolerance=None)
+    )
+    assert rc == 2
+    # Names the actual problem account, not just a bare "error: refused" --
+    # the same standard test_regroup_unknown_account_prints_a_clean_error_
+    # not_a_traceback holds cmd_regroup to for the identical situation.
+    assert str(bogus) in capsys.readouterr().err
+
+
+# --- Fix round 1: statement clock vs. ledger clock ---------------------------
+
+
+async def test_reconcile_labels_the_statement_and_ledger_clocks_separately(
+    conn, reconcilable_account, monkeypatch, capsys
+):
+    """account_cash, open_positions and latest_marks all read CURRENT ledger
+    state -- open_positions and latest_marks don't even take an `as_of`
+    parameter -- while the report's other clock is the STATEMENT's date
+    (snapshot.as_of). A single "as of <statement date>" header above numbers
+    that are actually current would misrepresent any ordinary trading since
+    the statement as drift "as of" a date before any of it happened: the same
+    phantom-hunt shape the brief requires for the unvaluable-exclusion case.
+    `reconcilable_account` pins its snapshot/fill/mark clock to a fixed past
+    instant (_RECONCILE_AS_OF); `ledger as of` is real wall-clock time at
+    test run, which is a different instant -- so the two labelled lines must
+    both appear, and must not carry the same timestamp."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    out = captured.out
+
+    assert "statement as of 2026-08-01t09:00:00+00:00" in out.lower()
+    assert "ledger as of" in out.lower()
+
+    statement_line = next(line for line in out.splitlines() if "statement as of" in line.lower())
+    ledger_line = next(line for line in out.splitlines() if "ledger as of" in line.lower())
+    statement_ts = statement_line.split("as of", 1)[1].strip()
+    ledger_ts = ledger_line.split("as of", 1)[1].strip()
+    assert statement_ts != ledger_ts
+
+
+# --- Fix round 1: a negative --tolerance ---------------------------------------
+
+
+async def test_reconcile_refuses_a_negative_tolerance_without_opening_a_connection(
+    conn, monkeypatch, capsys
+):
+    """is_finite() rejects NaN/Infinity but not a negative number. A negative
+    tolerance makes `abs(difference) <= tolerance` unsatisfiable, so EVERY
+    account -- even a perfectly reconciled one -- would report DRIFT: a
+    confidently wrong verdict from a silently accepted bad input. Refused
+    before the pool is ever opened, same as every other argument guard --
+    fake_create_pool raises if cmd_reconcile ever reaches it, so this also
+    proves the check runs early rather than merely returning 2 eventually."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of=None, tolerance="-1")
+    )
+    assert rc == 2
+    assert "tolerance" in capsys.readouterr().err.lower()
+
+
+# --- Fix round 1: MixedCurrencyError was implemented but unpinned ------------
+
+
+async def test_reconcile_refuses_a_mixed_currency_account(
+    conn, mixed_currency_account, monkeypatch, capsys
+):
+    """v1 does not model FX -- db/cash.py's account_cash already refuses a
+    mixed-currency account by raising MixedCurrencyError; cmd_reconcile must
+    catch it and print a clean, currency-naming error instead of letting it
+    propagate as an uncaught traceback."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(mixed_currency_account), as_of=None, tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "USD" in err and "EUR" in err
+
+
+# --- Final review: a short position is a liability, not an asset --------------
+
+
+@pytest_asyncio.fixture
+async def short_reconcilable_account(conn):
+    """A genuine SHORT position, opened with a SELL, priced against a mark.
+
+    Named distinctly from `short_position_account` above (the cmd_positions
+    fixture) and using its own symbol: a second fixture reusing that name
+    would REDEFINE it at module scope and silently retarget every existing
+    test that requests it -- which is exactly what happened on the first
+    attempt here, reddening test_positions_values_a_short_in_the_right_
+    direction with this fixture's numbers.
+
+    Arithmetic: deposit 10000, then short 10 SHRC @ 50 -- the sale CREDITS
+    500 (net_cash is already direction-aware), so computed cash = 10500.
+    Marked at 60, the position is a liability worth -600, so computed equity =
+    10500 - 600 = 9900. The snapshot is set to exactly (10500, 9900).
+
+    Valued unsigned -- the bug this fixture exists to catch -- equity comes out
+    10500 + 600 = 11100: wrong by 1200, twice the market value, and reported
+    as DRIFT with the cash line agreeing to the cent, which reads as a pure
+    equity discrepancy and sends the reader hunting a phantom.
+
+    The fixture proves itself below rather than assuming: if this position
+    landed in the UNVALUABLE bucket instead (`unvaluable_reason` set), it would
+    never be turned into a `Position` at all, the verdict would be UNRELIABLE
+    for an unrelated reason, and the test would prove nothing about signing.
+    """
+    acc = await create_account(conn, name="ShortSeller", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="SHRC", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "10000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.SELL, quantity="10", price="50", ref="shrc1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("60"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("10500"), total_equity=Decimal("9900")
+    )
+
+    (position,) = await open_positions(conn, acc)
+    assert position.direction is Direction.SHORT, (
+        f"fixture is not short: direction={position.direction!r}"
+    )
+    assert position.unvaluable_reason is None, (
+        "fixture landed in the unvaluable bucket "
+        f"({position.unvaluable_reason!r}) -- it would never be valued at all, "
+        "so a test built on it proves nothing about the direction sign"
+    )
+    # An unsigned MAGNITUDE, exactly as ledger/pnl.py:105 leaves it -- this is
+    # why `direction` has to travel alongside it.
+    assert position.quantity == Decimal("10")
+    return acc
+
+
+async def test_reconcile_values_a_short_position_as_a_liability(
+    conn, short_reconcilable_account, monkeypatch, capsys
+):
+    """End to end, through the real command: a short must SUBTRACT its market
+    value from equity. The sibling `positions` command has always passed
+    `direction` through to unrealized_pnl; `reconcile`'s adapter dropped it,
+    so every short was valued as though it were owned."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(short_reconcilable_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    out = captured.out
+    assert "verdict: ok" in out.lower()
+
+    # Parsed off the rendered line rather than string-matched, so the failure
+    # message names the wrong number instead of just "not found".
+    def _computed(label):
+        line = next(ln for ln in out.splitlines() if ln.strip().startswith(label))
+        return Decimal(line.split("computed", 1)[1].split()[0])
+
+    # Cash agrees to the cent whether or not the sign is applied -- which is
+    # exactly what made the unsigned bug read as a pure equity problem.
+    assert _computed("cash:") == Decimal("10500")
+    assert _computed("equity:") == Decimal("9900")  # 11100 if valued unsigned
+
+
+# --- Final review: a bare-date --as-of, as README.md documents it -------------
+
+
+async def test_reconcile_accepts_a_bare_date_as_of(
+    conn, reconcilable_account, monkeypatch, capsys
+):
+    """README.md's own worked example passes a bare date to `snapshot add` on
+    one line and to `reconcile` on the next. `cmd_snapshot_add` accepted it
+    (date.fromisoformat -> midnight UTC) and `cmd_reconcile` did not:
+    datetime.fromisoformat parsed "2026-08-02" to a NAIVE midnight, the tz
+    guard fired, and the documented invocation exited 2. The two siblings now
+    read the same string the same way."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    # A day AFTER the fixture's snapshot instant (2026-08-01T09:00Z): a bare
+    # date becomes midnight, and midnight on the 1st precedes the snapshot,
+    # which would refuse for the unrelated "no snapshot on or before" reason
+    # and prove nothing about parsing.
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(reconcilable_account), as_of="2026-08-02", tolerance=None)
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "utc offset" not in captured.err.lower()
+    # It really resolved to the stored statement, not to "now".
+    assert "statement as of 2026-08-01t09:00:00+00:00" in captured.out.lower()
+
+
+# --- Final review: the DRIFT verdict itself ----------------------------------
+
+
+@pytest_asyncio.fixture
+async def drifting_account(conn):
+    """Everything valued, nothing unvaluable, and the numbers disagree.
+
+    Arithmetic: deposit 1000; buy 5 DRFT @ 100 (fee 0) spends 500, so computed
+    cash = 500. Marked at 100, market value = 5 * 100 * 1 = 500, so computed
+    equity = 1000. The snapshot reports cash 500 (agreeing exactly) and equity
+    900 -- a 100 equity difference, four orders of magnitude beyond the 0.01
+    default tolerance. Cash deliberately agrees so the drift can only come
+    from the equity comparison."""
+    acc = await create_account(conn, name="Drifting", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="DRFT", quote_currency="USD"),
+    )
+    await _deposit(conn, acc, "1000")
+    await insert_fills(
+        conn, [_position_fill(acc, inst, side=Side.BUY, quantity="5", price="100", ref="dr1")]
+    )
+    await regroup_account(conn, acc)
+    await set_mark(conn, inst, Decimal("100"), _RECONCILE_AS_OF)
+    await add_snapshot(
+        conn, acc, _RECONCILE_AS_OF, cash_balance=Decimal("500"), total_equity=Decimal("900")
+    )
+    return acc
+
+
+async def test_reconcile_reports_plain_drift(conn, drifting_account, monkeypatch, capsys):
+    """The branch's second-most-important outcome, and until now the only
+    verdict no CLI test exercised: OK, UNRELIABLE and four refusals were
+    covered, plain DRIFT was not. Combined with a verdict chain that ended in
+    an unguarded `return 1` carrying the UNRELIABLE narration, deleting the
+    DRIFT branch entirely relabelled every drift as "could not be priced" --
+    a wrong explanation attached to a real number -- and the suite stayed
+    green. Hence the stderr assertions: the exit code and the `verdict:` line
+    are identical under that mutation; the narration is not."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(drifting_account), as_of=None, tolerance=None)
+    )
+    captured = capsys.readouterr()
+    out, err = captured.out.lower(), captured.err.lower()
+
+    assert rc == 1
+    assert "verdict: drift" in out
+    # Nothing was unvaluable here, so the exclusion notice must NOT appear --
+    # this is a clean numeric disagreement, not an unattributable one.
+    assert "cannot be priced" not in out
+    assert "disagree outside tolerance" in err
+    assert "could not be priced" not in err
+
+
+# --- Review round 2: the --as-of refusal branches, in both commands ----------
+#
+# `snapshot add` and `cmd_reconcile` now share ONE parser (cli._parse_as_of),
+# so two of these four exercise the same helper as the other two. They are kept
+# per-command deliberately: what each test pins is that ITS command routes
+# --as-of through the parser at all and turns a None into exit 2. A future edit
+# that inlined the parse back into one command, or dropped the `if ... is None:
+# return 2` on one side, would leave the helper's own behaviour untouched and
+# would only ever be caught by the per-command pair.
+#
+# Both refusals were reachable and both printed a distinct message with nothing
+# asserting on either -- deleting either branch left the suite green.
+#
+# fake_create_pool RAISES rather than returning a stand-in: whether a string
+# parses depends only on the argument, never on the database, so the refusal has
+# to land before a connection is opened. That also makes these tests independent
+# of any fixture -- a bogus account id is fine, because nothing ever looks it up.
+
+
+async def test_snapshot_add_refuses_a_naive_as_of_timestamp(conn, monkeypatch, capsys):
+    """A timestamp with no offset silently implies a wall-clock zone nobody
+    named, and would reach `as_of > now + tolerance` -- an offset-naive vs
+    offset-aware comparison -- as an uncaught TypeError. A bare DATE is
+    deliberately still accepted (it means midnight UTC), so the message has to
+    say what is missing rather than "not a valid date"."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(uuid4()), as_of="2026-07-31T12:00",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "utc offset" in err
+    # Not the unparseable message: the two branches must stay distinguishable
+    # to a reader, since the fix for each is different.
+    assert "not a valid date or timestamp" not in err
+
+
+async def test_snapshot_add_refuses_an_unparseable_as_of(conn, monkeypatch, capsys):
+    """Neither a date nor a timestamp. Distinct from the naive-timestamp
+    refusal above: nothing here can be fixed by appending an offset."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_snapshot_add(
+        _snapshot_args(
+            account=str(uuid4()), as_of="not-a-date",
+            equity="1", cash="1", note=None,
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "not a valid date or timestamp" in err
+    assert "not-a-date" in err
+
+
+async def test_reconcile_refuses_a_naive_as_of_timestamp(conn, monkeypatch, capsys):
+    """Same string, same refusal, on the sibling command -- the two disagreeing
+    about how to read one --as-of value is exactly the defect the shared parser
+    exists to prevent (it happened once already, with a bare date). Here a naive
+    timestamp would otherwise reach latest_snapshot's `as_of <= $2` bind and
+    surface as an asyncpg error instead of a clean message."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of="2026-07-31T12:00", tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "utc offset" in err
+    assert "not a valid date or timestamp" not in err
+
+
+async def test_reconcile_refuses_an_unparseable_as_of(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_reconcile(
+        _reconcile_args(account=str(uuid4()), as_of="not-a-date", tolerance=None)
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.lower()
+    assert "not a valid date or timestamp" in err
+    assert "not-a-date" in err

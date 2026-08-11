@@ -1,12 +1,14 @@
 from datetime import UTC, datetime
 from decimal import Decimal, getcontext
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from ledger.reconcile import Position, Snapshot, reconcile
+from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
+from ledger.types import Direction
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 SPY = UUID("00000000-0000-0000-0000-0000000000b1")
 AAPL = UUID("00000000-0000-0000-0000-0000000000b2")
+SHRT = UUID("00000000-0000-0000-0000-0000000000b3")
 AS_OF = datetime(2026, 7, 31, 20, 0, tzinfo=UTC)
 
 
@@ -17,7 +19,7 @@ def snapshot(cash, equity) -> Snapshot:
 
 
 def test_matching_account_reports_no_drift():
-    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"))]
+    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"), Direction.LONG)]
     drift = reconcile(
         snapshot=snapshot("1000", "6000"),
         positions=positions,
@@ -30,7 +32,7 @@ def test_matching_account_reports_no_drift():
 
 
 def test_equity_drift_is_reported_with_sign():
-    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"))]
+    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"), Direction.LONG)]
     drift = reconcile(
         snapshot=snapshot("1000", "6312"),
         positions=positions,
@@ -54,7 +56,7 @@ def test_cash_drift_is_reported_separately():
 
 
 def test_multiplier_is_applied_to_position_value():
-    positions = [Position(SPY, Decimal("2"), Decimal("1.50"), Decimal("100"))]
+    positions = [Position(SPY, Decimal("2"), Decimal("1.50"), Decimal("100"), Direction.LONG)]
     drift = reconcile(
         snapshot=snapshot("0", "500"),
         positions=positions,
@@ -66,7 +68,7 @@ def test_multiplier_is_applied_to_position_value():
 
 def test_position_without_a_mark_falls_back_to_cost_basis():
     """An unmarked position must not silently value at zero."""
-    positions = [Position(AAPL, Decimal("5"), Decimal("200"), Decimal("1"))]
+    positions = [Position(AAPL, Decimal("5"), Decimal("200"), Decimal("1"), Direction.LONG)]
     drift = reconcile(
         snapshot=snapshot("0", "1000"), positions=positions, marks={}, computed_cash=Decimal("0")
     )
@@ -92,7 +94,7 @@ def test_both_differences_agree_in_sign():
     A snapshot with both cash and equity below computed values should yield
     positive differences for both fields, confirming both use computed - reported.
     """
-    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"))]
+    positions = [Position(SPY, Decimal("10"), Decimal("500"), Decimal("1"), Direction.LONG)]
     drift = reconcile(
         snapshot=snapshot("900", "5500"),  # reported less than computed
         positions=positions,
@@ -136,7 +138,7 @@ def test_precision_pinning_produces_exact_value():
     """
     # Create a position with a non-terminating valuation: qty=1, mark=100/3, multiplier=1
     # computed_equity = 0 + (1 * (100/3) * 1) = 33.333...333 (48 threes, 50 sig figs)
-    positions = [Position(SPY, Decimal("1"), Decimal("1"), Decimal("1"))]
+    positions = [Position(SPY, Decimal("1"), Decimal("1"), Decimal("1"), Direction.LONG)]
 
     # Compute the mark at prec=50 to ensure we have the full precision
     from decimal import localcontext
@@ -165,7 +167,7 @@ def test_precision_pinning_works_across_ambient_precisions():
     This test compares full result sets across different ambient precisions.
     Without precision pinning inside reconcile(), results would differ.
     """
-    positions = [Position(SPY, Decimal("1"), Decimal("1"), Decimal("1"))]
+    positions = [Position(SPY, Decimal("1"), Decimal("1"), Decimal("1"), Direction.LONG)]
 
     # Compute mark at prec=50 for reference
     from decimal import localcontext
@@ -195,3 +197,146 @@ def test_precision_pinning_works_across_ambient_precisions():
         assert results[3] == expected_equity_str
     finally:
         getcontext().prec = ambient_prec
+
+
+def unvaluable_ref(reason="open quantity unknown"):
+    return UnvaluableRef(instrument_id=uuid4(), symbol="ZXCO", reason=reason)
+
+
+def test_agreement_with_nothing_unvaluable_is_ok():
+    d = reconcile(snapshot(cash="1000", equity="1000"), [], {}, Decimal("1000"))
+    assert d.verdict is ReconcileVerdict.OK
+    assert d.is_within_tolerance is True
+    assert d.unvaluable_positions == ()
+
+
+def test_disagreement_with_nothing_unvaluable_is_drift():
+    d = reconcile(snapshot(cash="1000", equity="1000"), [], {}, Decimal("900"))
+    assert d.verdict is ReconcileVerdict.DRIFT
+    assert d.is_within_tolerance is False
+
+
+def test_any_unvaluable_position_makes_the_run_unreliable():
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("1000"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+    assert len(d.unvaluable_positions) == 1
+
+
+def test_unreliable_outranks_drift():
+    """Both conditions at once. The numeric gap cannot be attributed -- it may be
+    entirely the unvalued position, or may hide a real defect on top -- so
+    reporting DRIFT would imply a precision the data does not support."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("900"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+
+
+def test_an_unreliable_run_still_reports_its_numbers():
+    """The numbers are still useful for judging whether the gap explains the
+    drift. Refusing to compute them would make one orphaned trade disable the
+    check for the whole account."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("900"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.computed_cash == Decimal("900")
+    assert d.equity_difference == Decimal("-100")
+
+
+def test_is_within_tolerance_still_answers_only_the_numeric_question():
+    """It is a COMPONENT of the verdict, never the answer. On an unreliable run
+    whose numbers happen to agree it is still True -- which is exactly why a
+    caller must render `verdict` and not this."""
+    d = reconcile(
+        snapshot(cash="1000", equity="1000"),
+        [],
+        {},
+        Decimal("1000"),
+        unvaluable=[unvaluable_ref()],
+    )
+    assert d.is_within_tolerance is True
+    assert d.verdict is ReconcileVerdict.UNRELIABLE
+
+
+def test_an_unmarked_but_valuable_position_does_not_make_the_run_unreliable():
+    """The distinction the whole design turns on. Unmarked = known quantity,
+    missing price; cost basis is a defensible stale proxy. Unvaluable = unknown
+    quantity, for which no proxy exists."""
+    pos = Position(
+        instrument_id=uuid4(),
+        quantity=Decimal("10"),
+        cost_basis=Decimal("100"),
+        multiplier=Decimal("1"),
+        direction=Direction.LONG,
+    )
+    d = reconcile(snapshot(cash="1000", equity="2000"), [pos], {}, Decimal("1000"))
+    assert d.unmarked_instruments == (pos.instrument_id,)
+    # `is OK`, not `is not UNRELIABLE`: this scenario reconciles exactly
+    # (1000 cash + 10 * 100 * 1 at cost basis = 2000 = reported equity), and
+    # the weaker assertion could not tell OK from DRIFT -- on the very test
+    # for the distinction the spec calls the single most likely thing to get
+    # wrong.
+    assert d.verdict is ReconcileVerdict.OK
+
+
+def test_a_short_position_reduces_equity_at_its_mark():
+    """A short is a LIABILITY. `quantity` is an unsigned magnitude for both
+    directions (ledger/pnl.py:105 adds every opening fill's quantity
+    regardless of side), so without the direction sign a short is valued as an
+    asset and equity comes out wrong by TWICE the market value -- while the
+    cash line still agrees to the cent, because net_cash already credits the
+    sale. That combination reads as a pure equity discrepancy and sends the
+    reader hunting a phantom.
+
+    Deposit 10000, then short 10 @ 50: the sale credits 500, so cash = 10500.
+    Marked at 60, the position is worth -600, so equity = 10500 - 600 = 9900.
+    Valued unsigned it would be 10500 + 600 = 11100 -- 1200 out, exactly twice
+    the 600 market value."""
+    positions = [Position(SHRT, Decimal("10"), Decimal("50"), Decimal("1"), Direction.SHORT)]
+    d = reconcile(
+        snapshot=snapshot("10500", "9900"),
+        positions=positions,
+        marks={SHRT: Decimal("60")},
+        computed_cash=Decimal("10500"),
+    )
+    assert d.computed_equity == Decimal("9900")
+    assert d.equity_difference == Decimal("0")
+    assert d.verdict is ReconcileVerdict.OK
+
+
+def test_an_unmarked_short_falls_back_to_cost_basis_and_still_reduces_equity():
+    """The cost-basis fallback has to be signed too -- it is the same
+    valuation path at a staler price, and an unmarked short valued as an asset
+    is wrong by twice its basis.
+
+    Deposit 10000, then short 10 @ 50 with NO mark on file: cash = 10500, and
+    the fallback values the position at its own cost basis, -500. Equity is
+    therefore 10500 - 500 = 10000 -- exactly the deposit, because a short held
+    at the price it was opened at has made and lost nothing. That arithmetic
+    is the point: valued unsigned this reports 11000, a 1000 phantom gain on a
+    position that has not moved."""
+    positions = [Position(SHRT, Decimal("10"), Decimal("50"), Decimal("1"), Direction.SHORT)]
+    d = reconcile(
+        snapshot=snapshot("10500", "10000"),
+        positions=positions,
+        marks={},
+        computed_cash=Decimal("10500"),
+    )
+    assert d.computed_equity == Decimal("10000")
+    assert d.unmarked_instruments == (SHRT,)
+    assert d.equity_difference == Decimal("0")
+    assert d.verdict is ReconcileVerdict.OK
