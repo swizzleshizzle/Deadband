@@ -19,7 +19,7 @@ pytestmark = requires_db
 T0 = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 
 
-def _fill(acc, inst, *, side, quantity, price, ref, fee="0"):
+def _fill(acc, inst, *, side, quantity, price, ref, fee="0", fee_currency="USD"):
     return Fill(
         id=uuid4(),
         account_id=acc,
@@ -29,7 +29,7 @@ def _fill(acc, inst, *, side, quantity, price, ref, fee="0"):
         quantity=Decimal(quantity),
         price=Decimal(price),
         fee=Decimal(fee),
-        fee_currency="USD",
+        fee_currency=fee_currency,
         source=FillSource.MANUAL,
         venue_fill_id=ref,
         is_estimated=False,
@@ -162,6 +162,63 @@ async def mixed_currency_instrument_account(conn):
     return acc
 
 
+@pytest_asyncio.fixture
+async def mixed_fee_currency_account(conn):
+    """The mismatch lives on the THIRD source: every cash_movement is USD and
+    the only instrument quotes in USD, but the fill's fee is denominated in
+    EUR. `net_cash` subtracts `fee` from a USD balance regardless of its
+    currency (ledger/cash.py), so without the fee_currency check this account
+    silently loses a EUR number out of a USD balance -- the confident wrong
+    number the refusal exists to prevent. This was docs/known-gaps.md gap #24.
+
+    The fee is NONZERO on purpose: the check ignores zero fees, so a zero here
+    would prove nothing."""
+    acc = await create_account(conn, name="MixedFee", venue="manual", account_type="cash")
+    await _deposit(conn, acc, amount="100.00", currency="USD")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="FEEX", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            _fill(
+                acc, inst, side=Side.BUY, quantity="1", price="10.00", ref="fee1",
+                fee="1.50", fee_currency="EUR",
+            )
+        ],
+    )
+    return acc
+
+
+@pytest_asyncio.fixture
+async def zero_fee_in_another_currency_account(conn):
+    """Same shape as the fixture above with ONE difference: the fee is zero.
+
+    `fill.fee_currency` is `TEXT NOT NULL DEFAULT 'USD'` (db/schema.sql:73), so
+    every fill carries some currency whether or not it charges a fee, and a
+    venue that stamps its quote currency on a free fill is ordinary. A check
+    built over every fill's fee_currency would refuse this perfectly
+    single-currency account; the `fee != 0` guard is what stops it. A zero fee
+    adds zero to the balance in any currency, so nothing can go wrong here."""
+    acc = await create_account(conn, name="ZeroFee", venue="manual", account_type="cash")
+    await _deposit(conn, acc, amount="100.00", currency="USD")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZFEE", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            _fill(
+                acc, inst, side=Side.BUY, quantity="1", price="10.00", ref="zfee1",
+                fee="0", fee_currency="EUR",
+            )
+        ],
+    )
+    return acc
+
+
 async def test_cash_combines_movements_and_fills(conn, funded_account):
     """A buy spends cash as a FILL, not a movement -- a balance built from
     movements alone would omit every trade."""
@@ -209,3 +266,33 @@ async def test_a_mixed_currency_account_is_refused_via_instrument_quote_currency
     with pytest.raises(MixedCurrencyError) as exc:
         await account_cash(conn, mixed_currency_instrument_account)
     assert "USD" in str(exc.value) and "EUR" in str(exc.value)
+
+
+async def test_a_nonzero_fee_in_another_currency_is_refused(
+    conn, mixed_fee_currency_account
+):
+    """docs/known-gaps.md gap #24, closed. A fill carries TWO currencies and
+    only one of them used to be checked: this account's movements and its
+    instrument are both USD, so a gate built from those two alone lets it
+    straight through and `net_cash` subtracts a EUR fee from a USD balance.
+
+    Both currencies must be named -- the message is the only place a reader
+    learns WHICH pair disagreed, and an account can hold several instruments."""
+    with pytest.raises(MixedCurrencyError) as exc:
+        await account_cash(conn, mixed_fee_currency_account)
+    assert "USD" in str(exc.value) and "EUR" in str(exc.value)
+
+
+async def test_a_zero_fee_in_another_currency_is_not_refused(
+    conn, zero_fee_in_another_currency_account
+):
+    """The other half of the fee-currency check, and the reason it is written
+    `if r["fee"] != Decimal(0)` rather than over every fill: fee_currency has a
+    schema DEFAULT of 'USD' and is NOT NULL, so a fee-free fill always carries
+    a currency that means nothing. Refusing on it would break ordinary
+    single-currency accounts -- a false refusal, which for a command whose
+    whole value is trustworthiness is as damaging as a false pass.
+
+    Asserts the exact balance, not merely "did not raise": 100 deposited minus
+    the 10 the fill spent, with a zero fee changing nothing."""
+    assert await account_cash(conn, zero_fee_in_another_currency_account) == Decimal("90.00")
