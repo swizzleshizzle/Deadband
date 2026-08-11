@@ -2,6 +2,10 @@
 
 **Closes known gap #13.** Decided 2026-08-10.
 
+**Amended 2026-08-11**, during PR #8's review round: R7 and §8's failure-policy row now
+name `fill.fee_currency` as a third checked currency source, closing gap #24 — the
+refusal shipped covering three sources, so the design record had to stop describing two.
+
 ---
 
 ## 1. Context
@@ -46,7 +50,7 @@ rather than fast or scriptable.
 | R4 | `Drift` exposes a single **`verdict`** field that callers render. | A caller reading `is_within_tolerance` alone would print a clean pass on an unreliable account. That is precisely the misuse the gap #12 note already warns about for `unvaluable_reason`. A single enum cannot be half-read. |
 | R5 | `reconcile()` keeps `Position` rather than switching to `OpenPosition`. | `Position`'s minimalism is a feature. `OpenPosition` carries display concerns (`symbol`, `trade_count`) that reconciliation has no business depending on. |
 | R6 | Cash is derived from **movements *and* fills**. | A buy spends cash as a fill, not a movement. Cash from `cash_movement` alone would omit every trade, making the cash line meaningless and the equity line wrong. |
-| R7 | An account whose movements or instruments span **more than one currency** is refused. | v1 does not model FX. Summing across currencies produces a confident wrong number, which is the failure class this project exists to avoid. |
+| R7 | An account is refused when **more than one currency** appears across any of three sources: `cash_movement.currency`, `instrument.quote_currency`, and — for fills charging a **nonzero** fee — `fill.fee_currency`. | v1 does not model FX. Summing across currencies produces a confident wrong number, which is the failure class this project exists to avoid. A fill carries *two* of those currencies, and its fee is netted straight into the balance (§5), so an unchecked `fee_currency` subtracts a EUR figure from a USD balance without tripping anything. **The nonzero qualifier is load-bearing, not a detail:** `fill.fee_currency` is `TEXT NOT NULL DEFAULT 'USD'`, so a fee-free fill on a EUR instrument carries a meaningless `'USD'` — checking it would falsely refuse a genuinely single-currency account, and a zero fee adds zero in any currency, so its denomination cannot make the sum wrong. *Amended 2026-08-11 (PR #8 review). As originally written this rule covered movements and instruments only; `fee_currency` was left unchecked and recorded as gap #24, now struck.* |
 | R8 | **Manual entry only** — no statement parsing. | Two numbers off a statement. A PDF parser is a separate subsystem and is not what gap #13 asks for. |
 
 ---
@@ -174,7 +178,7 @@ mistyped figure is the whole point, and the table has no history columns.
 |---|---|
 | Unknown account id | Refuse, exit 2 |
 | No snapshot for the account on or before `as_of` | Refuse, exit 2 |
-| Movements or instruments spanning more than one currency | Refuse, exit 2, naming the currencies |
+| More than one currency across cash movements, instrument quote currencies, or the fee currency of any **nonzero**-fee fill (R7, amended 2026-08-11) | Refuse, exit 2, naming the currencies |
 | Any position with `unvaluable_reason` set | Report, verdict `UNRELIABLE`, exit 1 |
 | Numbers disagree beyond tolerance, everything valued | Report, verdict `DRIFT`, exit 1 |
 | Agreement within tolerance, everything valued | Report, verdict `OK`, exit 0 |
