@@ -122,14 +122,17 @@ not on the Monday the broker got round to booking it.
 
 **Why this is a forward-looking correctness argument, not a claim about today's
 `reconcile`.** Dating from the symbol changes no drift figure `reconcile` currently
-prints. `open_positions` (`db/positions.py`) takes **no `as_of`** and filters only on
-`WHERE t.status = 'open'`; `--as-of` chooses which *snapshot* to compare against and never
+prints. `open_positions` (`db/positions.py`) takes **no `as_of`** and applies **no date
+filter of any kind** — its predicate is `t.status = 'open'` plus an optional account scope
+(`db/positions.py:38-39`); `--as-of` chooses which *snapshot* to compare against and never
 which positions (see `cmd_reconcile`'s own comments in `cli.py`, and gap **#29** in
 `docs/known-gaps.md`, which records that `--as-of` does not filter the ledger side of the
 comparison at all). Once both fills are imported, a close dated Nov 21 and one dated Nov
-24 are indistinguishable to today's command. What the expiry date buys is that the ledger
-is *already right* when position reconstruction becomes as-of aware — the change gap #29
-describes. Only then does the three-day window open up: a statement dated inside it shows
+24 — the fixture's synthetic three-day gap, chosen for the arithmetic and not because
+either date is an actual Friday/Monday — are indistinguishable to today's command. What
+the expiry date buys is that the ledger is *already right* when position reconstruction
+becomes as-of aware — the change gap #29 describes. Only then does the three-day window
+open up: a statement dated inside it shows
 no such position, while a ledger reconstructed from a `Run Date`-dated close would still
 carry the short. Backfilling a correct event date after the fact means re-deriving it from
 symbols anyway, so it is cheaper and safer to record it correctly now.
@@ -180,8 +183,9 @@ between an assignment and a silent drop.
   data, so substituting `Run Date` must turn a test red.
 - **Price is zero *and* no zero-price warning fired.** Both halves matter: the second is
   what pins the carve-out rather than the value.
-- **Two same-day lots of different sizes both survive** the dedupe, pinning the occurrence
-  counter.
+- **Two identical same-day lots both survive** the dedupe. They must be identical in size
+  — a different size would already produce a different hash and prove nothing — so the
+  occurrence index is the only thing pinning them apart.
 - **A zero quantity and an unparseable symbol warn** rather than guess.
 - **`ASSIGNED` blocks the commit**, and the message names the verb.
 - **End to end:** an open short call closed by its expiry yields realised P&L equal to the

@@ -80,10 +80,11 @@ with a sell — since an `EXPIRED` row describes the position being removed, not
 direction there is a verb for.
 
 This does not change any drift `reconcile` reports today: `open_positions` takes no
-`as_of` and filters only on `status = 'open'`, so `--as-of` picks which *statement* to
-compare against, never which positions — a close dated either day leaves the same closed
-trade. Recording the true event date is what keeps the ledger correct once position
-reconstruction becomes as-of aware (gap #29 in [`docs/known-gaps.md`](docs/known-gaps.md)
+`as_of` and applies no date filter at all — it filters on `status = 'open'` and,
+optionally, the account — so `--as-of` picks which *statement* to compare against, never
+which positions — a close dated either day leaves the same closed trade. Recording the
+true event date is what keeps the ledger correct once position reconstruction becomes
+as-of aware (gap #29 in [`docs/known-gaps.md`](docs/known-gaps.md)
 tracks that `--as-of` does not filter the ledger side); only then would a `Run Date`-dated
 close leave a phantom open position across a statement date falling inside the three-day
 window.

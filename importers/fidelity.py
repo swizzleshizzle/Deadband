@@ -447,8 +447,12 @@ class FidelityImporter:
             # selling it.
             side = Side.BUY if raw_qty < 0 else Side.SELL
 
-            # The option's own expiry, NOT `Run Date`. Fidelity books a Friday
-            # expiry on the following Monday, so the two differ by three days.
+            # The option's own expiry, NOT `Run Date`. In the real export
+            # this fix was built from, Fidelity booked a Friday expiry the
+            # following Monday, three days later. The fixture below reuses
+            # that three-day gap (11/21/2026 expiry, 11/24/2026 Run Date) for
+            # arithmetic clarity, not because those fall on a Friday/Monday
+            # -- 2026-11-21 is a Saturday.
             # The expiry is the TRUE event date -- the position ceased to
             # exist on it -- and `expiry` sits inside instrument_natural_key,
             # so this is the same value that mints the instrument and cannot
@@ -458,17 +462,19 @@ class FidelityImporter:
             # What this does NOT do is change any drift `reconcile` reports
             # today, and an earlier version of this comment claimed it did.
             # `reconcile` has no window to see: open_positions
-            # (db/positions.py) takes no `as_of` and filters only on
-            # `t.status = 'open'`, so `--as-of` selects which STATEMENT to
-            # compare against and never which positions -- cmd_reconcile's own
-            # comments say so (cli.py). Once both fills are imported the trade
-            # is closed either way, whether the close is dated Nov 21 or Nov
-            # 24. The phantom-open-across-a-statement-date problem is what
-            # dating from the symbol PREVENTS once position reconstruction
-            # becomes as-of aware (gap #29 in docs/known-gaps.md, which is
-            # what would make the ledger side honour a cutoff): only then does
-            # the three-day gap become visible, as a short that a statement
-            # dated inside the window would show as already gone.
+            # (db/positions.py) takes no `as_of` and has no date filter of
+            # any kind -- its predicate is `t.status = 'open'` plus an
+            # optional account scope -- so `--as-of` selects which STATEMENT
+            # to compare against and never which positions -- cmd_reconcile's
+            # own comments say so (cli.py). Once both fills are imported the
+            # trade is closed either way, whether the close is dated Nov 21
+            # or Nov 24. The phantom-open-across-a-statement-date problem is
+            # what dating from the symbol PREVENTS once position
+            # reconstruction becomes as-of aware (gap #29 in
+            # docs/known-gaps.md, which is what would make the ledger side
+            # honour a cutoff): only then does the three-day gap become
+            # visible, as a short that a statement dated inside the window
+            # would show as already gone.
             when = datetime(
                 instrument.expiry.year,
                 instrument.expiry.month,
