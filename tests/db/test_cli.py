@@ -1019,7 +1019,7 @@ async def test_an_unregistered_account_with_a_money_carrying_row_still_refuses_t
 
     assert rc != 0
     err = capsys.readouterr().err
-    assert "unmapped row(s) carry money" in err
+    assert "row(s) below block the commit" in err
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known) == 0
 
 

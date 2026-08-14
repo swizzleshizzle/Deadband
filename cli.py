@@ -316,8 +316,8 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             ]
             if effective_blocking:
                 print(
-                    "error: refusing to commit -- unmapped row(s) carry money and no "
-                    "rule matched them:",
+                    "error: refusing to commit -- row(s) below block the commit "
+                    "(see each reason):",
                     file=sys.stderr,
                 )
                 for _ref, msg in effective_blocking:
