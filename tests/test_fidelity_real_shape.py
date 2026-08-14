@@ -165,13 +165,40 @@ def test_every_rule_is_exercised_by_a_fixture_row():
 
     Classification is checked directly rather than through parse() because two
     rules resolve to INTERNAL and deliberately produce no output -- they are
-    invisible to any assertion made on fills or cash."""
+    invisible to any assertion made on fills or cash.
+
+    `Outcome.UNSUPPORTED` rules are excluded, keyed on the outcome rather than
+    a hardcoded name list so a future unsupported verb is exempt automatically.
+    A rule whose entire purpose is to refuse a row we have never received
+    cannot also be required to appear in a fixture of rows we have received --
+    requiring it would force fabricating the very row shape E1 says not to
+    invent (real assignments/exercises: zero, across three accounts and five
+    years). That is not a gap in this test's coverage; it is a different
+    source of coverage, asserted below in
+    test_unsupported_rules_are_exercised_by_the_hand_written_sample_table."""
     matched = set()
     for row in _data_rows():
         rule = classify(row["Action"], row["Symbol"])
         if rule is not None:
             matched.add(rule.name)
-    assert {r.name for r in RULES} - matched == set()
+    required = {r.name for r in RULES if r.outcome is not Outcome.UNSUPPORTED}
+    assert required - matched == set()
+
+
+def test_unsupported_rules_are_exercised_by_the_hand_written_sample_table():
+    """The other half of the split above. `Outcome.UNSUPPORTED` rules are
+    exempted from the real-shape requirement because a real export cannot
+    supply a row Michael has never received -- but that must not become a
+    silent hole in coverage. Every such rule is still required to be
+    exercised by SOMETHING: test_fidelity.py's RULE_COVERAGE_SAMPLES, the
+    hand-written table its own test_every_rule_is_reachable checks against.
+    Net effect: every rule in RULES is covered by exactly one of the two
+    files, split by whether the row it needs can plausibly exist."""
+    from tests.test_fidelity import RULE_COVERAGE_SAMPLES
+
+    matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
+    required = {r.name for r in RULES if r.outcome is Outcome.UNSUPPORTED}
+    assert required - matched == set()
 
 
 def test_no_dated_row_disappears_without_a_trace():
