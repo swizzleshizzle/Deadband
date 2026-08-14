@@ -117,10 +117,22 @@ Rejected alternatives:
 **The date comes from the symbol, not from the `AS OF` prose.** For an option, expiry sits
 *inside* `instrument_natural_key`, so the symbol's date is the same value that mints the
 instrument and cannot disagree with it. Parsing the prose would introduce a second source
-that could. This matters for reconciliation: a statement dated the day after a Friday
-expiry shows no such position, so dating the close to the following Monday's `Run Date`
-would leave a phantom open across the statement date and produce false drift in exactly
-the window `reconcile` is meant to check.
+that could. It is also the true event date: the position ceased to exist on the expiry,
+not on the Monday the broker got round to booking it.
+
+**Why this is a forward-looking correctness argument, not a claim about today's
+`reconcile`.** Dating from the symbol changes no drift figure `reconcile` currently
+prints. `open_positions` (`db/positions.py`) takes **no `as_of`** and filters only on
+`WHERE t.status = 'open'`; `--as-of` chooses which *snapshot* to compare against and never
+which positions (see `cmd_reconcile`'s own comments in `cli.py`, and gap **#29** in
+`docs/known-gaps.md`, which records that `--as-of` does not filter the ledger side of the
+comparison at all). Once both fills are imported, a close dated Nov 21 and one dated Nov
+24 are indistinguishable to today's command. What the expiry date buys is that the ledger
+is *already right* when position reconstruction becomes as-of aware — the change gap #29
+describes. Only then does the three-day window open up: a statement dated inside it shows
+no such position, while a ledger reconstructed from a `Run Date`-dated close would still
+carry the short. Backfilling a correct event date after the fact means re-deriving it from
+symbols anyway, so it is cheaper and safer to record it correctly now.
 
 **The zero-price guard is not called on this branch, and the reason is precise.**
 `zero_price_warning` exists because *downstream of `_decimal`, a missing column and a

@@ -448,12 +448,27 @@ class FidelityImporter:
             side = Side.BUY if raw_qty < 0 else Side.SELL
 
             # The option's own expiry, NOT `Run Date`. Fidelity books a Friday
-            # expiry on the following Monday; a statement dated in between
-            # shows no such position, so Run Date would leave a phantom open
-            # across the statement date and produce false drift. `expiry` sits
-            # inside instrument_natural_key, so this is the same value that
-            # mints the instrument and cannot disagree with it. Midnight UTC
-            # matches the date-only convention the Run Date branch uses.
+            # expiry on the following Monday, so the two differ by three days.
+            # The expiry is the TRUE event date -- the position ceased to
+            # exist on it -- and `expiry` sits inside instrument_natural_key,
+            # so this is the same value that mints the instrument and cannot
+            # disagree with it. Midnight UTC matches the date-only convention
+            # the Run Date branch uses.
+            #
+            # What this does NOT do is change any drift `reconcile` reports
+            # today, and an earlier version of this comment claimed it did.
+            # `reconcile` has no window to see: open_positions
+            # (db/positions.py) takes no `as_of` and filters only on
+            # `t.status = 'open'`, so `--as-of` selects which STATEMENT to
+            # compare against and never which positions -- cmd_reconcile's own
+            # comments say so (cli.py). Once both fills are imported the trade
+            # is closed either way, whether the close is dated Nov 21 or Nov
+            # 24. The phantom-open-across-a-statement-date problem is what
+            # dating from the symbol PREVENTS once position reconstruction
+            # becomes as-of aware (gap #29 in docs/known-gaps.md, which is
+            # what would make the ledger side honour a cutoff): only then does
+            # the three-day gap become visible, as a short that a statement
+            # dated inside the window would show as already gone.
             when = datetime(
                 instrument.expiry.year,
                 instrument.expiry.month,
