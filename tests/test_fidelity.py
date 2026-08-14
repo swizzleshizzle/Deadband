@@ -563,6 +563,8 @@ RULE_COVERAGE_SAMPLES = [
     ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
     ("CONTRIBUTIONS MISC 2026", ""),  # contributions
     ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
+    ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
+    ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option
 ]
 
 
@@ -965,3 +967,60 @@ def test_expiry_with_zero_quantity_is_refused_not_guessed():
     result = FidelityImporter().parse(row)
     assert result.fills == ()
     assert any("quantity" in w for w in result.warnings)
+
+
+# --- Task 2: UNSUPPORTED -- refuse assignment and exercise loudly -----------
+#
+# Scope is deliberately expiry-only. Today an unmapped row blocks the commit
+# only when it carries a non-zero quantity or amount (reject -> _carries_money).
+# The option leg of an assignment can carry Amount 0.00, exactly like an
+# expiry -- so leaving ASSIGNED/EXERCISED unmapped would drop them silently
+# and reproduce the exact hole Task 1 closed for expiry. UNSUPPORTED means
+# "recognised, and deliberately refuses" rather than "unrecognised."
+
+
+def test_an_assigned_option_blocks_the_commit_even_with_no_money_on_the_row():
+    """Scope is expiry-only, which is only safe if the unhandled case refuses
+    rather than passes. An assignment's option leg can carry Amount 0.00, so
+    the ordinary carries-money blocking rule would let it through silently --
+    the exact shape of the bug this branch exists to fix. Quantity is ALSO
+    left blank here, deliberately: a nonzero Quantity would already block
+    through the pre-existing carries-money path and the test would pass for
+    the wrong reason, hiding the very gap this outcome exists to close."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,ASSIGNED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.fills == ()
+    assert batch.blocking != ()
+    assert any("ASSIGNED" in message for _ref, message in batch.blocking)
+
+
+def test_an_exercised_option_blocks_the_commit():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXERCISED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.fills == ()
+    assert any("EXERCISED" in message for _ref, message in batch.blocking)
+
+
+def test_an_expiry_does_not_block():
+    """The counterpart assertion: the two outcomes must not be conflated."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.blocking == ()
+    assert len(batch.fills) == 1
+
+
+def test_every_outcome_member_has_a_dispatch_branch():
+    """The dispatch used to end in a bare `# rule.outcome is Outcome.CASH`
+    fallthrough, so a new Outcome with no branch would be silently treated as
+    a cash movement. This pins that it cannot happen again."""
+    for rule in RULES:
+        assert rule.outcome in {
+            Outcome.FILL,
+            Outcome.CASH,
+            Outcome.INTERNAL,
+            Outcome.EXPIRY,
+            Outcome.UNSUPPORTED,
+        }

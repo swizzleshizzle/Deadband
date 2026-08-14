@@ -123,6 +123,12 @@ class Outcome(enum.Enum):
     # constant this code supplies rather than a value parsed from the row,
     # so zero_price_warning must not run on it -- see build_expiry_fill.
     EXPIRY = "expiry"
+    # Recognised and deliberately REFUSED. Scope is expiry-only by decision
+    # E1 of the spec; this is what makes that a choice rather than a bet. An
+    # unmapped row blocks only when it carries money, and an assignment's
+    # option leg can carry Amount 0.00 -- so without this it would drop
+    # silently, exactly like an expiry did before Task 1.
+    UNSUPPORTED = "unsupported"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +184,8 @@ RULES: tuple[Rule, ...] = (
     Rule("participant_contribution", "PARTIC CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("contributions", "CONTRIBUTIONS", Outcome.CASH, cash_kind="deposit"),
     Rule("expired_option", "EXPIRED", Outcome.EXPIRY),
+    Rule("assigned_option", "ASSIGNED", Outcome.UNSUPPORTED),
+    Rule("exercised_option", "EXERCISED", Outcome.UNSUPPORTED),
 )
 
 
@@ -602,7 +610,19 @@ class FidelityImporter:
                 build_expiry_fill(row, raw_row, line_no, symbol, account)
                 continue
 
-            # rule.outcome is Outcome.CASH
+            if rule.outcome is Outcome.UNSUPPORTED:
+                message = (
+                    f"line {line_no}: {action.split()[0]} is recognised but not "
+                    "supported; import refuses rather than guessing at the "
+                    "resulting stock leg"
+                )
+                warnings.append(message)
+                unmapped.append(str(raw_row))
+                blocking.append((account, message))
+                continue
+
+            if rule.outcome is not Outcome.CASH:
+                raise AssertionError(f"unhandled rule outcome {rule.outcome!r}")
             try:
                 amount = _decimal(row.get("amount"))
             except InvalidOperation as exc:
