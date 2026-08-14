@@ -207,9 +207,11 @@ Every new test is gated against a mutant.
    `REVERSE SPLIT`, `NAME CHANGED`, `DISTRIBUTION`, `TRANSFER OF ASSETS ACAT`, `IN LIEU
    OF` and a `BUY CANCEL OPENING TRANSACTION`. `ledger/corporate.py` already models several
    of these but is not wired to the importer. Every one of these carries a nonzero
-   `Quantity` or `Amount` in the real exports (`MERGER` qty 41, `NAME CHANGED` qty -20,
-   `REVERSE SPLIT` qty 306, `IN LIEU OF` amount 0.03), so every one blocks the commit
-   today — these two accounts cannot be imported until corporate actions are modelled.
+   `Quantity` in the real exports — and `IN LIEU OF`, whose quantity is zero, a nonzero
+   `Amount` — so every one blocks the commit today; these two accounts cannot be imported
+   until corporate actions are modelled. (The figures themselves are deliberately not
+   quoted here: they are real transaction quantities and amounts, and the claim they
+   support is about which column is nonzero, not what it held.)
    That is a real gap, but it is a refusal, not a corruption: unlike the pre-fix expiry
    hazard, none of these rows can pass silently while changing share counts. It still
    needs its own spec, to turn a blocked import into a correct one.
