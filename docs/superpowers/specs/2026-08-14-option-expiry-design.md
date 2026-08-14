@@ -10,21 +10,27 @@
 ## 1. Context
 
 Real Fidelity exports for three accounts, covering 2022–2026, contain **27 `EXPIRED`
-rows** that the importer does not recognise. Every one is silently dropped: an unmapped
-row only blocks the commit when it carries a dollar figure in `Amount`, and an expiry's
-`Amount` is `0.00`.
+rows** that the importer does not recognise. Every one carries a nonzero `Quantity`, so
+each lands in `ImportBatch.blocking`, and `cmd_import` refuses the entire import — exit
+code 2, nothing written (`cli.py:317-325`) — the moment one of these files is imported.
+**These accounts' files cannot be imported at all until `EXPIRED` is handled.**
 
-The consequence compounds. Only the opening `YOU SOLD` fill is recorded, so a short call
-that expired worthless **never closes**:
+That refusal is the safe failure, not the harmful one. The harmful one is hypothetical,
+and it is why the fix has to be the correct close rather than just a rule that stops
+blocking: were an `EXPIRED` row ever unmapped *without* a money column that happens to
+block — the exact gap `Outcome.UNSUPPORTED` (§5) closes for `ASSIGNED`/`EXERCISED` — only
+the opening `YOU SOLD` fill would be recorded, and a short call that expired worthless
+would **never close**:
 
 - the position stays open forever in `positions`;
 - it is a short, so it is valued as a liability that does not exist, understating equity;
 - the realised gain — the whole premium, a 100% win — is never realised;
 - `reconcile` reports persistent, growing drift attributable to nothing obvious.
 
-That last point is why this is worth fixing before the first real import. A reconciliation
-run against a ledger with known phantom positions produces a drift figure that proves
-nothing, which is exactly the phantom-hunt §6 of the reconcile spec exists to prevent.
+Fixing this is worth doing before the first real import for a simpler reason than drift:
+these three accounts' `EXPIRED` rows block every file that contains one, so there is no
+"import now, reconcile later" option — the accounts stay unimportable until `EXPIRED` is
+handled.
 
 ### What the real exports established
 
@@ -143,12 +149,14 @@ this would not be caught by testing against that data alone.
 | `ASSIGNED` / `EXERCISED` | **Blocks the commit**, naming the verb. |
 | Any other unrecognised verb | Unchanged from today. |
 
-**Why assignment gets an explicit blocking rule rather than being left unmapped.** Today an
-unmapped row blocks only when it carries a dollar figure in `Amount`. The option leg of an
-assignment may well be `0.00` — exactly like an expiry — which would drop it silently and
-put us straight back in the hole this spec exists to fill. `Outcome.UNSUPPORTED` means
-*recognised, and deliberately refuses*, which is the honest description and the safety
-counterpart to E1's narrow scope. Without it, "expiry only" is a bet rather than a choice.
+**Why assignment gets an explicit blocking rule rather than being left unmapped.** A
+realistic `ASSIGNED`/`EXERCISED` row already blocks today: it carries a nonzero
+`Quantity`, and an unmapped row blocks whenever it carries a nonzero `Quantity` *or*
+`Amount`. `Outcome.UNSUPPORTED` earns its place anyway — it names the verb in the refusal
+instead of a generic "unhandled action", and it blocks unconditionally, independent of
+what the row's money columns happen to hold, rather than depending on `Quantity` staying
+nonzero. That is defence in depth and a better error message, not the only thing standing
+between an assignment and a silent drop.
 
 ---
 
@@ -182,10 +190,13 @@ Every new test is gated against a mutant.
 2. **Corporate actions remain unhandled.** The two long-term accounts contain `MERGER`,
    `REVERSE SPLIT`, `NAME CHANGED`, `DISTRIBUTION`, `TRANSFER OF ASSETS ACAT`, `IN LIEU
    OF` and a `BUY CANCEL OPENING TRANSACTION`. `ledger/corporate.py` already models several
-   of these but is not wired to the importer. **The asymmetry matters:** those carrying a
-   nonzero `Amount` block the commit, but `MERGER` and `NAME CHANGED` carry `0.00` and pass
-   silently while changing share counts. That is the same silent-drop shape as expiry, and
-   it needs its own spec.
+   of these but is not wired to the importer. Every one of these carries a nonzero
+   `Quantity` or `Amount` in the real exports (`MERGER` qty 41, `NAME CHANGED` qty -20,
+   `REVERSE SPLIT` qty 306, `IN LIEU OF` amount 0.03), so every one blocks the commit
+   today — these two accounts cannot be imported until corporate actions are modelled.
+   That is a real gap, but it is a refusal, not a corruption: unlike the pre-fix expiry
+   hazard, none of these rows can pass silently while changing share counts. It still
+   needs its own spec, to turn a blocked import into a correct one.
 3. **Backdated `as of` correction rows** (`REINVESTMENT as of …`, `FEE CHARGED as of …`)
    appear in one account and are not modelled. Their effect on dating is unexamined.
 

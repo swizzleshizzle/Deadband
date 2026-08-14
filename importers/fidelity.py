@@ -124,10 +124,10 @@ class Outcome(enum.Enum):
     # so zero_price_warning must not run on it -- see build_expiry_fill.
     EXPIRY = "expiry"
     # Recognised and deliberately REFUSED. Scope is expiry-only by decision
-    # E1 of the spec; this is what makes that a choice rather than a bet. An
-    # unmapped row blocks only when it carries money, and an assignment's
-    # option leg can carry Amount 0.00 -- so without this it would drop
-    # silently, exactly like an expiry did before Task 1.
+    # E1 of the spec. A realistic ASSIGNED/EXERCISED row already blocks on
+    # its own nonzero Quantity via the ordinary carries-money check; this
+    # exists so the refusal names the verb, and blocks unconditionally
+    # rather than depending on what the row's money columns happen to hold.
     UNSUPPORTED = "unsupported"
 
 

@@ -885,11 +885,13 @@ def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix(
 
 # --- Task 1: the EXPIRY outcome and the closing fill ------------------------
 #
-# An EXPIRED row's Amount is always 0.00, so an unmapped EXPIRED row is
-# silently dropped rather than blocking -- the short/long it should close
-# stays open forever. Reuses this file's own established convention (a data
-# row built from FIXTURE's own header) rather than introducing a second CSV
-# helper. Fabricated underlying (ZXCO) per the repo's public-data rule.
+# An EXPIRED row already blocks the commit today, via its nonzero Quantity --
+# cmd_import refuses the entire file rather than silently dropping just this
+# row (cli.py:317-325). What's missing is the correct handling: closing the
+# position at zero, rather than leaving the account permanently unimportable.
+# Reuses this file's own established convention (a data row built from
+# FIXTURE's own header) rather than introducing a second CSV helper.
+# Fabricated underlying (ZXCO) per the repo's public-data rule.
 
 
 def test_expired_short_call_closes_with_a_buy_at_zero():
@@ -971,22 +973,24 @@ def test_expiry_with_zero_quantity_is_refused_not_guessed():
 
 # --- Task 2: UNSUPPORTED -- refuse assignment and exercise loudly -----------
 #
-# Scope is deliberately expiry-only. Today an unmapped row blocks the commit
-# only when it carries a non-zero quantity or amount (reject -> _carries_money).
-# The option leg of an assignment can carry Amount 0.00, exactly like an
-# expiry -- so leaving ASSIGNED/EXERCISED unmapped would drop them silently
-# and reproduce the exact hole Task 1 closed for expiry. UNSUPPORTED means
-# "recognised, and deliberately refuses" rather than "unrecognised."
+# Scope is deliberately expiry-only. A realistic ASSIGNED/EXERCISED row
+# already blocks today via its nonzero Quantity (an unmapped row blocks
+# whenever it carries a nonzero Quantity OR Amount -- reject ->
+# _carries_money). UNSUPPORTED earns its place anyway: it names the verb in
+# the refusal instead of a generic "unhandled action", and it blocks
+# unconditionally, independent of what the row's money columns happen to
+# hold, rather than depending on Quantity staying nonzero. That is defence
+# in depth and a better error message, not the only thing standing between
+# an assignment and a silent drop.
 
 
 def test_an_assigned_option_blocks_the_commit_even_with_no_money_on_the_row():
-    """Scope is expiry-only, which is only safe if the unhandled case refuses
-    rather than passes. An assignment's option leg can carry Amount 0.00, so
-    the ordinary carries-money blocking rule would let it through silently --
-    the exact shape of the bug this branch exists to fix. Quantity is ALSO
-    left blank here, deliberately: a nonzero Quantity would already block
-    through the pre-existing carries-money path and the test would pass for
-    the wrong reason, hiding the very gap this outcome exists to close."""
+    """Scope is expiry-only, which stays safe only if the refusal does not
+    depend on the row's money columns. A realistic assignment row already
+    blocks via its nonzero Quantity; this row deliberately leaves BOTH
+    Quantity and Amount blank to isolate that independence -- pinning that
+    UNSUPPORTED blocks because the verb is recognised and refused, not
+    because some column happened to be nonzero."""
     header = FIXTURE.splitlines()[0]
     row = header + "\n11/24/2026,X1,ASSIGNED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,,,,,0.00\n"
     batch = FidelityImporter().parse(row)
