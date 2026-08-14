@@ -562,6 +562,7 @@ RULE_COVERAGE_SAMPLES = [
     ("CO CONTR 2026 Q1", ""),  # employer_contribution
     ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
     ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+    ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
 ]
 
 
@@ -878,3 +879,89 @@ def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix(
     result = FidelityImporter().parse(FIXTURE + "This report is for informational purposes only.\n")
     assert result.blocking == ()
     assert result.unmapped_rows
+
+
+# --- Task 1: the EXPIRY outcome and the closing fill ------------------------
+#
+# An EXPIRED row's Amount is always 0.00, so an unmapped EXPIRED row is
+# silently dropped rather than blocking -- the short/long it should close
+# stays open forever. Reuses this file's own established convention (a data
+# row built from FIXTURE's own header) rather than introducing a second CSV
+# helper. Fabricated underlying (ZXCO) per the repo's public-data rule.
+
+
+def test_expired_short_call_closes_with_a_buy_at_zero():
+    """The row describes the POSITION being removed, not a trade direction.
+    A negative quantity is a short, and a short is closed by buying it back.
+    Reading the sign as a side would open a second short instead of closing
+    the first, and the phantom would never go away."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.side is Side.BUY
+    assert fill.quantity == Decimal(1)
+    assert fill.price == Decimal(0)
+
+
+def test_expired_long_put_closes_with_a_sell_at_zero():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED PUT (ZXCO) ZXCO CORP,-ZXCO261121P10,,2,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.side is Side.SELL
+    assert fill.quantity == Decimal(2)
+
+
+def test_expiry_is_dated_from_the_symbol_not_the_run_date():
+    """Fidelity books a Friday expiry on the following Monday. A statement
+    dated in between shows no such position, so dating the close to Run Date
+    would leave a phantom open across the statement date and produce false
+    drift in exactly the window reconcile exists to check."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.executed_at == datetime(2026, 11, 21, tzinfo=UTC)
+
+
+def test_expiry_does_not_trip_the_zero_price_guard():
+    """The guard exists because downstream of _decimal a missing column and a
+    genuine zero are indistinguishable. This path never reads `price` at all,
+    so the ambiguity cannot arise. Asserting the absence of the warning is
+    what pins the carve-out -- asserting price == 0 alone would still pass if
+    the guard fired."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert not any("zero price" in w.lower() for w in result.warnings)
+
+
+def test_two_same_size_lots_expiring_the_same_day_both_survive():
+    """Identical rows hash identically without the occurrence counter, and the
+    second would be silently deduped away -- losing a lot. The real export's
+    same-day pair differs in quantity, so testing against that data alone
+    would never catch this."""
+    header = FIXTURE.splitlines()[0]
+    data_row = "11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-3,,,,0.00"
+    rows = "\n".join([header, data_row, data_row])
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+
+
+def test_expiry_with_an_unparsable_symbol_is_refused_not_guessed():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED SOMETHING ODD,NOTANOPTION,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert any("option symbol" in w for w in result.warnings)
+
+
+def test_expiry_with_zero_quantity_is_refused_not_guessed():
+    """Neither direction nor size is knowable, and guessing either is how you
+    get a plausible wrong number."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,0,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert any("quantity" in w for w in result.warnings)
