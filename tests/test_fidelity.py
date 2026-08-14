@@ -929,10 +929,19 @@ def test_expired_long_put_closes_with_a_sell_at_zero():
 
 
 def test_expiry_is_dated_from_the_symbol_not_the_run_date():
-    """Fidelity books a Friday expiry on the following Monday. A statement
-    dated in between shows no such position, so dating the close to Run Date
-    would leave a phantom open across the statement date and produce false
-    drift in exactly the window reconcile exists to check."""
+    """The expiry is the TRUE event date -- the position ceased to exist on
+    it -- and `expiry` sits inside instrument_natural_key, so it is the same
+    value that mints the instrument. In the real export Fidelity booked an
+    expiry three days after it; the dates below reuse that gap for arithmetic
+    clarity, not because they fall on a Friday/Monday (2026-11-21 is a
+    Saturday).
+
+    This does NOT change any drift `reconcile` reports today, and an earlier
+    version of this docstring claimed it did. `open_positions` takes no
+    `as_of` and has no date filter, so `--as-of` selects which STATEMENT to
+    compare against, never which positions. Dating from the symbol is what
+    PREVENTS a phantom-open-across-a-statement-date once position
+    reconstruction becomes as-of aware (gap #29)."""
     header = FIXTURE.splitlines()[0]
     row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
     result = FidelityImporter().parse(row)
