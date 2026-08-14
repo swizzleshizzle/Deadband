@@ -1,7 +1,14 @@
 import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import UUID
 
+# Private by name, imported deliberately: _fill_dedupe_keys is the single
+# computation commit_batch and probe_duplicates both use (see its docstring),
+# so it is the real dedupe mechanism, not a test-only reimplementation of it.
+# It is pure -- no connection, no I/O -- so importing it here costs no
+# database.
+from db.importing import _fill_dedupe_keys
 from importers.base import OUTFLOW_KINDS
 from importers.fidelity import (
     RULES,
@@ -19,6 +26,10 @@ from ledger.types import AssetClass, Side
 # only resolves when pytest happens to be invoked from the repo root.
 _FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
 FIXTURE = (_FIXTURES_DIR / "fidelity" / "activity.csv").read_text()
+
+# Any stable account id: content_hash mixes it in, so it must be the SAME for
+# both fills being compared or they would differ for the wrong reason.
+_DEDUPE_ACCOUNT = UUID("00000000-0000-0000-0000-0000000000a1")
 
 
 def batch():
@@ -941,16 +952,40 @@ def test_expiry_does_not_trip_the_zero_price_guard():
     assert not any("zero price" in w.lower() for w in result.warnings)
 
 
-def test_two_same_size_lots_expiring_the_same_day_both_survive():
-    """Identical rows hash identically without the occurrence counter, and the
-    second would be silently deduped away -- losing a lot. The real export's
-    same-day pair differs in quantity, so testing against that data alone
-    would never catch this."""
+def test_two_same_size_lots_expiring_the_same_day_get_distinct_dedupe_keys():
+    """Two identical expiry rows must survive the DEDUPE, which is what the
+    occurrence counter in db.importing._fill_dedupe_keys exists for: without
+    it both rows hash to the same content_hash and the second is silently
+    dropped on commit, losing a lot. The real export's same-day pair differs
+    in quantity, so testing against that data alone would never catch this.
+
+    Asserting on `len(parse().fills)` alone would prove NOTHING here -- parse
+    performs no dedupe of any kind, so that count stays 2 even with the
+    occurrence index deleted outright. The keys are what the commit path
+    actually deduplicates on, so this calls the real key function.
+    `_fill_dedupe_keys` is pure (it hashes rows; no connection, no I/O), so
+    no database is needed to exercise it.
+
+    It is also the only coverage that an EXPIRY fill participates in dedupe
+    at all. `_fill_dedupe_keys` is origin-agnostic -- it hashes whatever
+    CanonicalFills it is handed, without caring which branch built them -- so
+    participation is true by construction; this pins that the construction
+    holds for fills the expiry branch produces.
+    """
     header = FIXTURE.splitlines()[0]
     data_row = "11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-3,,,,0.00"
     rows = "\n".join([header, data_row, data_row])
     result = FidelityImporter().parse(rows + "\n")
     assert len(result.fills) == 2
+
+    keys = _fill_dedupe_keys(_DEDUPE_ACCOUNT, result.fills)
+    assert len(keys) == 2
+    # Neither expiry fill carries a venue_fill_id, so both must take the
+    # content_hash arm -- if either took the (venue_fill_id, None) arm the
+    # occurrence counter would not be what is keeping them apart, and this
+    # test would be pinning the wrong mechanism.
+    assert all(venue_id is None and content is not None for venue_id, content in keys)
+    assert keys[0][1] != keys[1][1]
 
 
 def test_expiry_with_an_unparsable_symbol_is_refused_not_guessed():
