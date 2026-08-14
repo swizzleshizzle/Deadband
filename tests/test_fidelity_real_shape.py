@@ -49,6 +49,7 @@ import csv
 import io
 import pathlib
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from importers.fidelity import RULES, FidelityImporter, Outcome, classify
@@ -68,7 +69,7 @@ SYNTHETIC_REFS = frozenset({"X23456789", "112233445", "556677889", "90210"})
 
 # Every dated row must resolve to exactly one of these. See
 # test_no_dated_row_disappears_without_a_trace.
-_DATED_ROWS = 23
+_DATED_ROWS = 25
 
 
 def batch():
@@ -246,11 +247,22 @@ def test_option_symbol_survives_its_leading_space():
 
 def test_compound_action_text_does_not_hijack_the_trade_branch():
     """Every action here is prose containing a security's name. Exactly the
-    three intended rows become externally-funded fills; nothing else is
-    dragged into the YOU BOUGHT/YOU SOLD branch by a substring."""
+    three intended YOU BOUGHT/YOU SOLD rows become externally-funded fills via
+    that branch; nothing else is dragged into it by a substring.
+
+    Five in total: the original three, plus the Task 3 expiry pair (the
+    opening YOU SOLD and its closing EXPIRY fill, which is funded externally
+    too -- see build_expiry_fill). Their order follows the fixture's row
+    order, not chronology, same as the original three."""
     external = [f for f in batch().fills if f.funding_source == "external"]
-    assert len(external) == 3
-    assert [f.side for f in external] == [Side.BUY, Side.BUY, Side.SELL]
+    assert len(external) == 5
+    assert [f.side for f in external] == [
+        Side.BUY,
+        Side.BUY,
+        Side.SELL,
+        Side.SELL,
+        Side.BUY,
+    ]
 
 
 def test_signed_quantity_becomes_a_positive_sell():
@@ -417,3 +429,21 @@ def test_employer_plan_unit_quantities_are_currently_discarded():
     assert contribution.amount == Decimal("118.44")
     # The units are nowhere: no fill exists for the plan account at all.
     assert not [f for f in b.fills if f.external_ref == "90210"]
+
+
+# --- Task 3: the closing fill actually closes a trade ----------------------
+
+
+def test_an_expired_short_call_closes_and_realises_its_premium():
+    """The whole point of the feature. Before this, only the opening SELL was
+    recorded: the short stayed open forever, was valued as a liability that
+    did not exist, and its premium was never realised."""
+    batch_ = FidelityImporter().parse(FIXTURE)
+    opt = [f for f in batch_.fills if f.instrument.symbol == "-ZXCO261121C500"]
+    assert len(opt) == 2
+    opening = next(f for f in opt if f.side is Side.SELL)
+    closing = next(f for f in opt if f.side is Side.BUY)
+    assert opening.price == Decimal("4.00")
+    assert closing.price == Decimal(0)
+    assert closing.executed_at == datetime(2026, 11, 21, tzinfo=UTC)
+    assert closing.quantity == opening.quantity
