@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -3063,7 +3064,16 @@ async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(
     assert await list_actions(conn, instrument_id) == []
 
 
-async def test_corporate_add_refuses_an_unknown_symbol(conn, monkeypatch):
+async def test_corporate_add_refuses_an_unknown_symbol(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """Follows test_marks_set_refuses_an_ambiguous_symbol_without_writing:
+    db.marks.resolve_instrument_by_symbol's OWN message must survive into
+    stderr, not just some exit code. A `print` that dropped `{exc}` -- or a
+    handler that returned 2 for an entirely unrelated reason -- would satisfy
+    a bare `rc == 2` and tell the user nothing about which symbol failed."""
+    _account_id, instrument_id = account_with_1800
+
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
 
@@ -3075,6 +3085,13 @@ async def test_corporate_add_refuses_an_unknown_symbol(conn, monkeypatch):
         )
     )
     assert rc == 2
+    err = capsys.readouterr().err
+    assert "no instrument with symbol" in err
+    assert "NOSUCH" in err
+    # Scoped to the one instrument this test's fixture created, never an
+    # unqualified count: the test database is shared and `instrument` rows are
+    # global.
+    assert await list_actions(conn, instrument_id) == []
 
 
 async def test_corporate_add_allows_an_instrument_with_no_fills(conn, monkeypatch, capsys):
@@ -3162,14 +3179,28 @@ async def test_corporate_remove_previews_without_deleting(
     assert position.quantity == Decimal(300)
 
 
-async def test_corporate_remove_refuses_an_unknown_id(conn, monkeypatch):
+async def test_corporate_remove_refuses_an_unknown_id(conn, account_with_1800, monkeypatch, capsys):
+    """A bare `rc == 2` would hold for a handler that refused for an unrelated
+    reason, and would not notice a `remove` that deleted the wrong row on its
+    way to reporting failure. So: the refusal names the id that was not found,
+    and a real stored action -- one this test created, on a different id --
+    is still there afterwards, with the position it adjusts untouched."""
+    account_id, instrument_id = account_with_1800
+    kept = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    missing = uuid4()
+
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
 
-    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(uuid4()), commit=True))
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(missing), commit=True))
     assert rc == 2
+    assert str(missing) in capsys.readouterr().err
+    assert [r["id"] for r in await list_actions(conn, instrument_id)] == [kept]
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(300)
 
 
 async def test_corporate_remove_refuses_a_malformed_id(conn, monkeypatch):
@@ -3209,3 +3240,145 @@ async def test_corporate_add_refuses_a_basis_allocation_that_is_not_a_finite_num
     )
     assert rc == 2
     assert await list_actions(conn, instrument_id) == []
+
+
+# Deliberately BEFORE the 2026-03-02 ex-date every corporate test here uses.
+# `_position_fill` above executes at 2026-08-01, which is AFTER it, so a
+# fixture built on that helper unmodified would put both fills on the wrong
+# side of the split and every assertion below would pass vacuously -- the same
+# trap tests/db/conftest.py's own `_T0` comment describes.
+_PRE_EX_DATE = datetime(2026, 2, 1, 9, 0, tzinfo=UTC)
+
+
+@pytest_asyncio.fixture
+async def two_accounts_holding_zxco(conn):
+    """TWO accounts, each holding a BUY on the SAME fabricated ZXCO equity.
+
+    `account_with_1800` (tests/db/conftest.py) is a single account, which is
+    why the mutation "regroup only the first holding account" survived the
+    whole gate: with one holder, `account_ids[:1]` and `account_ids` are the
+    same list. This is the fixture that tells them apart.
+
+    The two quantities are DIFFERENT (1800 and 600 -> 300 and 100 after a 1:6
+    reverse split) so the assertion binds each account to its own figure and
+    cannot be satisfied by regrouping one account twice.
+    """
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    accounts = []
+    for name, quantity, ref in (("CorpA", "1800", "zx2a"), ("CorpB", "600", "zx2b")):
+        acc = await create_account(conn, name=name, venue="manual", account_type="cash")
+        fill = replace(
+            _position_fill(acc, inst, side=Side.BUY, quantity=quantity, price="0.05", ref=ref),
+            executed_at=_PRE_EX_DATE,
+        )
+        await insert_fills(conn, [fill])
+        accounts.append(acc)
+    return accounts[0], accounts[1], inst
+
+
+async def test_corporate_add_commits_and_regroups_every_holding_account(
+    conn, two_accounts_holding_zxco, monkeypatch
+):
+    """Spec decision C7. A corporate action is GLOBAL -- the corporate_action
+    table deliberately has no account_id, because a split affects every holder
+    -- and positions come from materialised trade rows, so an add that regroups
+    only some holders leaves the rest reporting pre-split quantities with
+    nothing about the position saying so.
+
+    The account order `SELECT DISTINCT account_id` returns is not defined, so
+    this must hold whichever account comes first: each expected quantity is
+    bound to its own account, and an unregrouped account has no trade rows at
+    all, which fails the single-position unpack rather than passing quietly.
+    """
+    acc_a, acc_b, instrument_id = two_accounts_holding_zxco
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 0
+    (position_a,) = await open_positions(conn, acc_a)
+    (position_b,) = await open_positions(conn, acc_b)
+    assert (position_a.quantity, position_b.quantity) == (Decimal(300), Decimal(100))
+
+
+# --- the `corporate` subparser wiring -------------------------------------
+# Every test above hands its handler a namespace built by `_corporate_args`,
+# which hardcodes the dest names. A flag registered under a dest no handler
+# reads -- or a subcommand missing its set_defaults(fn=...) -- would ship with
+# all of them green. These two drive the real parser through cli.main() with a
+# monkeypatched sys.argv, the same way
+# test_marks_set_requires_exactly_one_of_symbol_or_natural_key above does.
+
+
+@pytest.mark.parametrize(
+    ("argv", "handler"),
+    [
+        (
+            [
+                "deadband", "corporate", "add", "--type", "reverse_split",
+                "--symbol", "ZXCO", "--ex-date", "2026-03-02", "--ratio", "1:6",
+            ],
+            "cmd_corporate_add",
+        ),
+        (["deadband", "corporate", "list", "--symbol", "ZXCO"], "cmd_corporate_list"),
+        (
+            ["deadband", "corporate", "remove", "3f1b2c9e-0000-4000-8000-000000000001"],
+            "cmd_corporate_remove",
+        ),
+    ],
+)
+def test_corporate_parser_routes_each_subcommand_to_its_handler(monkeypatch, argv, handler):
+    """main() resolves `fn` at parse time, so a subcommand whose
+    set_defaults(fn=...) was omitted or pointed at the wrong handler fails
+    here. No database is involved: the handler itself is replaced."""
+    called = []
+
+    async def spy(args):
+        called.append(args)
+        return 0
+
+    monkeypatch.setattr(cli, handler, spy)
+    monkeypatch.setattr("sys.argv", argv)
+    assert cli.main() == 0
+    assert len(called) == 1
+
+
+def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monkeypatch):
+    """One invocation carrying every flag `corporate add` registers, asserted
+    against the exact attribute names cmd_corporate_add reads. A renamed flag,
+    a missing `default=None`, or a --commit that did not store True would be
+    invisible to every namespace-built test in this file."""
+    captured = []
+
+    async def spy(args):
+        captured.append(args)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_corporate_add", spy)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "deadband", "corporate", "add", "--type", "spinoff", "--symbol", "ZXCO",
+            "--ex-date", "2026-03-02", "--ratio", "1:1", "--resulting-symbol", "ZXCB",
+            "--basis-allocation", "0.25", "--note", "a spinoff", "--commit",
+        ],
+    )
+    assert cli.main() == 0
+    (args,) = captured
+    assert (args.type, args.symbol, args.ex_date, args.ratio) == (
+        "spinoff", "ZXCO", "2026-03-02", "1:1",
+    )
+    assert (args.resulting_symbol, args.basis_allocation, args.note) == (
+        "ZXCB", "0.25", "a spinoff",
+    )
+    assert args.commit is True
