@@ -118,6 +118,17 @@ class Outcome(enum.Enum):
     # cash (A2-9), those are two legs of one event; recording both counts the
     # money twice. The dividend leg records, this leg does not.
     INTERNAL = "internal"
+    # An option leaving the book because it expired worthless. Produces a
+    # CLOSING fill at price zero. Distinct from FILL because the zero is a
+    # constant this code supplies rather than a value parsed from the row,
+    # so zero_price_warning must not run on it -- see build_expiry_fill.
+    EXPIRY = "expiry"
+    # Recognised and deliberately REFUSED. Scope is expiry-only by decision
+    # E1 of the spec. A realistic ASSIGNED/EXERCISED row already blocks on
+    # its own nonzero Quantity via the ordinary carries-money check; this
+    # exists so the refusal names the verb, and blocks unconditionally
+    # rather than depending on what the row's money columns happen to hold.
+    UNSUPPORTED = "unsupported"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +183,9 @@ RULES: tuple[Rule, ...] = (
     Rule("employer_contribution", "CO CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("participant_contribution", "PARTIC CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("contributions", "CONTRIBUTIONS", Outcome.CASH, cash_kind="deposit"),
+    Rule("expired_option", "EXPIRED", Outcome.EXPIRY),
+    Rule("assigned_option", "ASSIGNED", Outcome.UNSUPPORTED),
+    Rule("exercised_option", "EXERCISED", Outcome.UNSUPPORTED),
 )
 
 
@@ -379,6 +393,109 @@ class FidelityImporter:
                 )
             )
 
+        def build_expiry_fill(
+            row: dict[str, str],
+            raw_row: dict[str, str],
+            line_no: int,
+            symbol: str,
+            account: str | None,
+        ) -> None:
+            """An option that expired worthless: close the position at zero.
+
+            Deliberately NOT routed through build_fill. build_fill reads
+            `price` from the row and runs zero_price_warning on the result;
+            this path never reads `price` at all. Giving build_fill a price
+            override would make the guard bypassable from any future call
+            site, which is the opposite of what importers.base's
+            zero_price_warning docstring asks for. The near-duplication of
+            the quantity checks below is the price of keeping the guard
+            unreachable from here, and is deliberate.
+            """
+            instrument = parse_option_symbol(symbol)
+            if instrument is None:
+                reject(
+                    row,
+                    raw_row,
+                    account,
+                    line_no,
+                    f"line {line_no}: expiry with no parsable option symbol "
+                    f"({symbol!r}), skipped",
+                )
+                return
+
+            try:
+                raw_qty = _decimal(row.get("quantity"))
+            except InvalidOperation as exc:
+                reject(row, raw_row, account, line_no, f"line {line_no}: bad number ({exc})")
+                return
+
+            # NaN == 0 is False, so the finiteness test must be part of the
+            # same guard rather than a later one.
+            if not raw_qty.is_finite() or raw_qty == 0:
+                reject(
+                    row,
+                    raw_row,
+                    account,
+                    line_no,
+                    f"line {line_no}: expiry with zero or non-finite quantity, skipped",
+                )
+                return
+
+            # The row describes the POSITION being removed, not a trade
+            # direction -- there is no verb here to read a side from. A short
+            # (negative) position is closed by buying it back, a long one by
+            # selling it.
+            side = Side.BUY if raw_qty < 0 else Side.SELL
+
+            # The option's own expiry, NOT `Run Date`. In the real export
+            # this fix was built from, Fidelity booked a Friday expiry the
+            # following Monday, three days later. The fixture below reuses
+            # that three-day gap (11/21/2026 expiry, 11/24/2026 Run Date) for
+            # arithmetic clarity, not because those fall on a Friday/Monday
+            # -- 2026-11-21 is a Saturday.
+            # The expiry is the TRUE event date -- the position ceased to
+            # exist on it -- and `expiry` sits inside instrument_natural_key,
+            # so this is the same value that mints the instrument and cannot
+            # disagree with it. Midnight UTC matches the date-only convention
+            # the Run Date branch uses.
+            #
+            # What this does NOT do is change any drift `reconcile` reports
+            # today, and an earlier version of this comment claimed it did.
+            # `reconcile` has no window to see: open_positions
+            # (db/positions.py) takes no `as_of` and has no date filter of
+            # any kind -- its predicate is `t.status = 'open'` plus an
+            # optional account scope -- so `--as-of` selects which STATEMENT
+            # to compare against and never which positions -- cmd_reconcile's
+            # own comments say so (cli.py). Once both fills are imported the
+            # trade is closed either way, whether the close is dated Nov 21
+            # or Nov 24. The phantom-open-across-a-statement-date problem is
+            # what dating from the symbol PREVENTS once position
+            # reconstruction becomes as-of aware (gap #29 in
+            # docs/known-gaps.md, which is what would make the ledger side
+            # honour a cutoff): only then does the three-day gap become
+            # visible, as a short that a statement dated inside the window
+            # would show as already gone.
+            when = datetime(
+                instrument.expiry.year,
+                instrument.expiry.month,
+                instrument.expiry.day,
+                tzinfo=UTC,
+            )
+
+            fills.append(
+                CanonicalFill(
+                    instrument=instrument,
+                    executed_at=when,
+                    side=side,
+                    quantity=abs(raw_qty),
+                    price=Decimal(0),
+                    fee=Decimal(0),
+                    fee_currency="USD",
+                    external_ref=account,
+                    funding_source="external",
+                )
+            )
+
         # Strip UTF-8 BOM if present — Fidelity exports carry them too, and a
         # BOM makes csv.DictReader name the first field "﻿Run Date"
         # instead of "Run Date", so every row would fail to parse.
@@ -510,7 +627,23 @@ class FidelityImporter:
                 )
                 continue
 
-            # rule.outcome is Outcome.CASH
+            if rule.outcome is Outcome.EXPIRY:
+                build_expiry_fill(row, raw_row, line_no, symbol, account)
+                continue
+
+            if rule.outcome is Outcome.UNSUPPORTED:
+                message = (
+                    f"line {line_no}: {action.split()[0]} is recognised but not "
+                    "supported; import refuses rather than guessing at the "
+                    "resulting stock leg"
+                )
+                warnings.append(message)
+                unmapped.append(str(raw_row))
+                blocking.append((account, message))
+                continue
+
+            if rule.outcome is not Outcome.CASH:
+                raise AssertionError(f"unhandled rule outcome {rule.outcome!r}")
             try:
                 amount = _decimal(row.get("amount"))
             except InvalidOperation as exc:

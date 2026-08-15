@@ -24,6 +24,8 @@ Run Date,Account,Account Number,Action,Symbol,Description,Type,Price ($),Quantit
 04/30/2026,EXAMPLE SAVINGS PLAN,90210,REVENUE CREDIT,,EXAMPLE REAL ESTATE FUND,,,0.011,,,,0.44,
 04/01/2026,EXAMPLE SAVINGS PLAN,90210,RECORDKEEPING FEE,,EXAMPLE REAL ESTATE FUND,,,"-0.017",,,,"-0.69",
 04/01/2026,EXAMPLE SAVINGS PLAN,90210,Investment Gain/Loss,,EXAMPLE REAL ESTATE FUND,,,0,,,,0.58,
+10/03/2026,Brokerage - TOD,X23456789,YOU SOLD OPENING TRANSACTION CALL (ZXCO) ZEPHYR EXPLORATION CO COM NOV 21 26 $500 (100 SHS) (Cash),-ZXCO261121C500,CALL (ZXCO) ZEPHYR EXPLORATION CO COM NOV 21 26 $500 (100 SHS),Cash,4.00,-1,"","","",400.00,10/04/2026
+11/24/2026,Brokerage - TOD,X23456789,EXPIRED CALL (ZXCO) ZEPHYR EXPLORATION CO COM NOV 21 26 $500 (100 SHS),-ZXCO261121C500,CALL (ZXCO) ZEPHYR EXPLORATION CO COM NOV 21 26 $500 (100 SHS),Cash,"",-1,"","","",0.00,""
 
 "The data and information in this spreadsheet is provided to you solely for your use and is not intended for"
 "informational purposes only, and is not intended to provide advice, nor should it be construed as an offer"

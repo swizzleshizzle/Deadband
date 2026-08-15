@@ -67,6 +67,40 @@ points you at `sync coinbase` instead. CSV import remains the only path for Coin
 non-trade cash movements (deposits, withdrawals, transfers, rewards and staking income,
 interest); the Advanced Trade API has no endpoint for any of those.
 
+### Fidelity option expiry
+
+An `EXPIRED` row in a Fidelity export closes the option position at price zero, dated to
+**the option's own expiry date, not the broker's `Run Date`** — Fidelity books a Friday
+expiry on the following Monday, so the two differ by three days, and the expiry is the
+date the position actually ceased to exist. The expiry date comes from the option symbol
+itself (it is part of what identifies the instrument), never from parsed row text, so it
+cannot disagree with the instrument the fill is posted against. Side is derived from the
+sign of the row's `Quantity` — negative closes a short with a buy, positive closes a long
+with a sell — since an `EXPIRED` row describes the position being removed, not a trade
+direction there is a verb for.
+
+This does not change any drift `reconcile` reports today: `open_positions` takes no
+`as_of` and applies no date filter at all — it filters on `status = 'open'` and,
+optionally, the account — so `--as-of` picks which *statement* to compare against, never
+which positions — a close dated either day leaves the same closed trade. Recording the
+true event date is what keeps the ledger correct once position reconstruction becomes
+as-of aware (gap #29 in [`docs/known-gaps.md`](docs/known-gaps.md)
+tracks that `--as-of` does not filter the ledger side); only then would a `Run Date`-dated
+close leave a phantom open position across a statement date falling inside the three-day
+window.
+
+`ASSIGNED` and `EXERCISED` rows are recognised and deliberately **refused** rather than
+guessed at: no assignment or exercise appears anywhere in five years of real exports
+across three accounts, and modelling the resulting stock leg from documentation instead
+of from a row actually received is how an earlier version of this importer's test fixture
+got its money columns wrong. Either verb blocks the entire commit — nothing is written,
+for any account in the batch — and names itself in the refusal. The one carve-out: a
+blocking row belonging to an account registered `ignore_on_import` refuses nothing, since
+it was never going to be part of the import. See
+[`docs/known-gaps.md`](docs/known-gaps.md) (gaps #30–32) for what this leaves open: an
+expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
+`REVERSE SPLIT`, and others), and backdated `as of` correction rows.
+
 ### Reconciliation
 
 `snapshot add` records a broker statement's figures by hand; `reconcile` compares the

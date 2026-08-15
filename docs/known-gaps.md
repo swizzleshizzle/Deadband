@@ -250,7 +250,7 @@ wrong by a factor of the price. Refusing rather than guessing is the right call.
 consequence is not obvious, though, and needs saying out loud:
 
 **Symptom.** `deadband sync coinbase --commit` exits 2 with
-`refusing to commit -- unmapped row(s) carry money and no rule matched them`, naming a
+`refusing to commit -- row(s) below block the commit (see each reason)`, naming a
 fill with `size_in_quote`. It does this **every time**, and nothing else commits either —
 the refusal is all-or-nothing by design (a partial commit that silently drops a
 money-carrying row is the defect that policy exists to prevent). Preview is unaffected.
@@ -427,6 +427,22 @@ this file is the project's memory.
 > `reconcile` (gap #13) was unblocked by this work and is now BUILT — `cli.py`'s
 > `cmd_reconcile` ships, and gap #13 is struck above. It reads `unvaluable_reason`, never
 > `direction`, exactly as the paragraph above warns a future reader must.
+
+---
+
+## Found while designing Fidelity option expiry (2026-08-14)
+
+`Outcome.EXPIRY` (`importers/fidelity.py:125`) closes an expired option at price zero on
+its expiry date, and `Outcome.UNSUPPORTED` (`:131`) refuses `ASSIGNED`/`EXERCISED` rather
+than guessing at the resulting stock leg. Full design:
+[`docs/superpowers/specs/2026-08-14-option-expiry-design.md`](superpowers/specs/2026-08-14-option-expiry-design.md).
+Three gaps came out of that work, deliberately deferred rather than fixed here:
+
+| # | Gap | Why it matters |
+|---|---|---|
+| 30 | **An expiry whose opening fill is absent from the ledger** makes the grouper treat the closing fill as an *opening* one, creating a phantom position at zero cost basis. | `build_expiry_fill` (`importers/fidelity.py:396-476`) trusts that the position it is closing already exists — it has no way to check, since it only ever sees one row at a time. `regroup_account` (`db/trades.py:20`) pairs fills within an account purely by iterating them in order, so a closing fill with no prior opener becomes the *opener* of a new trade, at a zero cost basis that was never real. Deliberately not defended against: 0 of 27 `EXPIRED` rows across three real accounts and five years are orphaned this way, and because `regroup_account` recomputes every trade from every fill on each run, importing an account's files out of order self-heals the moment the missing year arrives — the phantom trade is silently replaced by the correct one. It is permanent only if one year of an account is imported and the earlier ones never are, which is a real possibility for a five-year account imported piecemeal. |
+| 31 | **Corporate actions remain unhandled.** The two long-term real accounts contain `MERGER`, `REVERSE SPLIT`, `NAME CHANGED`, `DISTRIBUTION`, `TRANSFER OF ASSETS ACAT`, `IN LIEU OF`, and a `BUY CANCEL OPENING TRANSACTION`. `ledger/corporate.py` already models several of these action types but is not wired to the importer at all. | An earlier draft of this gap claimed these rows "pass silently while changing share counts" — that is false, and worth correcting rather than quietly not repeating. `reject()` (`importers/fidelity.py:298-321`) blocks on `_carries_money(quantity) OR _carries_money(amount)`, and *quantity* counts, not only amount. Checked directly against the real shapes: `MERGER`, `NAME CHANGED` and `REVERSE SPLIT` each carry a nonzero quantity and so all block; `IN LIEU OF`, whose quantity is zero, blocks on its nonzero amount instead. (The quantities and amounts themselves are deliberately not quoted — this repository is public, they are real transaction figures, and what the claim rests on is which column is nonzero, not what it held.) Every corporate action found in the real exports blocks the commit, and `cmd_import` refuses the entire import with exit 2 (`cli.py:314-325`) the moment one appears — nothing is reclassified into money or silently dropped. The gap is real and it is a hard one: **the two accounts holding these actions cannot be imported at all** until corporate actions are modelled and wired in. That is the safe failure, not the harmful one, and it is why this is a blocker rather than a corruption risk — the same distinction §7 of the option-expiry design draws between this and the pre-fix `EXPIRED` hazard. |
+| 32 | **Backdated `as of` correction rows** (`REINVESTMENT as of …`, `FEE CHARGED as of …`) appear in one real account and are not modelled. | Their effect on dating is unexamined — `REINVESTMENT`'s ordinary rule (`importers/fidelity.py:149-150`) and `FEE CHARGED`'s (`:175`) both read `Run Date` as the event's own date, and whether a backdated correction should instead date to the date it corrects is an open question this work did not have real examples of `ASSIGNED`/`EXERCISED` to answer, so it stayed out of scope by the same E1 decision that kept assignment out. |
 
 ---
 

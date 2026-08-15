@@ -49,10 +49,14 @@ import csv
 import io
 import pathlib
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import UUID, uuid4
 
 from importers.fidelity import RULES, FidelityImporter, Outcome, classify
-from ledger.types import AssetClass, Side
+from ledger.grouping import group_fills
+from ledger.pnl import compute_pnl
+from ledger.types import AssetClass, Direction, Fill, FillSource, Side, TradeStatus
 
 # Anchored to this file's location, never the process cwd -- same hazard as
 # test_fidelity.py's FIXTURE path.
@@ -68,7 +72,7 @@ SYNTHETIC_REFS = frozenset({"X23456789", "112233445", "556677889", "90210"})
 
 # Every dated row must resolve to exactly one of these. See
 # test_no_dated_row_disappears_without_a_trace.
-_DATED_ROWS = 23
+_DATED_ROWS = 25
 
 
 def batch():
@@ -164,13 +168,40 @@ def test_every_rule_is_exercised_by_a_fixture_row():
 
     Classification is checked directly rather than through parse() because two
     rules resolve to INTERNAL and deliberately produce no output -- they are
-    invisible to any assertion made on fills or cash."""
+    invisible to any assertion made on fills or cash.
+
+    `Outcome.UNSUPPORTED` rules are excluded, keyed on the outcome rather than
+    a hardcoded name list so a future unsupported verb is exempt automatically.
+    A rule whose entire purpose is to refuse a row we have never received
+    cannot also be required to appear in a fixture of rows we have received --
+    requiring it would force fabricating the very row shape E1 says not to
+    invent (real assignments/exercises: zero, across three accounts and five
+    years). That is not a gap in this test's coverage; it is a different
+    source of coverage, asserted below in
+    test_unsupported_rules_are_exercised_by_the_hand_written_sample_table."""
     matched = set()
     for row in _data_rows():
         rule = classify(row["Action"], row["Symbol"])
         if rule is not None:
             matched.add(rule.name)
-    assert {r.name for r in RULES} - matched == set()
+    required = {r.name for r in RULES if r.outcome is not Outcome.UNSUPPORTED}
+    assert required - matched == set()
+
+
+def test_unsupported_rules_are_exercised_by_the_hand_written_sample_table():
+    """The other half of the split above. `Outcome.UNSUPPORTED` rules are
+    exempted from the real-shape requirement because a real export cannot
+    supply a row Michael has never received -- but that must not become a
+    silent hole in coverage. Every such rule is still required to be
+    exercised by SOMETHING: test_fidelity.py's RULE_COVERAGE_SAMPLES, the
+    hand-written table its own test_every_rule_is_reachable checks against.
+    Net effect: every rule in RULES is covered by exactly one of the two
+    files, split by whether the row it needs can plausibly exist."""
+    from tests.test_fidelity import RULE_COVERAGE_SAMPLES
+
+    matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
+    required = {r.name for r in RULES if r.outcome is Outcome.UNSUPPORTED}
+    assert required - matched == set()
 
 
 def test_no_dated_row_disappears_without_a_trace():
@@ -246,11 +277,22 @@ def test_option_symbol_survives_its_leading_space():
 
 def test_compound_action_text_does_not_hijack_the_trade_branch():
     """Every action here is prose containing a security's name. Exactly the
-    three intended rows become externally-funded fills; nothing else is
-    dragged into the YOU BOUGHT/YOU SOLD branch by a substring."""
+    three intended YOU BOUGHT/YOU SOLD rows become externally-funded fills via
+    that branch; nothing else is dragged into it by a substring.
+
+    Five in total: the original three, plus the Task 3 expiry pair (the
+    opening YOU SOLD and its closing EXPIRY fill, which is funded externally
+    too -- see build_expiry_fill). Their order follows the fixture's row
+    order, not chronology, same as the original three."""
     external = [f for f in batch().fills if f.funding_source == "external"]
-    assert len(external) == 3
-    assert [f.side for f in external] == [Side.BUY, Side.BUY, Side.SELL]
+    assert len(external) == 5
+    assert [f.side for f in external] == [
+        Side.BUY,
+        Side.BUY,
+        Side.SELL,
+        Side.SELL,
+        Side.BUY,
+    ]
 
 
 def test_signed_quantity_becomes_a_positive_sell():
@@ -417,3 +459,112 @@ def test_employer_plan_unit_quantities_are_currently_discarded():
     assert contribution.amount == Decimal("118.44")
     # The units are nowhere: no fill exists for the plan account at all.
     assert not [f for f in b.fills if f.external_ref == "90210"]
+
+
+# --- Task 3: the closing fill actually closes a trade ----------------------
+
+
+def test_an_expired_short_call_closes_and_realises_its_premium():
+    """The whole point of the feature. Before this, only the opening SELL was
+    recorded: the short stayed open forever, was valued as a liability that
+    did not exist, and its premium was never realised.
+
+    This test pins the PARSED SHAPE only -- sides, prices, dates, quantities.
+    That the two fills actually group into one closed trade, and that the
+    trade realises the premium, is
+    test_an_expired_short_call_leaves_a_closed_trade_realising_the_premium
+    below, which walks the ledger path instead of restating this one.
+    """
+    batch_ = FidelityImporter().parse(FIXTURE)
+    opt = [f for f in batch_.fills if f.instrument.symbol == "-ZXCO261121C500"]
+    assert len(opt) == 2
+    opening = next(f for f in opt if f.side is Side.SELL)
+    closing = next(f for f in opt if f.side is Side.BUY)
+    assert opening.price == Decimal("4.00")
+    assert closing.price == Decimal(0)
+    assert closing.executed_at == datetime(2026, 11, 21, tzinfo=UTC)
+    assert closing.quantity == opening.quantity
+
+
+# Synthetic ids, exactly as tests/test_grouping.py and tests/test_pnl.py do
+# it: the pure layer needs fill ids only to be distinct, and instrument ids
+# only to be equal for fills in the same instrument. Nothing here touches a
+# database -- group_fills and compute_pnl are pure functions over rows.
+_LEDGER_ACCOUNT = UUID("00000000-0000-0000-0000-0000000000a1")
+_LEDGER_INSTRUMENT = UUID("00000000-0000-0000-0000-0000000000b1")
+
+
+def _as_ledger_fill(cf) -> Fill:
+    """A parsed CanonicalFill as the ledger layer will see it once persisted.
+
+    Every field the grouper and the P&L walk actually read -- executed_at,
+    side, quantity, price, fee -- is carried over from the PARSED fill rather
+    than restated here, so a wrong value produced by the importer reaches the
+    assertions instead of being papered over by a hand-built row.
+    """
+    return Fill(
+        id=uuid4(),
+        account_id=_LEDGER_ACCOUNT,
+        instrument_id=_LEDGER_INSTRUMENT,
+        executed_at=cf.executed_at,
+        side=cf.side,
+        quantity=cf.quantity,
+        price=cf.price,
+        fee=cf.fee,
+        fee_currency=cf.fee_currency,
+        source=FillSource.CSV,
+        venue_fill_id=cf.venue_fill_id,
+        is_estimated=False,
+    )
+
+
+def test_an_expired_short_call_leaves_a_closed_trade_realising_the_premium():
+    """Spec §6, seventh testing item: an open short call closed by its expiry
+    yields realised P&L equal to the premium received and leaves no open
+    position. This is the claim the whole feature rests on, and parse-level
+    assertions cannot make it -- they stop before the grouper.
+
+    The two fills are identified by PRICE, never by side, deliberately. The
+    side of the closing fill is precisely what this test exists to exercise
+    through the real path, so selecting on it would turn a wrong side into a
+    StopIteration during setup instead of a failed assertion about a trade
+    that never closed.
+
+    aggregate_positions is deliberately NOT called for the "no open position"
+    half. It aggregates whatever rows it is handed; the status filter that
+    would exclude this trade lives in db/positions.py's SQL
+    (`WHERE t.status = 'open'`), so feeding it a closed trade's row would
+    assert on the test's own construction rather than on the ledger. The pure
+    equivalents of "no open position" are the grouper's CLOSED status and the
+    P&L walk's zero residual quantity, both asserted below.
+    """
+    batch_ = FidelityImporter().parse(FIXTURE)
+    opt = [f for f in batch_.fills if f.instrument.symbol == "-ZXCO261121C500"]
+    assert len(opt) == 2
+    opening = next(f for f in opt if f.price == Decimal("4.00"))
+    closing = next(f for f in opt if f.price == Decimal(0))
+
+    ledger_fills = [_as_ledger_fill(opening), _as_ledger_fill(closing)]
+    groups = group_fills(ledger_fills)
+    assert len(groups) == 1
+    g = groups[0]
+    assert g.status is TradeStatus.CLOSED
+    assert g.direction is Direction.SHORT
+    # Closed ON the expiry, not on the Monday Fidelity booked it.
+    assert g.closed_at == datetime(2026, 11, 21, tzinfo=UTC)
+
+    pnl = compute_pnl(
+        g.allocations,
+        {f.id: f for f in ledger_fills},
+        # The multiplier the SYMBOL parsed to, not a hand-typed 100: the
+        # premium claim is only true if the contract size the instrument
+        # carries is the one the arithmetic uses.
+        {_LEDGER_INSTRUMENT: opening.instrument.contract_multiplier},
+        g.direction,
+    )
+    # Premium received, in full and exactly: (4.00 - 0) x 1 contract x 100.
+    # Not `> 0` -- a wrong side, a wrong multiplier and a wrong closing price
+    # all still produce a positive number.
+    assert pnl.realized_pnl == Decimal("400.00")
+    # Nothing left open: the short is gone, not merely smaller.
+    assert pnl.open_quantity == Decimal(0)

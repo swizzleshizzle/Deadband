@@ -1,7 +1,14 @@
 import pathlib
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import UUID
 
+# Private by name, imported deliberately: _fill_dedupe_keys is the single
+# computation commit_batch and probe_duplicates both use (see its docstring),
+# so it is the real dedupe mechanism, not a test-only reimplementation of it.
+# It is pure -- no connection, no I/O -- so importing it here costs no
+# database.
+from db.importing import _fill_dedupe_keys
 from importers.base import OUTFLOW_KINDS
 from importers.fidelity import (
     RULES,
@@ -19,6 +26,10 @@ from ledger.types import AssetClass, Side
 # only resolves when pytest happens to be invoked from the repo root.
 _FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
 FIXTURE = (_FIXTURES_DIR / "fidelity" / "activity.csv").read_text()
+
+# Any stable account id: content_hash mixes it in, so it must be the SAME for
+# both fills being compared or they would differ for the wrong reason.
+_DEDUPE_ACCOUNT = UUID("00000000-0000-0000-0000-0000000000a1")
 
 
 def batch():
@@ -562,6 +573,9 @@ RULE_COVERAGE_SAMPLES = [
     ("CO CONTR 2026 Q1", ""),  # employer_contribution
     ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
     ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+    ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
+    ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
+    ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option
 ]
 
 
@@ -878,3 +892,183 @@ def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix(
     result = FidelityImporter().parse(FIXTURE + "This report is for informational purposes only.\n")
     assert result.blocking == ()
     assert result.unmapped_rows
+
+
+# --- Task 1: the EXPIRY outcome and the closing fill ------------------------
+#
+# An EXPIRED row already blocks the commit today, via its nonzero Quantity --
+# cmd_import refuses the entire file rather than silently dropping just this
+# row (cli.py:317-325). What's missing is the correct handling: closing the
+# position at zero, rather than leaving the account permanently unimportable.
+# Reuses this file's own established convention (a data row built from
+# FIXTURE's own header) rather than introducing a second CSV helper.
+# Fabricated underlying (ZXCO) per the repo's public-data rule.
+
+
+def test_expired_short_call_closes_with_a_buy_at_zero():
+    """The row describes the POSITION being removed, not a trade direction.
+    A negative quantity is a short, and a short is closed by buying it back.
+    Reading the sign as a side would open a second short instead of closing
+    the first, and the phantom would never go away."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.side is Side.BUY
+    assert fill.quantity == Decimal(1)
+    assert fill.price == Decimal(0)
+
+
+def test_expired_long_put_closes_with_a_sell_at_zero():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED PUT (ZXCO) ZXCO CORP,-ZXCO261121P10,,2,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.side is Side.SELL
+    assert fill.quantity == Decimal(2)
+
+
+def test_expiry_is_dated_from_the_symbol_not_the_run_date():
+    """The expiry is the TRUE event date -- the position ceased to exist on
+    it -- and `expiry` sits inside instrument_natural_key, so it is the same
+    value that mints the instrument. In the real export Fidelity booked an
+    expiry three days after it; the dates below reuse that gap for arithmetic
+    clarity, not because they fall on a Friday/Monday (2026-11-21 is a
+    Saturday).
+
+    This does NOT change any drift `reconcile` reports today, and an earlier
+    version of this docstring claimed it did. `open_positions` takes no
+    `as_of` and has no date filter, so `--as-of` selects which STATEMENT to
+    compare against, never which positions. Dating from the symbol is what
+    PREVENTS a phantom-open-across-a-statement-date once position
+    reconstruction becomes as-of aware (gap #29)."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    (fill,) = result.fills
+    assert fill.executed_at == datetime(2026, 11, 21, tzinfo=UTC)
+
+
+def test_expiry_does_not_trip_the_zero_price_guard():
+    """The guard exists because downstream of _decimal a missing column and a
+    genuine zero are indistinguishable. This path never reads `price` at all,
+    so the ambiguity cannot arise. Asserting the absence of the warning is
+    what pins the carve-out -- asserting price == 0 alone would still pass if
+    the guard fired."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert not any("zero price" in w.lower() for w in result.warnings)
+
+
+def test_two_same_size_lots_expiring_the_same_day_get_distinct_dedupe_keys():
+    """Two identical expiry rows must survive the DEDUPE, which is what the
+    occurrence counter in db.importing._fill_dedupe_keys exists for: without
+    it both rows hash to the same content_hash and the second is silently
+    dropped on commit, losing a lot. The real export's same-day pair differs
+    in quantity, so testing against that data alone would never catch this.
+
+    Asserting on `len(parse().fills)` alone would prove NOTHING here -- parse
+    performs no dedupe of any kind, so that count stays 2 even with the
+    occurrence index deleted outright. The keys are what the commit path
+    actually deduplicates on, so this calls the real key function.
+    `_fill_dedupe_keys` is pure (it hashes rows; no connection, no I/O), so
+    no database is needed to exercise it.
+
+    It is also the only coverage that an EXPIRY fill participates in dedupe
+    at all. `_fill_dedupe_keys` is origin-agnostic -- it hashes whatever
+    CanonicalFills it is handed, without caring which branch built them -- so
+    participation is true by construction; this pins that the construction
+    holds for fills the expiry branch produces.
+    """
+    header = FIXTURE.splitlines()[0]
+    data_row = "11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-3,,,,0.00"
+    rows = "\n".join([header, data_row, data_row])
+    result = FidelityImporter().parse(rows + "\n")
+    assert len(result.fills) == 2
+
+    keys = _fill_dedupe_keys(_DEDUPE_ACCOUNT, result.fills)
+    assert len(keys) == 2
+    # Neither expiry fill carries a venue_fill_id, so both must take the
+    # content_hash arm -- if either took the (venue_fill_id, None) arm the
+    # occurrence counter would not be what is keeping them apart, and this
+    # test would be pinning the wrong mechanism.
+    assert all(venue_id is None and content is not None for venue_id, content in keys)
+    assert keys[0][1] != keys[1][1]
+
+
+def test_expiry_with_an_unparsable_symbol_is_refused_not_guessed():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED SOMETHING ODD,NOTANOPTION,,-1,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert any("option symbol" in w for w in result.warnings)
+
+
+def test_expiry_with_zero_quantity_is_refused_not_guessed():
+    """Neither direction nor size is knowable, and guessing either is how you
+    get a plausible wrong number."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,0,,,,0.00\n"
+    result = FidelityImporter().parse(row)
+    assert result.fills == ()
+    assert any("quantity" in w for w in result.warnings)
+
+
+# --- Task 2: UNSUPPORTED -- refuse assignment and exercise loudly -----------
+#
+# Scope is deliberately expiry-only. A realistic ASSIGNED/EXERCISED row
+# already blocks today via its nonzero Quantity (an unmapped row blocks
+# whenever it carries a nonzero Quantity OR Amount -- reject ->
+# _carries_money). UNSUPPORTED earns its place anyway: it names the verb in
+# the refusal instead of a generic "unhandled action", and it blocks
+# unconditionally, independent of what the row's money columns happen to
+# hold, rather than depending on Quantity staying nonzero. That is defence
+# in depth and a better error message, not the only thing standing between
+# an assignment and a silent drop.
+
+
+def test_an_assigned_option_blocks_the_commit_even_with_no_money_on_the_row():
+    """Scope is expiry-only, which stays safe only if the refusal does not
+    depend on the row's money columns. A realistic assignment row already
+    blocks via its nonzero Quantity; this row deliberately leaves BOTH
+    Quantity and Amount blank to isolate that independence -- pinning that
+    UNSUPPORTED blocks because the verb is recognised and refused, not
+    because some column happened to be nonzero."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,ASSIGNED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.fills == ()
+    assert batch.blocking != ()
+    assert any("ASSIGNED" in message for _ref, message in batch.blocking)
+
+
+def test_an_exercised_option_blocks_the_commit():
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXERCISED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.fills == ()
+    assert any("EXERCISED" in message for _ref, message in batch.blocking)
+
+
+def test_an_expiry_does_not_block():
+    """The counterpart assertion: the two outcomes must not be conflated."""
+    header = FIXTURE.splitlines()[0]
+    row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
+    batch = FidelityImporter().parse(row)
+    assert batch.blocking == ()
+    assert len(batch.fills) == 1
+
+
+def test_every_outcome_member_has_a_dispatch_branch():
+    """The dispatch used to end in a bare `# rule.outcome is Outcome.CASH`
+    fallthrough, so a new Outcome with no branch would be silently treated as
+    a cash movement. This pins that it cannot happen again."""
+    for rule in RULES:
+        assert rule.outcome in {
+            Outcome.FILL,
+            Outcome.CASH,
+            Outcome.INTERNAL,
+            Outcome.EXPIRY,
+            Outcome.UNSUPPORTED,
+        }
