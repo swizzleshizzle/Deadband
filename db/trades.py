@@ -10,8 +10,10 @@ from uuid import UUID
 import asyncpg
 
 from db.accounts import UnknownAccountError, get_account
+from db.corporate import actions_for_instruments
 from db.fills import fetch_fills
 from db.instruments import get_multipliers
+from ledger.corporate import adjust_fills
 from ledger.grouping import group_fills
 from ledger.pnl import compute_pnl
 from ledger.types import TradeIntent
@@ -77,6 +79,29 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             if remaining == f.quantity
             else replace(f, quantity=remaining, fee=f.fee * remaining / f.quantity)
         )
+
+    # Corporate actions are applied HERE: after the manual reduction, before
+    # grouping -- and never written back to the fill table. Fills are ground
+    # truth, an action is a separate fact, and the adjusted view is a
+    # consequence of both. That is what makes removing an action a genuine undo
+    # rather than a second restatement.
+    #
+    # THE ORDER IS LOAD-BEARING. trade_fill quantities were recorded in the
+    # units that existed when a manual grouping was made -- pre-split units. If
+    # adjustment ran first, a fill scaled from 1800 to 300 would be compared
+    # against a manual holding of 1800, yield a negative remainder, and be
+    # dropped entirely: the fill would vanish from the ledger rather than
+    # merely being mis-sized.
+    #
+    # A consequence, recorded as a gap rather than solved here: fills WHOLLY
+    # owned by a manual trade never reach this point (they are skipped above),
+    # so manual groupings are not split-adjusted.
+    if fills:
+        actions = await actions_for_instruments(
+            conn, list({f.instrument_id for f in fills})
+        )
+        if actions:
+            fills = adjust_fills(fills, actions)
 
     seen_openings: list[UUID] = []
     written = 0

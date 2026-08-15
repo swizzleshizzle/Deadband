@@ -3,17 +3,26 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 
 from db.accounts import UnknownAccountError, create_account
-from db.fills import insert_fills
+from db.corporate import add_action, remove_action
+from db.fills import fetch_fills, insert_fills
 from db.instruments import upsert_instrument
+from db.positions import open_positions
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _split  # account_with_1800 is auto-discovered from conftest.py
 
 pytestmark = requires_db
 
 T0 = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+# Deliberately earlier than T0 above (used by every other fixture in this
+# file) and before the 2026-03-02 ex-date `_split` defaults to -- a fill
+# executed on T0 would fall on the wrong side of the split and the
+# split-dependent tests below would pass vacuously.
+_SPLIT_T0 = datetime(2026, 2, 1, 9, 0, tzinfo=UTC)
 
 
 async def seed(conn, specs):
@@ -1054,3 +1063,131 @@ async def test_regroup_account_names_the_unknown_account_id(conn):
     bogus = uuid4()
     with pytest.raises(UnknownAccountError, match=str(bogus)):
         await regroup_account(conn, bogus)
+
+
+# --- Task 2: corporate actions applied in regroup_account -------------------
+#
+# `account_with_1800` and `_split` come from tests/db/conftest.py (Task 1),
+# not from this file -- see the import at the top. `partly_manual_account`
+# stays local here: this file is its only consumer.
+
+
+@pytest_asyncio.fixture
+async def partly_manual_account(conn):
+    """One account, one BUY fill of 1800 on a fabricated ZXCO equity executed
+    before the 2026-03-02 ex-date, with a manual trade permanently holding
+    1200 of it -- so only 600 reaches the auto grouper and, after a 1:6
+    split, 100.
+
+    Built by direct INSERT rather than by flipping an auto-grouped trade to
+    manual: a single BUY fill has no zero-crossing for regroup_account to
+    split on its own, so the only way to get a manual trade holding PART of
+    it is to construct the trade and its trade_fill allocation by hand, the
+    same way tests/db/test_cli.py's protected-trade fixtures do."""
+    acc = await create_account(conn, name="PartlyManual", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    fill = Fill(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        executed_at=_SPLIT_T0,
+        side=Side.BUY,
+        quantity=Decimal("1800"),
+        price=Decimal("0.05"),
+        fee=Decimal("0"),
+        fee_currency="USD",
+        source=FillSource.MANUAL,
+        venue_fill_id="zx-partial",
+        is_estimated=False,
+    )
+    await insert_fills(conn, [fill])
+
+    trade_id = await conn.fetchval(
+        """
+        INSERT INTO trade (account_id, direction, status, opened_at,
+                            open_quantity, open_cost_basis, grouping_mode, notes)
+        VALUES ($1, 'long', 'open', $2, $3, $4, 'manual', 'manual hold')
+        RETURNING id
+        """,
+        acc,
+        _SPLIT_T0,
+        Decimal("1200"),
+        Decimal("0.05"),
+    )
+    await conn.execute(
+        "INSERT INTO trade_fill (trade_id, fill_id, account_id, quantity) VALUES ($1,$2,$3,$4)",
+        trade_id,
+        fill.id,
+        acc,
+        Decimal("1200"),
+    )
+    return acc, inst
+
+
+async def test_a_stored_reverse_split_reaches_the_position(conn, account_with_1800):
+    """The whole point of the subsystem. Before this wiring, adjust_fills was
+    never called anywhere in production code -- an action could be stored and
+    would change nothing."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(300)
+
+
+async def test_removing_the_action_restores_the_original_quantity(conn, account_with_1800):
+    """Derived at read time, so removal is a genuine undo rather than a second
+    restatement."""
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    await remove_action(conn, action_id)
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(1800)
+
+
+async def test_the_stored_fill_is_never_rewritten(conn, account_with_1800):
+    """Fills are ground truth. The adjustment is a view over them, and writing
+    it back would make the action impossible to undo and double-apply on the
+    next regroup."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    (fill,) = await fetch_fills(conn, account_id)
+    assert fill.quantity == Decimal(1800)
+
+
+async def test_a_fill_partly_held_by_a_manual_trade_is_not_dropped(
+    conn, partly_manual_account
+):
+    """The ordering test. trade_fill quantities are in pre-split units, so
+    adjusting BEFORE the manual reduction compares 300 against a holding of
+    1200, yields a negative remainder, and drops the fill from the ledger
+    entirely. Reversing the two steps must turn this red.
+
+    Ruling C: `positions != []` is too weak here -- the account also holds a
+    permanent manual trade (1200 of the fill), and because that trade's
+    opening_fill_id is NULL, open_positions reports it as its OWN unvaluable
+    row (instrument_id falls back to the trade's own id, per
+    db/positions.py), keyed separately from the auto-grouped ZXCO row. That
+    row alone satisfies `positions != []` even when the auto-grouped fill
+    has vanished entirely -- exactly the failure this test exists to catch.
+    So this asserts on the ZXCO row specifically: 1800 - 1200 = 600 reaches
+    the grouper, and a 1:6 split takes that to 100."""
+    account_id, instrument_id = partly_manual_account
+    await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    positions = await open_positions(conn, account_id)
+    zxco = next(p for p in positions if p.instrument_id == instrument_id)
+    assert zxco.quantity == Decimal(100)
+
+
+async def test_an_account_with_no_actions_is_unaffected(conn, account_with_1800):
+    account_id, _instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(1800)
