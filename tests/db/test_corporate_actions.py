@@ -67,6 +67,8 @@ async def test_actions_are_scoped_to_the_instruments_asked_for(conn, two_instrum
     a, b = two_instruments
     await add_action(conn, _split(a))
     assert await actions_for_instruments(conn, [b]) == []
+    (action,) = await actions_for_instruments(conn, [a])
+    assert action.instrument_id == a
 
 
 async def test_find_duplicate_matches_on_instrument_ex_date_and_type(conn, an_instrument):
