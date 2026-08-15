@@ -12,6 +12,14 @@ from uuid import UUID
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.cash import MixedCurrencyError, account_cash
+from db.corporate import (
+    EffectPreview,
+    add_action,
+    find_duplicate,
+    list_actions,
+    preview_effect,
+    remove_action,
+)
 from db.importing import commit_batch, probe_duplicates, route_batch
 from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
@@ -21,6 +29,7 @@ from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import ImportBatch
 from importers.registry import get_importer, list_importers
+from ledger.corporate import ActionType, CorporateAction
 from ledger.pnl import unrealized_pnl
 from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
@@ -1235,6 +1244,374 @@ async def cmd_reconcile(args) -> int:
         raise AssertionError(f"unhandled verdict {drift.verdict}")
 
 
+# --- corporate actions (spec 2026-08-15, §5-§6) --------------------------
+#
+# `add` and `remove` PREVIEW by default and write only with --commit, mirroring
+# `import`. Two-stage validation, deliberately:
+#
+#   1. everything decidable from the flags alone runs before any connection is
+#      opened, so a mistyped ratio, ex-date or a spinoff with no basis
+#      allocation never depends on the database to be refused;
+#   2. the rest -- symbol resolution, CorporateAction.__post_init__ and the
+#      duplicate check -- runs on a connection but strictly before any write.
+#
+# The full "build the action before opening the pool" shape is not reachable:
+# `resulting_instrument_id` is a UUID only the database can supply. What the
+# spec actually requires is that refusals write nothing and open no write
+# transaction, and stage 2 preserves that.
+
+# The types CorporateAction.__post_init__ requires a resulting instrument for.
+# Named from the same three members that constructor checks, so the flag-level
+# refusal below and the constructor cannot drift apart.
+_RESULTING_INSTRUMENT_TYPES = {ActionType.MERGER, ActionType.SPINOFF, ActionType.SYMBOL_CHANGE}
+
+
+def _parse_ex_date(raw: str) -> date | None:
+    """`--ex-date` -> a plain date. NOT `_parse_as_of`: an ex-date is a
+    calendar day the exchange declares, never a timestamp, and
+    `corporate_action.ex_date` is a DATE column. Returns None after printing
+    the refusal, the same shape `_parse_as_of` has."""
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        print(f"error: --ex-date {raw!r} is not a valid ISO-8601 date", file=sys.stderr)
+        return None
+
+
+def _parse_ratio(raw: str) -> tuple[Decimal, Decimal] | None:
+    """`--ratio NEW:OLD` -> (ratio_numerator, ratio_denominator).
+
+    That is the direction `adjust_fills` consumes -- a quantity is scaled by
+    numerator / denominator -- so a 1-for-6 reverse split is `1:6` and takes
+    1,800 shares to 300, and a 3-for-1 forward split is `3:1`. Stating it is
+    not pedantry: inverting the pair turns that reverse split into a 6x forward
+    split, leaving the position wrong by a factor of 36 with every individual
+    step still looking plausible.
+
+    Returns None after printing the refusal to stderr; the caller turns that
+    into `return 2` -- the same shape `_parse_as_of` above already has.
+
+    Decimal("abc") raises decimal.InvalidOperation, which does NOT descend from
+    ValueError, and Decimal("NaN")/Decimal("Infinity") construct successfully
+    and slip past that catch entirely: the same InvalidOperation/is_finite pair
+    cmd_marks_set and cmd_snapshot_add already carry. The positivity check
+    duplicates CorporateAction.__post_init__ on purpose -- the constructor
+    cannot run until a connection has resolved the symbols, and a ratio of
+    `1:0` is a typing mistake that should never need a database to be caught.
+    """
+    parts = raw.split(":")
+    if len(parts) != 2:
+        print(f"error: --ratio {raw!r} must be NEW:OLD, e.g. 1:6", file=sys.stderr)
+        return None
+    values: list[Decimal] = []
+    for part in parts:
+        try:
+            value = Decimal(part)
+        except InvalidOperation:
+            print(f"error: --ratio component {part!r} is not a valid number", file=sys.stderr)
+            return None
+        if not value.is_finite():
+            print(f"error: --ratio component {part!r} must be a finite number", file=sys.stderr)
+            return None
+        if value <= 0:
+            print(f"error: --ratio component {part!r} must be positive", file=sys.stderr)
+            return None
+        values.append(value)
+    return values[0], values[1]
+
+
+def _print_effect(headline: str, preview: EffectPreview) -> None:
+    """Render `db.corporate.preview_effect`'s CUMULATIVE diff (spec §5).
+
+    Cumulative, not the proposed action against raw fills: the numbers below
+    are what would change given everything already stored, which is the only
+    framing that stays honest for interacting actions on one instrument.
+
+    `_fmt_decimal` is reused from `positions` for the same reason it exists
+    there -- an adjusted price is a division evaluated at 50 digits of
+    precision, so an unbounded one would wrap the line off a terminal while
+    asserting precision the inputs never had.
+    """
+    print(headline)
+    if preview.fills_changed == 0:
+        # Spec §6's last row: an action on an instrument with no fills (or none
+        # before its ex-date) is ALLOWED -- a legitimately pre-recorded future
+        # action -- so this reports that nothing is affected rather than
+        # refusing. Saying so explicitly is what stops a silent, empty preview
+        # from reading as a successful adjustment.
+        print("  no fills affected")
+        return
+    print(f"  {preview.fills_changed} fill(s) affected across {preview.accounts} account(s)")
+    for before, after in preview.samples:
+        print(
+            f"    {_fmt_decimal(before.quantity)} @ {_fmt_decimal(before.price)}"
+            f"  ->  {_fmt_decimal(after.quantity)} @ {_fmt_decimal(after.price)}"
+        )
+
+
+async def _regroup_holders(conn, instrument_id: UUID) -> int:
+    """Regroup EVERY account holding `instrument_id`; returns how many.
+
+    Spec C7. Positions are read from materialised `trade` rows, so an action
+    that is stored but never regrouped leaves every holder reporting a stale
+    quantity -- silently, since nothing about the position says it predates the
+    action. Every holder rather than the first: a corporate action is global
+    (the table has no `account_id`, correctly -- a split affects every holder),
+    so regrouping one account would leave the others pre-split.
+
+    Called only from inside the caller's `async with conn.transaction()`, so
+    the write and every regroup it invalidates commit or roll back together.
+    """
+    account_ids = [
+        r["account_id"]
+        for r in await conn.fetch(
+            "SELECT DISTINCT account_id FROM fill WHERE instrument_id = $1", instrument_id
+        )
+    ]
+    for account_id in account_ids:
+        await regroup_account(conn, account_id)
+    return len(account_ids)
+
+
+async def cmd_corporate_add(args) -> int:
+    action_type = ActionType(args.type)
+
+    # --- stage 1: flag-level only, before any connection is opened ---
+    ratio = _parse_ratio(args.ratio)
+    if ratio is None:
+        return 2
+    numerator, denominator = ratio
+
+    ex_date = _parse_ex_date(args.ex_date)
+    if ex_date is None:
+        return 2
+
+    # Both of these are enforced again by CorporateAction.__post_init__, which
+    # cannot run until stage 2. Checking them here is what makes the refusal
+    # independent of the database: `--type spinoff` with no --basis-allocation
+    # must be refused for the missing flag, not because some unrelated symbol
+    # failed to resolve first.
+    if action_type in _RESULTING_INSTRUMENT_TYPES and args.resulting_symbol is None:
+        print(f"error: --type {action_type} requires --resulting-symbol", file=sys.stderr)
+        return 2
+    if action_type is ActionType.SPINOFF and args.basis_allocation is None:
+        print("error: --type spinoff requires --basis-allocation", file=sys.stderr)
+        return 2
+
+    basis_allocation: Decimal | None = None
+    if args.basis_allocation is not None:
+        # Same InvalidOperation/is_finite pair as --ratio above, and the
+        # is_finite half is load-bearing here: an ORDERING comparison against
+        # a Decimal NaN raises InvalidOperation rather than returning False
+        # (verified on this interpreter), so __post_init__'s `0 <= x <= 1`
+        # range check would blow up with an exception that is not a ValueError
+        # and would therefore escape the constructor's `except ValueError`
+        # below as a traceback instead of a clean refusal.
+        try:
+            basis_allocation = Decimal(args.basis_allocation)
+        except InvalidOperation:
+            print(
+                f"error: --basis-allocation {args.basis_allocation!r} is not a valid number",
+                file=sys.stderr,
+            )
+            return 2
+        if not basis_allocation.is_finite():
+            print(
+                f"error: --basis-allocation {args.basis_allocation!r} must be a finite number",
+                file=sys.stderr,
+            )
+            return 2
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            # --- stage 2: needs a connection, still strictly before any write ---
+            try:
+                instrument_id = await resolve_instrument_by_symbol(conn, args.symbol)
+                resulting_instrument_id = (
+                    await resolve_instrument_by_symbol(conn, args.resulting_symbol)
+                    if args.resulting_symbol
+                    else None
+                )
+            except ValueError as exc:
+                # resolve_instrument_by_symbol refuses an unknown symbol AND an
+                # ambiguous one (instrument.symbol is not unique), naming every
+                # candidate in the latter case -- reused rather than reinvented
+                # so `corporate` and `marks set` cannot disagree about which
+                # instrument a symbol means.
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+
+            try:
+                action = CorporateAction(
+                    instrument_id=instrument_id,
+                    action_type=action_type,
+                    ex_date=ex_date,
+                    ratio_numerator=numerator,
+                    ratio_denominator=denominator,
+                    resulting_instrument_id=resulting_instrument_id,
+                    basis_allocation=basis_allocation,
+                )
+            except ValueError as exc:
+                # The invariants only the database can decide -- chiefly that a
+                # resulting instrument may not be the source instrument, which
+                # needs both UUIDs. A clean message rather than the traceback
+                # main() would otherwise let through (it deliberately does not
+                # wrap domain ValueErrors).
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+
+            existing = await find_duplicate(conn, instrument_id, ex_date, action_type)
+            if existing is not None:
+                # The same 1:6 split entered twice is a 1:36 restatement, and
+                # every individual step of it looks plausible. There is no
+                # UNIQUE constraint backing this (adding one is a migration and
+                # out of scope), so this application-level guard is the only
+                # thing standing between a double keypress and a silently
+                # wrong position. The existing id is named so it can be
+                # inspected with `corporate list` or dropped with
+                # `corporate remove`.
+                print(
+                    f"error: a {action_type} on {args.symbol} with ex-date "
+                    f"{ex_date.isoformat()} is already recorded as {existing}",
+                    file=sys.stderr,
+                )
+                return 2
+
+            # Computed BEFORE the write, always: previewing after storing the
+            # action would diff the new state against itself and print "no
+            # fills affected" for a change that had just been made.
+            preview = await preview_effect(conn, instrument_id, adding=action)
+            _print_effect(
+                f"{args.symbol} — {action_type} {numerator}:{denominator}, "
+                f"ex {ex_date.isoformat()}",
+                preview,
+            )
+
+            if not args.commit:
+                print("\npreview only — rerun with --commit to write")
+                return 0
+
+            # ONE transaction over the write and every regroup it invalidates:
+            # a crash between them would otherwise leave a stored action whose
+            # effect has reached some accounts' trades and not others.
+            async with conn.transaction():
+                action_id = await add_action(conn, action, args.note)
+                regrouped = await _regroup_holders(conn, instrument_id)
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited (including via every
+        # early return above), never from inside it, or close() deadlocks
+        # waiting for a release that will never come.
+        await pool.close()
+
+    print(f"recorded {action_id}; regrouped {regrouped} account(s)")
+    return 0
+
+
+async def cmd_corporate_list(args) -> int:
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            instrument_id = None
+            if args.symbol:
+                try:
+                    instrument_id = await resolve_instrument_by_symbol(conn, args.symbol)
+                except ValueError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 2
+            rows = await list_actions(conn, instrument_id)
+            # The stored rows carry instrument UUIDs, and a listing of nothing
+            # but UUIDs cannot do the job spec §5 gives this command -- finding
+            # the id to hand to `corporate remove`, for the instrument you
+            # meant. One lookup for the whole listing, rather than a join
+            # pushed into db/corporate.py, which would make the storage layer
+            # answer a display question.
+            ids = {r["instrument_id"] for r in rows} | {
+                r["resulting_instrument_id"] for r in rows if r["resulting_instrument_id"]
+            }
+            symbols = {
+                r["id"]: r["symbol"]
+                for r in await conn.fetch(
+                    "SELECT id, symbol FROM instrument WHERE id = ANY($1::uuid[])", list(ids)
+                )
+            }
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    for r in rows:
+        line = (
+            f"{r['id']}  {r['ex_date']:%Y-%m-%d}  "
+            f"{symbols.get(r['instrument_id'], '?'):<8} {r['action_type']:<14} "
+            f"{r['ratio_numerator']}:{r['ratio_denominator']}"
+        )
+        if r["resulting_instrument_id"] is not None:
+            line += f"  -> {symbols.get(r['resulting_instrument_id'], '?')}"
+        if r["basis_allocation"] is not None:
+            line += f"  basis {r['basis_allocation']}"
+        print(line)
+    return 0
+
+
+async def cmd_corporate_remove(args) -> int:
+    # main()'s UUID guard covers --account only, so a mistyped id would
+    # otherwise reach asyncpg as a bad bind and surface as a traceback. Parsed
+    # before the pool: whether it is a UUID depends only on the argument.
+    try:
+        action_id = UUID(args.id)
+    except ValueError as exc:
+        print(f"error: {args.id!r} is not a valid corporate action id: {exc}", file=sys.stderr)
+        return 2
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            # Fetched first for two reasons at once: an unknown id must be
+            # refused before anything is deleted (db.corporate.remove_action's
+            # own docstring -- False means unknown, and the caller refuses
+            # rather than reporting a successful no-op), and both the preview
+            # and the regroup below need the instrument the action applies to.
+            row = await conn.fetchrow(
+                "SELECT action_type, ex_date, instrument_id FROM corporate_action WHERE id = $1",
+                action_id,
+            )
+            if row is None:
+                print(f"error: no corporate action with id {action_id}", file=sys.stderr)
+                return 2
+            instrument_id = row["instrument_id"]
+
+            preview = await preview_effect(conn, instrument_id, removing=action_id)
+            _print_effect(
+                f"removing {action_id}: {row['action_type']}, "
+                f"ex {row['ex_date']:%Y-%m-%d}",
+                preview,
+            )
+
+            if not args.commit:
+                print("\npreview only — rerun with --commit to write")
+                return 0
+
+            async with conn.transaction():
+                # remove_action returns False for an unknown id; that case was
+                # already refused above, on this same connection, so the only
+                # way to see it here is a concurrent deleter -- not a case
+                # worth a second refusal path inside an open transaction, where
+                # `return` would COMMIT rather than roll back.
+                await remove_action(conn, action_id)
+                regrouped = await _regroup_holders(conn, instrument_id)
+    finally:
+        # See cmd_trades's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+
+    print(f"removed {action_id}; regrouped {regrouped} account(s)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="deadband")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1353,6 +1730,46 @@ def main() -> int:
     p_reconcile.add_argument("--as-of", default=None, help="ISO-8601; defaults to now")
     p_reconcile.add_argument("--tolerance", default=None, help="default 0.01")
     p_reconcile.set_defaults(fn=cmd_reconcile)
+
+    p_corp = sub.add_parser("corporate", help="corporate actions")
+    corp_sub = p_corp.add_subparsers(dest="corporate_command", required=True)
+
+    p_corp_add = corp_sub.add_parser("add", help="record a corporate action")
+    # Drawn from ActionType rather than a literal list, so a new member of the
+    # enum is offered by the CLI instead of being silently unreachable.
+    p_corp_add.add_argument("--type", required=True, choices=[t.value for t in ActionType])
+    p_corp_add.add_argument("--symbol", required=True, help="refused if it is ambiguous")
+    p_corp_add.add_argument("--ex-date", required=True, help="ISO-8601 date")
+    # The direction is not guessable and inverting it is a factor-of-36 error
+    # on a 1:6 reverse split with every step still looking plausible, so it is
+    # spelled out here as well as in _parse_ratio.
+    p_corp_add.add_argument(
+        "--ratio",
+        required=True,
+        help="NEW:OLD — a quantity is scaled by NEW/OLD, so a 1-for-6 reverse split is 1:6",
+    )
+    p_corp_add.add_argument(
+        "--resulting-symbol",
+        default=None,
+        help="the instrument produced; required for merger, spinoff and symbol_change",
+    )
+    p_corp_add.add_argument(
+        "--basis-allocation",
+        default=None,
+        help="spinoff only: fraction of cost basis moved to the spun-off instrument (0-1)",
+    )
+    p_corp_add.add_argument("--note", default=None)
+    p_corp_add.add_argument("--commit", action="store_true", help="write to the database")
+    p_corp_add.set_defaults(fn=cmd_corporate_add)
+
+    p_corp_list = corp_sub.add_parser("list", help="show stored corporate actions")
+    p_corp_list.add_argument("--symbol", default=None)
+    p_corp_list.set_defaults(fn=cmd_corporate_list)
+
+    p_corp_rm = corp_sub.add_parser("remove", help="delete a corporate action")
+    p_corp_rm.add_argument("id")
+    p_corp_rm.add_argument("--commit", action="store_true", help="write to the database")
+    p_corp_rm.set_defaults(fn=cmd_corporate_remove)
 
     args = parser.parse_args()
     # `import --commit` no longer requires --account at parse time: whether

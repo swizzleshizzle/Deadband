@@ -14,6 +14,7 @@ import pytest_asyncio
 
 import cli
 from db.accounts import create_account
+from db.corporate import add_action, list_actions
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
@@ -22,6 +23,7 @@ from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _split
 
 pytestmark = requires_db
 
@@ -2838,3 +2840,372 @@ async def test_reconcile_refuses_an_unparseable_as_of(conn, monkeypatch, capsys)
     err = capsys.readouterr().err.lower()
     assert "not a valid date or timestamp" in err
     assert "not-a-date" in err
+
+
+# --- `deadband corporate` (spec 2026-08-15, §5-§6) -------------------------
+# The engine (ledger/corporate.py's adjust_fills) and the storage layer
+# (db/corporate.py) are both already tested. What is new here is the WIRING:
+# that a stored action reaches adjust_fills and that its result reaches the
+# materialised `trade` rows positions are read from. `_split` and
+# `account_with_1800` come from tests/db/conftest.py rather than being
+# redefined here -- the fixture's single BUY of 1800 is executed 2026-02-01,
+# deliberately BEFORE the 2026-03-02 ex-date these tests use, so the split
+# actually applies to it.
+
+
+def _corporate_args(**kw):
+    """Same hand-built argparse.Namespace pattern as `_args` (marks) and
+    `_snapshot_args` (snapshots) above, named distinctly from both so it cannot
+    silently widen either.
+
+    Every flag the three `corporate` subparsers register is present, defaulted
+    the way argparse would default it, so a handler reading a flag this call
+    didn't pass sees the parser's own default rather than an AttributeError the
+    real CLI could never produce. An unrecognised keyword is a hard error
+    instead of a silently-added attribute: a typo'd `ex_date=` would otherwise
+    leave the real flag at None and the test would pass for the wrong reason.
+    """
+    defaults = {
+        "type": None,
+        "symbol": None,
+        "ex_date": None,
+        "ratio": None,
+        "resulting_symbol": None,
+        "basis_allocation": None,
+        "note": None,
+        "id": None,
+        "commit": False,
+    }
+    unknown = set(kw) - set(defaults)
+    if unknown:
+        raise TypeError(f"no such corporate flag(s): {', '.join(sorted(unknown))}")
+    return argparse.Namespace(**{**defaults, **kw})
+
+
+async def test_corporate_add_previews_without_writing(conn, account_with_1800, monkeypatch, capsys):
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=False
+        )
+    )
+    assert rc == 0
+    assert await list_actions(conn, instrument_id) == []
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    # The adjusted quantity, not just a row count: a preview that prints "1
+    # fill affected" without saying what it becomes cannot catch an inverted
+    # ratio, which is the mistake the spec singles out.
+    assert "300" in out
+
+
+async def test_corporate_add_commits_and_regroups(conn, account_with_1800, monkeypatch):
+    """Positions come from materialised trade rows, so an add that does not
+    regroup leaves them silently stale."""
+    account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 0
+    assert len(await list_actions(conn, instrument_id)) == 1
+    (position,) = await open_positions(conn, account_id)
+    # 1800 * 1/6. An inverted --ratio would make this 10800 and every
+    # individual step would still look plausible.
+    assert position.quantity == Decimal(300)
+
+
+async def test_corporate_add_refuses_a_duplicate_without_writing(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """The same 1:6 split entered twice is a 1:36 restatement that looks
+    plausible at every individual step."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = _corporate_args(
+        type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+    )
+    assert await cli.cmd_corporate_add(args) == 0
+    assert await cli.cmd_corporate_add(args) == 2
+    assert len(await list_actions(conn, instrument_id)) == 1
+    assert "already" in capsys.readouterr().err.lower()
+
+
+async def test_corporate_add_refuses_a_spinoff_with_no_basis_allocation(
+    conn, account_with_1800, monkeypatch
+):
+    """Refused for the MISSING --basis-allocation, in the flag-level stage that
+    runs before any connection is opened -- not because ZXCB fails to resolve.
+    No ZXCB instrument is ever created here, so a version that resolved symbols
+    first would refuse for the wrong reason and this test would pin nothing:
+    fake_create_pool therefore raises rather than returning a stand-in pool,
+    the same idiom test_snapshot_add_refuses_a_non_finite_figure_without_
+    opening_a_connection uses."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_a_malformed_ratio_without_writing(
+    conn, account_with_1800, monkeypatch
+):
+    """Whether a ratio parses depends only on the argument, never on the
+    database, so this too must be refused before a connection is opened."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02",
+            ratio="one-to-six", commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize("bad_ratio", ["1:NaN", "Infinity:6", "1:0", "-1:6", "1:6:2", "1:six"])
+async def test_corporate_add_refuses_a_ratio_component_that_is_not_positive_and_finite(
+    conn, account_with_1800, monkeypatch, bad_ratio
+):
+    """Decimal("NaN") and Decimal("Infinity") CONSTRUCT successfully and slip
+    past the InvalidOperation catch entirely -- is_finite() is this codebase's
+    established guard (see cmd_marks_set). A zero or negative component would
+    reach CorporateAction.__post_init__ and surface as an uncaught ValueError
+    traceback rather than a clean refusal."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02",
+            ratio=bad_ratio, commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_an_unparseable_ex_date(conn, account_with_1800, monkeypatch):
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="not-a-date", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(
+    conn, account_with_1800, monkeypatch
+):
+    """Spec §6: a type that requires a resulting instrument and is given none
+    is refused before a write transaction is opened. Without the flag-level
+    check this would reach CorporateAction.__post_init__ and raise."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="merger", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1", commit=True
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_an_unknown_symbol(conn, monkeypatch):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="NOSUCH", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+
+
+async def test_corporate_add_allows_an_instrument_with_no_fills(conn, monkeypatch, capsys):
+    """Spec §6's last row: an action on an instrument nobody holds is a
+    legitimately pre-recorded future action, so it is ALLOWED and reports that
+    nothing is affected -- it must not be mistaken for an error, and it must
+    still be stored."""
+    instrument_id = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="split", symbol="ZXCO", ex_date="2026-03-02", ratio="3:1", commit=True
+        )
+    )
+    assert rc == 0
+    assert len(await list_actions(conn, instrument_id)) == 1
+    assert "no fills affected" in capsys.readouterr().out
+
+
+async def test_corporate_list_shows_stored_actions(conn, account_with_1800, monkeypatch, capsys):
+    _account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_list(_corporate_args(symbol="ZXCO"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "reverse_split" in out
+    # The id is what `corporate remove` takes, so a listing that omits it
+    # cannot do the job spec §5 gives it.
+    assert str(action_id) in out
+
+
+async def test_corporate_remove_undoes_the_adjustment(conn, account_with_1800, monkeypatch):
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    # Guard: if the split never reached the position in the first place, the
+    # 1800 asserted below would be true whether or not remove did anything.
+    (adjusted,) = await open_positions(conn, account_id)
+    assert adjusted.quantity == Decimal(300)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(action_id), commit=True))
+    assert rc == 0
+    assert await list_actions(conn, instrument_id) == []
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(1800)
+
+
+async def test_corporate_remove_previews_without_deleting(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """`remove` mirrors `add`: preview by default, write only with --commit."""
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(action_id), commit=False))
+    assert rc == 0
+    assert "preview only" in capsys.readouterr().out
+    assert len(await list_actions(conn, instrument_id)) == 1
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(300)
+
+
+async def test_corporate_remove_refuses_an_unknown_id(conn, monkeypatch):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(uuid4()), commit=True))
+    assert rc == 2
+
+
+async def test_corporate_remove_refuses_a_malformed_id(conn, monkeypatch):
+    """main()'s UUID guard covers --account only, so a mistyped positional id
+    would otherwise surface as a raw ValueError traceback."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id="not-a-uuid", commit=True))
+    assert rc == 2
+
+
+@pytest.mark.parametrize("bad_allocation", ["NaN", "abc"])
+async def test_corporate_add_refuses_a_basis_allocation_that_is_not_a_finite_number(
+    conn, account_with_1800, monkeypatch, bad_allocation
+):
+    """The is_finite half is load-bearing: an ORDERING comparison against a
+    Decimal NaN RAISES InvalidOperation rather than returning False, so a NaN
+    reaching CorporateAction.__post_init__'s `0 <= x <= 1` range check would
+    escape the CLI's `except ValueError` as a traceback. Decimal("abc") raises
+    InvalidOperation at construction, which is not a ValueError either."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", basis_allocation=bad_allocation, commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
