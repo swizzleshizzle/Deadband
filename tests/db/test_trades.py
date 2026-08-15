@@ -1140,10 +1140,20 @@ async def test_a_stored_reverse_split_reaches_the_position(conn, account_with_18
 
 async def test_removing_the_action_restores_the_original_quantity(conn, account_with_1800):
     """Derived at read time, so removal is a genuine undo rather than a second
-    restatement."""
+    restatement.
+
+    The intermediate 300 is what makes this test bind, and it is not decoration:
+    without it, deleting the `adjust_fills` call from `db/trades.py` turns every
+    step here into a no-op and the closing 1800 stays true -- the test would
+    pass under its own designated mutant, pinning nothing about removal being an
+    undo. Same guard, for the same reason, as
+    test_corporate_remove_undoes_the_adjustment in tests/db/test_cli.py.
+    """
     account_id, instrument_id = account_with_1800
     action_id = await add_action(conn, _split(instrument_id))
     await regroup_account(conn, account_id)
+    (adjusted,) = await open_positions(conn, account_id)
+    assert adjusted.quantity == Decimal(300)
     await remove_action(conn, action_id)
     await regroup_account(conn, account_id)
     (position,) = await open_positions(conn, account_id)

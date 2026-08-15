@@ -103,10 +103,20 @@ expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
 
 ### Corporate actions
 
-`corporate add`, `corporate list` and `corporate remove` manage split, reverse-split,
-merger, spinoff and symbol-change records. A stored action is never applied to a fill in
-place — it is applied at read time, inside `regroup_account`, so raw fills stay ground
-truth and removing an action is a genuine undo rather than a second restatement.
+`corporate add`, `corporate list` and `corporate remove` manage **split and reverse-split**
+records. A stored action is never applied to a fill in place — it is applied at read time,
+inside `regroup_account`, so raw fills stay ground truth and removing an action is a
+genuine undo rather than a second restatement.
+
+That read-time design is also why the other three `ActionType` members — `merger`,
+`spinoff` and `symbol_change` — are **refused**, with exit 2 and an explanation, rather
+than stored. `ledger/corporate.py` computes all five correctly, but an action that changes
+*which instrument* a fill belongs to cannot be materialised into a `trade` row while the
+`fill` table is never rewritten: the position would keep reporting under the old symbol
+(disagreeing with `deadband trades`, and never priced by a mark on the new one), and a
+spinoff's synthetic child fill has no `fill` row for `trade.opening_fill_id`'s composite
+foreign key to point at. It is a recorded limitation, not a bug —
+[`docs/known-gaps.md`](docs/known-gaps.md) gap #39 states what closing it would take.
 
 ```bash
 uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
@@ -129,10 +139,14 @@ the row and then regroups every account holding the instrument, all inside one
 transaction, so a crash between the write and a regroup can never leave one account
 adjusted and another stale.
 
-`--type` is one of the five `ActionType` members (`split`, `reverse_split`, `merger`,
-`spinoff`, `symbol_change`); `merger`, `spinoff` and `symbol_change` additionally require
-`--resulting-symbol` (the instrument produced), and `spinoff` requires
-`--basis-allocation` (the fraction of cost basis moved to it, 0–1).
+`--type` accepts `split` and `reverse_split`. `merger`, `spinoff` and `symbol_change` are
+still offered by `--type` — they stay in its choices deliberately, so the refusal comes
+from the handler and can explain itself rather than from argparse as a bare "invalid
+choice" — but supplying one exits 2, writes nothing, and opens no connection. Neither
+accepted type uses `--resulting-symbol` or `--basis-allocation`, so passing either is also
+refused: a stored `resulting_instrument_id` joins that instrument's action set and can
+raise `circular corporate-action dependency` out of every later regroup, including
+`import --commit`.
 
 `--ratio NEW:OLD` maps directly onto `ratio_numerator:ratio_denominator`, the direction
 `adjust_fills` consumes: a quantity is scaled by `numerator / denominator`. A 1-for-6
@@ -143,11 +157,12 @@ looking plausible.
 
 `corporate list` optionally filters with `--symbol` and prints, per action, the id
 `remove` needs, its ex-date, symbol, type, ratio, resulting symbol (if any), and basis
-allocation (if any). See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–38) for what
+allocation (if any). See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–39) for what
 this leaves open: corporate actions still can't be *imported* from a venue export, manual
 trades aren't split-adjusted, merger cash isn't modelled, there's no audit trail on a
-restatement, no database-level duplicate guard, and an action recorded against the result
-of an earlier one regroups nothing.
+restatement, no database-level duplicate guard, an action recorded against the result of an
+earlier one regroups nothing, and the three identity-changing types are refused rather than
+supported.
 
 ### Reconciliation
 

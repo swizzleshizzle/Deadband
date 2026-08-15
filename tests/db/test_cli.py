@@ -2950,16 +2950,41 @@ async def test_corporate_add_refuses_a_duplicate_without_writing(
     assert "already" in capsys.readouterr().err.lower()
 
 
-async def test_corporate_add_refuses_a_spinoff_with_no_basis_allocation(
-    conn, account_with_1800, monkeypatch
+@pytest.mark.parametrize(
+    ("action_type", "extra_flags"),
+    [
+        ("merger", {"resulting_symbol": "ZXCB"}),
+        ("spinoff", {"resulting_symbol": "ZXCB", "basis_allocation": "0.25"}),
+        ("symbol_change", {"resulting_symbol": "ZXCB"}),
+    ],
+)
+async def test_corporate_add_refuses_an_identity_changing_type(
+    conn, account_with_1800, monkeypatch, capsys, action_type, extra_flags
 ):
-    """Refused for the MISSING --basis-allocation, in the flag-level stage that
-    runs before any connection is opened -- not because ZXCB fails to resolve.
-    No ZXCB instrument is ever created here, so a version that resolved symbols
-    first would refuse for the wrong reason and this test would pin nothing:
-    fake_create_pool therefore raises rather than returning a stand-in pool,
-    the same idiom test_snapshot_add_refuses_a_non_finite_figure_without_
-    opening_a_connection uses."""
+    """The three types that change WHICH INSTRUMENT a fill belongs to are
+    refused outright (docs/known-gaps.md gap #39). `ledger/corporate.py` derives
+    all five correctly; the ledger cannot materialise these three, because
+    adjustments are derived at read time over a `fill` table that is never
+    rewritten:
+
+      * `db/positions.py` reads a position's instrument from the RAW opening
+        fill while `db/trades.py` writes primary_underlying from the ADJUSTED
+        one, so a merger or symbol change reports the position under the OLD
+        symbol and a mark on the new symbol never prices it;
+      * a spinoff's synthetic child fill has no `fill` row, so
+        trade_opening_fill_fk -- a non-deferrable composite FK -- rejects it.
+
+    Each case passes EVERY flag its type requires, so the refusal cannot be
+    the older "requires --resulting-symbol" / "requires --basis-allocation"
+    one firing early and making this pass for the wrong reason.
+
+    The message, not just the exit code: a bare `rc == 2` would be satisfied by
+    a handler failing for an unrelated reason, and the whole point of refusing
+    here (rather than through argparse's `choices`) is that a user with a real
+    merger to record learns WHY and that it is a recorded limitation.
+    fake_create_pool raises rather than returning a stand-in pool, so "opens no
+    connection, and therefore no write transaction" is structural.
+    """
     _account_id, instrument_id = account_with_1800
 
     async def fake_create_pool(*_a, **_kw):
@@ -2969,11 +2994,73 @@ async def test_corporate_add_refuses_a_spinoff_with_no_basis_allocation(
 
     rc = await cli.cmd_corporate_add(
         _corporate_args(
-            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
-            resulting_symbol="ZXCB", commit=True,
+            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            commit=True, **extra_flags,
         )
     )
     assert rc == 2
+    err = capsys.readouterr().err
+    assert f"--type {action_type}" in err
+    assert "cannot be recorded" in err
+    # Named as a recorded limitation with a stated remedy, not a bare
+    # "unsupported": the gap it is recorded under, and the fact that lifting it
+    # is a schema change, both have to reach the user.
+    assert "gap #39" in err
+    assert "docs/known-gaps.md" in err
+    assert "schema change" in err
+    # Scoped to the one instrument this test's fixture created, never an
+    # unqualified count: the test database is shared and `instrument` rows are
+    # global.
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize(
+    ("action_type", "flag", "value", "named"),
+    [
+        ("split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
+        ("reverse_split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
+        ("split", "basis_allocation", "0.25", "--basis-allocation"),
+        ("reverse_split", "basis_allocation", "0.25", "--basis-allocation"),
+    ],
+)
+async def test_corporate_add_refuses_a_flag_the_type_does_not_use(
+    conn, account_with_1800, monkeypatch, capsys, action_type, flag, value, named
+):
+    """A flag the type does not use is not harmless decoration.
+
+    `--type split --resulting-symbol ZXCB` was accepted and STORED, and
+    `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    `resulting_instrument_id` as well as `instrument_id` -- so that row joined
+    ZXCB's action set, entered `_ordered_actions`' dependency graph, and could
+    raise `ValueError: circular corporate-action dependency` out of
+    `adjust_fills`, inside `regroup_account`, for every account holding either
+    instrument, on every regroup including `import --commit`, naming neither the
+    offending action nor how to remove it.
+
+    Flag-level, so it must refuse before any connection is opened -- ZXCB is
+    never created here, and a version that resolved symbols first would refuse
+    for the wrong reason.
+    """
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:6",
+            commit=True, **{flag: value},
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    # The offending flag and the type are both named: "error: bad flags" would
+    # leave the user to guess which of the two to drop.
+    assert named in err
+    assert f"--type {action_type}" in err
+    assert "does not use" in err
     assert await list_actions(conn, instrument_id) == []
 
 
@@ -3042,26 +3129,19 @@ async def test_corporate_add_refuses_an_unparseable_ex_date(conn, account_with_1
     assert await list_actions(conn, instrument_id) == []
 
 
-async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(
-    conn, account_with_1800, monkeypatch
-):
-    """Spec §6: a type that requires a resulting instrument and is given none
-    is refused before a write transaction is opened. Without the flag-level
-    check this would reach CorporateAction.__post_init__ and raise."""
-    _account_id, instrument_id = account_with_1800
-
-    async def fake_create_pool(*_a, **_kw):
-        raise AssertionError("must refuse before opening a connection")
-
-    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
-
-    rc = await cli.cmd_corporate_add(
-        _corporate_args(
-            type="merger", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1", commit=True
-        )
-    )
-    assert rc == 2
-    assert await list_actions(conn, instrument_id) == []
+# Two tests were REMOVED here rather than kept green, when the three
+# identity-changing types began being refused outright (gap #39):
+# "refuses a merger with no --resulting-symbol" and "refuses a spinoff with a
+# --basis-allocation that is not a finite number". Both still exited 2 and wrote
+# nothing afterwards -- and both had stopped exercising the check they named,
+# since the type refusal now fires first for every input either one could
+# supply. A test that passes for a reason its docstring does not describe is the
+# vacuous-assertion shape this file's own comments keep warning about, so they
+# are gone. The checks themselves are still in cli.py, deliberately unreachable,
+# with a comment saying why (they are what a re-enabled merger or spinoff would
+# need), and CorporateAction.__post_init__ enforces both invariants regardless
+# of the CLI -- tests/test_corporate.py pins the basis_allocation half of that
+# directly.
 
 
 async def test_corporate_add_refuses_an_unknown_symbol(
@@ -3216,32 +3296,6 @@ async def test_corporate_remove_refuses_a_malformed_id(conn, monkeypatch):
     assert rc == 2
 
 
-@pytest.mark.parametrize("bad_allocation", ["NaN", "abc"])
-async def test_corporate_add_refuses_a_basis_allocation_that_is_not_a_finite_number(
-    conn, account_with_1800, monkeypatch, bad_allocation
-):
-    """The is_finite half is load-bearing: an ORDERING comparison against a
-    Decimal NaN RAISES InvalidOperation rather than returning False, so a NaN
-    reaching CorporateAction.__post_init__'s `0 <= x <= 1` range check would
-    escape the CLI's `except ValueError` as a traceback. Decimal("abc") raises
-    InvalidOperation at construction, which is not a ValueError either."""
-    _account_id, instrument_id = account_with_1800
-
-    async def fake_create_pool(*_a, **_kw):
-        raise AssertionError("must refuse before opening a connection")
-
-    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
-
-    rc = await cli.cmd_corporate_add(
-        _corporate_args(
-            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
-            resulting_symbol="ZXCB", basis_allocation=bad_allocation, commit=True,
-        )
-    )
-    assert rc == 2
-    assert await list_actions(conn, instrument_id) == []
-
-
 # Deliberately BEFORE the 2026-03-02 ex-date every corporate test here uses.
 # `_position_fill` above executes at 2026-08-01, which is AFTER it, so a
 # fixture built on that helper unmodified would put both fills on the wrong
@@ -3357,7 +3411,15 @@ def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monk
     """One invocation carrying every flag `corporate add` registers, asserted
     against the exact attribute names cmd_corporate_add reads. A renamed flag,
     a missing `default=None`, or a --commit that did not store True would be
-    invisible to every namespace-built test in this file."""
+    invisible to every namespace-built test in this file.
+
+    `--type spinoff` is used because it is the only type that exercises BOTH
+    --resulting-symbol and --basis-allocation in one invocation. The real
+    handler refuses that type (gap #39) and refuses those two flags for the
+    types it accepts -- which is exactly why the check has to happen inside the
+    handler and all five members stay in argparse's `choices`. This test
+    replaces the handler with a spy, so it pins the parser's flag-to-dest
+    mapping and nothing about what the handler does with it."""
     captured = []
 
     async def spy(args):
