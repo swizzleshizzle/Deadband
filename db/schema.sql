@@ -265,7 +265,8 @@ CREATE TABLE IF NOT EXISTS derived_fill (
                          CHECK (quantity > 0 AND quantity < 'Infinity'::numeric),
     price                NUMERIC NOT NULL
                          CHECK (price >= 0 AND price < 'Infinity'::numeric),
-    fee                  NUMERIC NOT NULL DEFAULT 0,
+    fee                  NUMERIC NOT NULL DEFAULT 0
+                         CHECK (fee >= 0 AND fee < 'Infinity'::numeric),
     is_estimated         BOOLEAN NOT NULL DEFAULT TRUE,
     derived_from_fill_id UUID NOT NULL REFERENCES fill(id) ON DELETE CASCADE,
     corporate_action_id  UUID NOT NULL REFERENCES corporate_action(id) ON DELETE CASCADE,

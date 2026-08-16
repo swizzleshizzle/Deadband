@@ -19,8 +19,9 @@ BASELINE = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "schema_ba
 
 
 async def _describe(conn, namespace: str) -> dict:
-    """Columns, check constraints, and trigger definitions (with their backing
-    function bodies) of every table in a namespace.
+    """Columns, check constraints, trigger definitions (with their backing
+    function bodies), and named foreign key / primary key / unique constraints
+    of every table in a namespace.
 
     information_schema.triggers returns one row per event (INSERT/UPDATE/...)
     for a single trigger, which makes it awkward to compare directly. pg_trigger
@@ -29,6 +30,16 @@ async def _describe(conn, namespace: str) -> dict:
     calls -- so a trigger added to schema.sql but not to a migration (or vice
     versa) shows up here even though it has no informal check the way column and
     CHECK DDL syntax does.
+
+    information_schema.check_constraints only surfaces contype = 'c' -- CHECK
+    constraints. It says nothing about foreign keys, primary keys, or unique
+    constraints, so a divergence there (a differently-named FK, a PK left as
+    the old composite shape on one side, a missing UNIQUE) was previously
+    invisible to this test. pg_constraint joined the same way as the trigger
+    query, with pg_get_constraintdef() for the full definition (the same
+    approach used above for triggers via pg_get_triggerdef()), closes that
+    gap: contype IN ('f', 'p', 'u') covers foreign keys, primary keys, and
+    unique constraints, keyed by table name and constraint name.
     """
     cols = await conn.fetch(
         """SELECT table_name, column_name, data_type, is_nullable, column_default
@@ -60,14 +71,28 @@ async def _describe(conn, namespace: str) -> dict:
          ORDER BY c.relname, t.tgname""",
         namespace,
     )
-    # pg_get_triggerdef()/pg_get_functiondef() unconditionally schema-qualify the
-    # trigger's own relation and the function's own name -- e.g. "... ON
-    # eq_fresh.fill ..." / "CREATE OR REPLACE FUNCTION eq_fresh.f()" -- regardless
-    # of search_path (verified directly against Postgres 16; this is not a
-    # search_path bug to fix, it is how ruleutils always deparses these two
-    # functions). Left alone, the namespace name itself would make eq_fresh and
-    # eq_migrated compare unequal forever, even for a byte-identical trigger.
-    # Strip the namespace's own name back out before comparing.
+    constraints = await conn.fetch(
+        """SELECT c.relname AS table_name,
+                  con.conname AS constraint_name,
+                  con.contype AS constraint_type,
+                  pg_get_constraintdef(con.oid) AS definition
+             FROM pg_constraint con
+             JOIN pg_class c ON c.oid = con.conrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1
+              AND con.contype IN ('f', 'p', 'u')
+         ORDER BY c.relname, con.conname""",
+        namespace,
+    )
+    # pg_get_triggerdef()/pg_get_functiondef()/pg_get_constraintdef() unconditionally
+    # schema-qualify the trigger's/constraint's own relation and any relation it
+    # references -- e.g. "... ON eq_fresh.fill ..." / "CREATE OR REPLACE FUNCTION
+    # eq_fresh.f()" / "FOREIGN KEY (...) REFERENCES eq_fresh.derived_fill(...)" --
+    # regardless of search_path (verified directly against Postgres 16; this is not
+    # a search_path bug to fix, it is how ruleutils always deparses these). Left
+    # alone, the namespace name itself would make eq_fresh and eq_migrated compare
+    # unequal forever, even for byte-identical definitions. Strip the namespace's
+    # own name back out before comparing.
     prefix = f"{namespace}."
     return {
         "columns": [tuple(r) for r in cols],
@@ -81,6 +106,15 @@ async def _describe(conn, namespace: str) -> dict:
             )
             for r in triggers
         ],
+        "constraints": sorted(
+            (
+                r["table_name"],
+                r["constraint_name"],
+                r["constraint_type"],
+                r["definition"].replace(prefix, ""),
+            )
+            for r in constraints
+        ),
     }
 
 
@@ -107,10 +141,10 @@ async def test_fresh_schema_matches_baseline_plus_migrations(conn):
     # creation failure, ...) that makes both sides empty: [] == [] would pass the
     # assertions below vacuously, proving nothing. This project has shipped ten
     # assertions that could not fail; this is the guard against adding an eleventh.
-    assert fresh["columns"] or fresh["checks"] or fresh["triggers"], (
-        "eq_fresh produced no columns, checks, or triggers -- _describe or the "
-        "schema build likely failed silently, which would make the comparisons "
-        "below vacuously true (empty compared to empty)"
+    assert fresh["columns"] or fresh["checks"] or fresh["triggers"] or fresh["constraints"], (
+        "eq_fresh produced no columns, checks, triggers, or constraints -- _describe "
+        "or the schema build likely failed silently, which would make the "
+        "comparisons below vacuously true (empty compared to empty)"
     )
 
     assert fresh["columns"] == migrated["columns"], (
@@ -123,4 +157,8 @@ async def test_fresh_schema_matches_baseline_plus_migrations(conn):
     assert fresh["triggers"] == migrated["triggers"], (
         "schema.sql and baseline+migrations disagree on triggers or their backing "
         "function bodies -- a change was written to one and not the other"
+    )
+    assert fresh["constraints"] == migrated["constraints"], (
+        "schema.sql and baseline+migrations disagree on foreign key, primary key, "
+        "or unique constraints -- a change was written to one and not the other"
     )
