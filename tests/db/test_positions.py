@@ -466,3 +466,68 @@ async def test_a_trade_predating_the_column_still_reports_its_fills_instrument(
     )
     (position,) = await open_positions(conn, account_id)
     assert position.instrument_id == instrument_id
+
+
+async def test_a_trade_with_no_opening_fill_but_an_effective_instrument_still_resolves(
+    conn, account_with_1800
+):
+    """Pins the shape Task 3's spinoff-derived trades will have: opening_fill_id
+    NULL (a spinoff's opening allocation is a synthetic row in `derived_fill`,
+    which has no `fill` counterpart -- that is the entire reason `derived_fill`
+    exists), but opening_derived_fill_id AND effective_instrument_id both set.
+
+    This branch first gated db/positions.py's instrument join on
+    `t.opening_fill_id IS NOT NULL` alone, reasoning that opening_fill_id
+    nullity meant "orphaned, so unreachable." That gate would have made every
+    spinoff-derived position resolve no instrument and no symbol at all --
+    wrong for a trade that isn't orphaned, just fillless by construction. The
+    gate must accept EITHER opening column: opening_fill_id for a normal
+    trade, opening_derived_fill_id for a spinoff-derived one.
+
+    Task 3 does not exist yet, so a derived_fill row is constructed by hand
+    here purely to give opening_derived_fill_id (a real FK) something valid
+    to reference -- its content is not semantically a spinoff, only a row
+    the constraint will accept."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    action_id = await add_action(conn, _split(instrument_id))
+    fill_id = await conn.fetchval("SELECT id FROM fill WHERE account_id = $1", account_id)
+    derived_id = uuid4()
+    await conn.execute(
+        """
+        INSERT INTO derived_fill (
+            id, account_id, instrument_id, executed_at, side, quantity, price,
+            derived_from_fill_id, corporate_action_id
+        ) VALUES ($1, $2, $3, now(), 'buy', 1, 1, $4, $5)
+        """,
+        derived_id, account_id, instrument_id, fill_id, action_id,
+    )
+    await conn.execute(
+        "UPDATE trade SET opening_fill_id = NULL, opening_derived_fill_id = $2 "
+        "WHERE account_id = $1",
+        account_id, derived_id,
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+    assert position.symbol == "ZXCO"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_a_trade_with_both_openings_null_resolves_no_instrument(
+    conn, account_with_1800
+):
+    """The genuine orphan case, exactly what regroup_account's protection step
+    leaves behind: opening_fill_id AND effective_instrument_id both NULL. This
+    must stay unresolvable -- proving the previous test's resolution comes
+    specifically from effective_instrument_id being set, not from some other
+    leniency in the query."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await conn.execute(
+        "UPDATE trade SET opening_fill_id = NULL, effective_instrument_id = NULL "
+        "WHERE account_id = $1",
+        account_id,
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.unvaluable_reason is not None
+    assert position.quantity == Decimal(0)

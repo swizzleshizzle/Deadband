@@ -239,6 +239,13 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # opening_fill_id (so a future auto upsert can never collide with it) and
     # null every derived column (it owns zero fills now; leaving stale P&L on
     # it would double-count against whatever trade its fills now belong to).
+    # effective_instrument_id is one of those derived columns: it is written
+    # only from a live opening allocation's fill, so once opening_fill_id is
+    # freed there is no live fill left to have derived it from. Leaving it
+    # behind would let db/positions.py's COALESCE resolve a stale instrument
+    # for a trade that no longer has one -- the same "unreachable instrument
+    # must not look reachable" contract open_quantity/open_cost_basis are
+    # nulled here to uphold.
     # `status` is left as-is — it is NOT NULL and no longer meaningful once the
     # row is judgment-only, but there is no null-able substitute for it.
     # `is_estimated` is likewise NOT NULL DEFAULT FALSE, so NULL isn't an option
@@ -253,6 +260,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
            SET grouping_mode = 'manual',
                updated_at = now(),
                opening_fill_id = NULL,
+               effective_instrument_id = NULL,
                qty_opened = NULL, qty_closed = NULL,
                avg_entry = NULL, avg_exit = NULL,
                realized_pnl = NULL, gross_realized_pnl = NULL,

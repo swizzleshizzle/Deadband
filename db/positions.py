@@ -20,17 +20,27 @@ from ledger.types import Direction
 # symbol change or merger is visible: `fill` is never rewritten, so f.instrument_id
 # still names the instrument the position was opened in. It stays NULL for trades
 # written before the column existed, which is why the fallback is required rather
-# than merely tidy.
+# than merely tidy. It is also the ONLY place a spinoff-derived trade's instrument
+# comes from at all (Task 3) -- that trade has no opening_fill_id, so `fill` is
+# NULL and the fallback never fires; effective_instrument_id is not a correction
+# for it, it is its sole source.
 #
-# `AND t.opening_fill_id IS NOT NULL` gates the whole COALESCE, not just the
-# f.instrument_id fallback. effective_instrument_id has its own plain FK to
-# instrument -- unlike opening_fill_id, nothing nulls it when the opening fill
-# is deleted (schema.sql's trade_opening_fill_fk is ON DELETE SET NULL only on
-# opening_fill_id). Without this gate, a trade orphaned by a raw fill delete
-# (no protection pass, no regroup) would keep resolving through its now-stale
-# effective_instrument_id and look reachable again -- exactly the "real
-# quantity under an unreachable instrument" case open_quantity/open_cost_basis
-# below are already forced to None for.
+# An orphaned trade resolves no instrument primarily because
+# regroup_account's protection step nulls effective_instrument_id alongside
+# opening_fill_id (and every other derived column) the moment a trade loses
+# its opening fill -- see the comment above that UPDATE. But protection is
+# application code, not a schema constraint: a trade whose opening fill is
+# deleted directly (no protection pass, no regroup -- e.g. a future
+# delete-a-fill action) has opening_fill_id nulled by the FK's ON DELETE SET
+# NULL alone, and nothing at the database level nulls effective_instrument_id
+# to match (its own FK to instrument has no ON DELETE action). Gating on
+# `opening_fill_id IS NOT NULL` alone would fix that case but wrongly zero
+# out every spinoff-derived trade too, whose opening_fill_id is NULL by
+# construction (its opening allocation is a synthetic derived_fill row, not a
+# `fill` row) while its own opening_derived_fill_id IS set. Checking either
+# opening column distinguishes "has some live opening allocation" (a normal
+# or spinoff-derived trade) from "has neither" (a genuine orphan, protected
+# or not) without depending on protection having run.
 _SQL = """
     SELECT t.id,
            t.direction,
@@ -52,7 +62,8 @@ _SQL = """
       JOIN account a         ON a.id = t.account_id
       LEFT JOIN fill f       ON f.id = t.opening_fill_id
       LEFT JOIN instrument i ON i.id = COALESCE(t.effective_instrument_id, f.instrument_id)
-                             AND t.opening_fill_id IS NOT NULL
+                             AND (t.opening_fill_id IS NOT NULL
+                                  OR t.opening_derived_fill_id IS NOT NULL)
      WHERE t.status = 'open'
        AND ($1::uuid IS NULL OR t.account_id = $1)
 """
