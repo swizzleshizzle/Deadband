@@ -79,6 +79,7 @@ unamended in that document as the historical record.
 |---|---|
 | `db/migrations/003_derived_fills.sql` | **new** — `derived_fill`, three columns, two indexes, one PK rework |
 | `db/schema.sql` | modify: the same objects, so a fresh database matches a migrated one |
+| `db/corporate.py` | modify: promote `_fetch_actions_for_instruments` to a public `actions_with_ids_for_instruments` (§5.1a) |
 | `db/trades.py` | modify: `regroup_account` writes and reaps derived fills, routes allocations, records the effective instrument |
 | `db/positions.py` | modify: `open_positions` prefers the effective instrument |
 | `cli.py` | modify: drop the refusal for all three types, and the "unreachable" comments on the three guards PR #10 left stranded — they become live code again |
@@ -150,6 +151,24 @@ A composite PK cannot contain a nullable column, so this rework is forced rather
 chosen. It is the one destructive step in the migration and the reason `003` must be
 verified against a populated database, not only an empty one.
 
+### 4.4 Keeping `schema.sql` and the migration in step
+
+`migrate.apply()` re-runs `schema.sql` on every call before applying migrations, so
+both files must describe the same end state and both must be idempotent —
+`tests/db/test_schema_equivalence.py` builds a fresh database and a migrated one in
+separate namespaces and fails if they disagree. Migration `002` is the pattern to
+follow: `DROP CONSTRAINT IF EXISTS` before every `ADD CONSTRAINT`, `ADD COLUMN IF NOT
+EXISTS`, `CREATE INDEX IF NOT EXISTS`.
+
+One ordering wrinkle: `derived_fill` references `corporate_action`, which `schema.sql`
+declares *after* `trade` and `trade_fill`. Rather than reorder existing table
+definitions, declare `derived_fill` after `corporate_action` and attach the two
+referring foreign keys (`trade.opening_derived_fill_id`, `trade_fill.derived_fill_id`)
+as `ALTER TABLE ... ADD CONSTRAINT` statements below it. That leaves the existing
+creation order untouched and makes `schema.sql`'s new text and migration `003`'s
+nearly identical, which is what keeps the equivalence test honest rather than merely
+green.
+
 ---
 
 ## 5. The regroup lifecycle
@@ -167,6 +186,37 @@ preserve the fill's id; only spinoff mints one.
 **This is an implicit invariant and must be pinned by a test** that fails loudly if a
 future action type starts minting ids — otherwise new synthetic fills would be silently
 mis-filed as real and hit the same foreign-key violation this branch exists to remove.
+
+### 5.1a Recovering provenance
+
+`adjust_fills` returns bare `Fill`s. It does not report which action produced a
+synthetic child, yet `derived_fill.derived_from_fill_id` and `corporate_action_id` are
+`NOT NULL`. The link is recovered by **inverting the id function**, not by re-deriving
+which fills were eligible:
+
+```
+_spinoff_fill_id(parent, action)
+    = uuid5(NS, f"{parent}:{action.resulting_instrument_id}:{action.ex_date}")
+```
+
+Build a lookup by computing that value for every (pre-adjustment fill id × stored
+spinoff action) pair — a handful of hashes — and index the derived fills against it.
+
+This distinction is the whole point: enumerating a hash cannot drift from
+`adjust_fills`, whereas re-deciding *which* fills a spinoff applies to would duplicate
+`_ordered_actions`' ordering and ex-date rules in a second place and silently disagree
+the first time either changes. A derived fill that matches no pair is a bug, not a
+row to insert with NULLs — regroup must raise rather than guess.
+
+`_spinoff_fill_id` is private to `ledger/corporate.py`. `db/trades.py` imports it
+directly, with a comment saying why; `ledger/` is still not modified, and the purity
+test only forbids the reverse direction.
+
+Recovering the action's **database id** needs one new accessor: `actions_for_instruments`
+returns the pure dataclass with no id. `db/corporate.py` already has a private
+`_fetch_actions_for_instruments` returning `(UUID, CorporateAction)` pairs; this branch
+promotes it to a public `actions_with_ids_for_instruments`, leaving
+`actions_for_instruments` untouched for its existing callers.
 
 ### 5.2 Write order, forced by the foreign keys
 
@@ -255,6 +305,9 @@ fill and needs no change.
   agree.
 - **The id-minting invariant** (§5.1): a test that fails if any non-spinoff action
   produces a fill id absent from the input set.
+- **Provenance is recovered, not guessed** (§5.1a): a spinoff's `derived_fill` row
+  points at the right parent fill and the right `corporate_action` row. Two spinoffs on
+  the same instrument with different ex-dates must not cross-attribute.
 - **Migration `003` against a populated database**, not only an empty one — the
   `trade_fill` primary-key rework is the only destructive step and the only one that can
   fail on real rows.
