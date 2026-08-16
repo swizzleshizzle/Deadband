@@ -120,6 +120,19 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # hold only PART of a zero-crossing fill, so excluding the fill whole would
     # strand -- and then reap -- the remainder. Reduce the available quantity
     # instead, and let the pure grouper allocate what is left.
+    #
+    # `tf.fill_id IS NOT NULL` is not defensive tidying. Since this branch,
+    # trade_fill rows come in two kinds -- one carries fill_id, the other
+    # derived_fill_id, and trade_fill_one_source_chk guarantees exactly one is
+    # set. Without the filter, a manual trade holding derived allocations
+    # groups them all under the key NULL and produces a `manual_held[None]`
+    # entry, which no fill's id can ever match: the derived quantity would be
+    # reserved against nothing, the derived fill regenerated in full below, and
+    # allocated a second time. UNREACHABLE TODAY -- manual grouping has no db/
+    # entry point at all, so nothing can create a manual trade that owns a
+    # derived allocation -- but this branch is what made the shape
+    # representable, and this is the function the repo treats as most
+    # load-bearing.
     manual_held: dict[UUID, Decimal] = {
         r["fill_id"]: r["held"]
         for r in await conn.fetch(
@@ -127,6 +140,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                  FROM trade_fill tf
                  JOIN trade t ON t.id = tf.trade_id
                 WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
+                  AND tf.fill_id IS NOT NULL
              GROUP BY tf.fill_id""",
             account_id,
         )
@@ -200,12 +214,23 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # regroup_account runs on every `import --commit`. The round bound makes it
     # terminate; only stopping early makes it affordable.
     #
-    # Stopping early is semantics-preserving: the map is monotone across rounds
-    # and each child has a unique (parent, action) preimage, so any id that IS
-    # looked up resolves to the same pair it would have under a full expansion --
-    # what a later round would add is exactly the entries nothing asks for. Real,
-    # unchained spinoffs finish in one round at R*n; a genuine depth-2 chain pays
-    # R*(n+1)^2. The guard below still fires once the budget is spent.
+    # Stopping early is semantics-preserving, and the argument rests on
+    # MONOTONICITY ALONE -- deliberately not on the preimage being unique, which
+    # gap #41 records as FALSE: _spinoff_fill_id hashes (parent, resulting
+    # instrument, ex-date) and not the source instrument, so two spinoff actions
+    # differing only in their source mint the same child id for a given parent.
+    # The argument that survives that: the map only ever grows (`if child_id in
+    # derived_provenance: continue` means no round ever rewrites an entry an
+    # earlier round wrote), and the enumeration order within a round is fixed by
+    # actions_with_ids_for_instruments' ORDER BY, so first-writer-wins picks the
+    # same action whether we stop here or expand fully. Any id that IS looked up
+    # therefore resolves to exactly the pair a full expansion would have given
+    # it; what a later round would add is exactly the entries nothing asks for.
+    # (Whether first-writer-wins picks the RIGHT action when the hash collides is
+    # gap #41's question, not this early exit's -- stopping early cannot change
+    # the answer either way.) Real, unchained spinoffs finish in one round at
+    # R*n; a genuine depth-2 chain pays R*(n+1)^2. The guard below still fires
+    # once the budget is spent.
     #
     # The candidates must be the closure and not just real_ids: a spinoff whose
     # source instrument is another spinoff's resulting instrument applies to the
@@ -267,10 +292,27 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 (id, account_id, instrument_id, executed_at, side, quantity, price,
                  fee, is_estimated, derived_from_fill_id, corporate_action_id)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            -- Every column the INSERT supplies is refreshed, not just the three
+            -- a spinoff visibly moves. The narrower list was safe only because
+            -- ledger/corporate.py's spinoff branch happens to derive the others
+            -- from fields the uuid5 id already pins; the day that derivation
+            -- changes (a fee convention on the child, a different executed_at,
+            -- is_estimated turning off), a live row would keep its stale value
+            -- forever while a freshly-created one got the new one -- two
+            -- meanings in one column, with no error. `id` is excluded because
+            -- it is the conflict target and `account_id` because it is part of
+            -- the row's identity via derived_fill_id_account_uniq; neither can
+            -- change without minting a different row.
             ON CONFLICT (id) DO UPDATE SET
-                instrument_id = EXCLUDED.instrument_id,
-                quantity      = EXCLUDED.quantity,
-                price         = EXCLUDED.price
+                instrument_id        = EXCLUDED.instrument_id,
+                executed_at          = EXCLUDED.executed_at,
+                side                 = EXCLUDED.side,
+                quantity             = EXCLUDED.quantity,
+                price                = EXCLUDED.price,
+                fee                  = EXCLUDED.fee,
+                is_estimated         = EXCLUDED.is_estimated,
+                derived_from_fill_id = EXCLUDED.derived_from_fill_id,
+                corporate_action_id  = EXCLUDED.corporate_action_id
             """,
             d.id,
             account_id,

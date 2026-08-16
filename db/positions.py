@@ -18,9 +18,16 @@ from ledger.types import Direction
 # The COALESCE below is not a defensive default. effective_instrument_id is
 # written by regroup_account from the ADJUSTED fill, so it is the only place a
 # symbol change or merger is visible: `fill` is never rewritten, so f.instrument_id
-# still names the instrument the position was opened in. It stays NULL for trades
-# written before the column existed, which is why the fallback is required rather
-# than merely tidy. It is also the ONLY place a spinoff-derived trade's instrument
+# still names the instrument the position was opened in.
+#
+# WHEN IT IS NULL, precisely: only for a trade written before the column existed
+# (the migration adds it nullable and backfills nothing) or for one whose derived
+# columns were nulled by regroup_account's protection step. It is NOT "NULL means
+# no identity-changing action applies" -- regroup_account writes it for EVERY
+# trade it groups, including split-only and action-free ones, where it simply
+# repeats the raw instrument. So the fallback below is a compatibility path for
+# unregrouped history, not the normal case; one regroup per account retires it.
+# It is also the ONLY place a spinoff-derived trade's instrument
 # comes from at all (Task 3) -- that trade has no opening_fill_id, so `fill` is
 # NULL and the fallback never fires; effective_instrument_id is not a correction
 # for it, it is its sole source.

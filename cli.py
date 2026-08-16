@@ -1351,6 +1351,15 @@ def _print_effect(headline: str, preview: EffectPreview) -> None:
             f"    {_fmt_decimal(before.quantity)} @ {_fmt_decimal(before.price)}"
             f"  ->  {_fmt_decimal(after.quantity)} @ {_fmt_decimal(after.price)}"
         )
+    # A minted fill has no "before" half, so it cannot ride in the arrow form
+    # above. Rendered on its own line rather than as "-- -> qty @ price": a
+    # spinoff's child is the new POSITION the action creates, which is the most
+    # visible thing about it, and the preview said nothing about it at all until
+    # this line existed. The resulting symbol is not repeated here -- it is
+    # already on the command line the user just typed, and preview_effect deals
+    # in instrument ids, not symbols.
+    for fill in preview.created:
+        print(f"    new: {_fmt_decimal(fill.quantity)} @ {_fmt_decimal(fill.price)}")
 
 
 async def _regroup_holders(conn, instrument_id: UUID) -> int:

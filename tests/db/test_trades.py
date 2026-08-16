@@ -1483,6 +1483,42 @@ async def test_two_spinoffs_are_not_cross_attributed(conn, account_with_1800, zx
     }
 
 
+async def test_two_spinoffs_differing_only_in_ex_date_are_not_cross_attributed(
+    conn, account_with_1800, zxcb
+):
+    """Spec §8 asks specifically for two spinoffs with different EX-DATES. The
+    test above varies the resulting instrument and the ex-date together, so it
+    cannot isolate either: a `_spinoff_fill_id` that had dropped `ex_date` from
+    its hash entirely would still mint two distinct ids there, because the
+    resulting instruments differ. This case holds the resulting instrument fixed
+    (both spin off ZXCB) so the ex-date is the ONLY thing separating the two
+    actions, and therefore the only thing that can separate their children.
+
+    The input that would make this fail: removing `action.ex_date` from
+    `_spinoff_fill_id`'s hashed string (ledger/corporate.py). Both actions then
+    mint the same id for the same parent. Run against that mutant, this reddens
+    before it reaches an assertion at all -- regroup_account raises
+    `UniqueViolationError ... "trade_fill_derived_uniq"`, because the one trade
+    ends up with two allocations naming the same derived fill. Verified, and
+    recorded here rather than the len == 2 the assertions read as, so the next
+    reader is not surprised by the shape of the failure.
+    """
+    account_id, instrument_id = account_with_1800
+    first = await add_action(conn, _spinoff(instrument_id, zxcb))
+    second = await add_action(
+        conn, _spinoff(instrument_id, zxcb, ex_date=date(2026, 4, 2))
+    )
+    await regroup_account(conn, account_id)
+    rows = await conn.fetch(
+        "SELECT id, instrument_id, corporate_action_id FROM derived_fill WHERE account_id = $1",
+        account_id,
+    )
+    assert len(rows) == 2
+    assert len({r["id"] for r in rows}) == 2
+    assert {r["instrument_id"] for r in rows} == {zxcb}
+    assert {r["corporate_action_id"] for r in rows} == {first, second}
+
+
 async def test_the_spun_off_shares_can_be_sold(conn, account_with_1800, zxcb):
     """D6: a view cannot be closed. A real SELL on the resulting instrument has
     to find a real opening trade to close against."""

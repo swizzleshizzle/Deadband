@@ -24,7 +24,7 @@ from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
-from tests.db.conftest import _split
+from tests.db.conftest import _split, _symbol_change
 
 pytestmark = requires_db
 
@@ -3111,6 +3111,97 @@ async def test_corporate_add_commits_a_spinoff(conn, account_with_1800, zxcb, mo
     assert positions.keys() == {"ZXCO", "ZXCB"}
     assert positions["ZXCO"].quantity == Decimal(1800)
     assert positions["ZXCB"].quantity == Decimal(180)
+
+
+async def test_a_mark_on_the_new_symbol_prices_the_position_after_a_symbol_change(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """Spec §8, and Half A's whole user-visible payoff. Marks are looked up by
+    `position.instrument_id`, which since this branch comes from
+    `COALESCE(t.effective_instrument_id, f.instrument_id)` (db/positions.py) --
+    so a mark set on the instrument the position moved TO is what prices it.
+    That was sound by inspection and asserted nowhere.
+
+    A mark is deliberately set on BOTH instruments, at different prices. A test
+    that marked only ZXCB could not tell "priced by the new symbol" from "priced
+    by whatever mark happens to exist"; with both set, the unrealized figure
+    names which one was used.
+
+    The inputs that would make this fail:
+      * dropping the COALESCE, so the position resolves back to ZXCO -- the row
+        then prints 1674.00 (the ZXCO mark) instead of 702.00;
+      * dropping `effective_instrument_id` from the trade upsert's DO UPDATE SET
+        or its INSERT column list -- the position resolves to ZXCO the same way;
+      * `latest_marks` keyed on the opening fill's instrument rather than the
+        position's -- same 1674.00.
+    """
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    now = datetime.now(UTC)
+    await set_mark(conn, zxcb, Decimal("0.44"), now)
+    # The decoy: a mark on the instrument the position is no longer reported
+    # under. Nothing must reach for it.
+    await set_mark(conn, instrument_id, Decimal("0.98"), now)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(account_id)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+
+    assert "ZXCB" in out
+    assert "ZXCO" not in out
+    # The mark column carries the price and its date, so an unpriced row would
+    # render "--" here instead.
+    assert "0.44 @" in out
+    assert "702.00" in out    # (0.44 - 0.05) * 1800 * 1
+    assert "1674.00" not in out  # what the ZXCO decoy mark would have produced
+
+
+async def test_trades_and_positions_agree_on_the_symbol_after_a_symbol_change(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """Spec §8. The two commands read different columns for the same fact:
+    `deadband trades` prints `trade.primary_underlying`, written by
+    regroup_account from the ADJUSTED fill's instrument, while `deadband
+    positions` prints `instrument.symbol` resolved through
+    `COALESCE(t.effective_instrument_id, f.instrument_id)`. Before this branch
+    those disagreed after a symbol change -- trades said ZXCB, positions said
+    ZXCO -- which is the exact split gap #38 recorded.
+
+    Compares the two rendered symbol fields to each OTHER, not each to a
+    hardcoded "ZXCB" separately: two independent assertions can both be edited
+    to a new expected value and stay green while the commands disagree. This
+    one cannot pass unless they match.
+
+    The input that would make it fail: reverting db/positions.py's COALESCE to
+    `f.instrument_id`. `trades` still prints ZXCB (primary_underlying comes from
+    the adjusted fill), `positions` prints ZXCO, and the equality below breaks.
+    """
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    assert await cli.cmd_trades(argparse.Namespace(account=str(account_id))) == 0
+    trades_out = capsys.readouterr().out
+    assert await cli.cmd_positions(_positions_args(account=str(account_id))) == 0
+    positions_out = capsys.readouterr().out
+
+    # One fill, so exactly one row from each command. `trades` renders
+    # "<date>  <symbol> <direction> ...", `positions` renders
+    # "<symbol> <account> ...".
+    (trades_row,) = trades_out.splitlines()
+    (positions_row,) = positions_out.splitlines()
+    assert trades_row.split()[1] == positions_row.split()[0] == "ZXCB"
 
 
 async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(

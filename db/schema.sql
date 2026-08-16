@@ -156,6 +156,32 @@ CREATE TABLE IF NOT EXISTS trade (
         CHECK (opening_fill_id IS NULL OR opening_derived_fill_id IS NULL)
 );
 
+-- UPGRADE PATH, NOT REDUNDANT WITH THE INLINE DECLARATIONS ABOVE. DO NOT DELETE.
+--
+-- migrate.apply() runs THIS FILE FIRST and the migrations afterwards (db/migrate.py).
+-- On an existing database `CREATE TABLE IF NOT EXISTS trade` above is skipped whole,
+-- so the two columns declared inside it never appear -- and trade_opening_derived_uniq,
+-- four statements below, indexes one of them. Without these two ALTERs that index
+-- raises `column "opening_derived_fill_id" does not exist`, asyncpg's implicit
+-- transaction rolls the whole file back, and apply() dies BEFORE migration 003 -- the
+-- only thing that would have added the columns -- ever runs. A fresh database is
+-- unaffected, which is why nothing caught it: these are no-ops there.
+--
+-- They add the columns ONLY, and nothing else about them. Everything a pre-003 table
+-- is still missing is supplied afterwards: the named foreign keys by the ALTER ...
+-- ADD CONSTRAINT block at the end of this file (and, identically, by 003), and
+-- trade_one_opening_chk, trade_fill_one_source_chk and trade_fill's surrogate primary
+-- key by migration 003 alone, since those exist here only inline inside a CREATE TABLE
+-- that an existing database skips. This is the minimum that lets the rest of this file
+-- run against a pre-003 table, not a second copy of the migration.
+--
+-- Placement is load-bearing: each ALTER must precede the FIRST statement in this file
+-- that names its column -- for `trade` the indexes immediately below, for `trade_fill`
+-- trade_fill_derived_uniq further down. NOT the ADD CONSTRAINT block near the end of
+-- the file, which is only reached long after both of those indexes have already run.
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS effective_instrument_id UUID;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS opening_derived_fill_id UUID;
+
 CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
 CREATE INDEX IF NOT EXISTS trade_opened_at_idx ON trade (opened_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_fill_uniq
@@ -188,6 +214,14 @@ CREATE TABLE IF NOT EXISTS trade_fill (
     -- after derived_fill exists) attaches the second half of this pairing.
     CONSTRAINT trade_fill_one_source_chk CHECK (num_nonnulls(fill_id, derived_fill_id) = 1)
 );
+
+-- UPGRADE PATH, NOT REDUNDANT WITH THE INLINE DECLARATION ABOVE. DO NOT DELETE.
+-- Same reason as the pair above `trade_account_status_idx`: on an existing database
+-- the CREATE TABLE is skipped, and trade_fill_derived_uniq just below indexes this
+-- column. Migration 003 still supplies the surrogate `id`, the primary key rework and
+-- trade_fill_one_source_chk; trade_fill_derived_fk is attached by the ADD CONSTRAINT
+-- block at the end of this file as well as by 003.
+ALTER TABLE trade_fill ADD COLUMN IF NOT EXISTS derived_fill_id UUID;
 
 CREATE INDEX IF NOT EXISTS trade_fill_fill_idx ON trade_fill (fill_id);
 CREATE UNIQUE INDEX IF NOT EXISTS trade_fill_real_uniq

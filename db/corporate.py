@@ -27,6 +27,11 @@ class EffectPreview:
     # (before, after) pairs, capped -- the preview is for a human deciding
     # whether the ratio is right, not an audit log.
     samples: tuple[tuple[Fill, Fill], ...]
+    # Fills the proposed action would MINT, which by definition have no
+    # `before` half and so cannot ride in `samples`. Today only a spinoff
+    # produces these (`ledger.corporate.adjust_fills` is the authority on
+    # which types may mint an id). Same cap, same purpose.
+    created: tuple[Fill, ...] = ()
 
 
 _SAMPLE_CAP = 3
@@ -192,6 +197,7 @@ async def preview_effect(
     accounts = 0
     changed = 0
     samples: list[tuple[Fill, Fill]] = []
+    created: list[Fill] = []
     for account_id in account_ids:
         fills = await fetch_fills(conn, account_id)
         before = {f.id: f for f in adjust_fills(fills, stored)}
@@ -203,8 +209,26 @@ async def preview_effect(
                 touched += 1
                 if len(samples) < _SAMPLE_CAP and a is not None:
                     samples.append((b, a))
+        # The other direction, and it is not symmetry for its own sake. The loop
+        # above iterates `before` and looks each id up in `after`, so it can see
+        # a fill that DISAPPEARS (`a is None`) but never one that APPEARS. A
+        # spinoff mints a child fill for the resulting instrument -- present only
+        # in `after` -- so previewing `corporate add --type spinoff` reported the
+        # parent's basis reduction and said nothing at all about the new position
+        # it was about to create. Given that `add` previews by default, that is a
+        # preview omitting the most visible thing the action does.
+        for fill_id, a in after.items():
+            if fill_id not in before:
+                touched += 1
+                if len(created) < _SAMPLE_CAP:
+                    created.append(a)
         if touched:
             accounts += 1
             changed += touched
 
-    return EffectPreview(accounts=accounts, fills_changed=changed, samples=tuple(samples))
+    return EffectPreview(
+        accounts=accounts,
+        fills_changed=changed,
+        samples=tuple(samples),
+        created=tuple(created),
+    )
