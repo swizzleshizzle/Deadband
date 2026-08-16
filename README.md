@@ -169,7 +169,7 @@ looking plausible.
 `corporate list` optionally filters with `--symbol` and prints, per action, the id
 `remove` needs, its ex-date, symbol, type, ratio, resulting symbol (if any), and basis
 allocation (if any) — but nothing about a derived position it produced; see the gaps
-below. See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–42) for what this branch
+below. See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–41) for what this branch
 leaves open: corporate actions still can't be *imported* from a venue export, manual
 trades aren't split-adjusted, merger cash isn't modelled (and is now reachable in
 practice, since `merger` is no longer refused), there's no audit trail on a restatement,
