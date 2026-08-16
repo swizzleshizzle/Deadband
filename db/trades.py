@@ -169,23 +169,58 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             conn, list({f.instrument_id for f in fills})
         )
         if pairs:
-            # Invert _spinoff_fill_id over (parent x spinoff action): a handful of
-            # hashes, giving every id a spinoff COULD mint and the (parent, action)
-            # it would have come from. adjust_fills returns bare Fills with no link
+            # Invert _spinoff_fill_id over (candidate parent x spinoff action): a
+            # handful of hashes, giving every id a spinoff COULD mint and the
+            # (root real fill, action) it would have come from -- see the note on
+            # the root below. adjust_fills returns bare Fills with no link
             # back to the action that produced them, and derived_fill's two
             # provenance columns are NOT NULL. Enumerating a hash cannot drift from
             # adjust_fills; re-deciding WHICH fills a spinoff applies to would
             # duplicate _ordered_actions' ordering and ex-date rules in a second
             # place and silently disagree the first time either changes. See the
             # design's section 5.1a.
-            for action_id, action in pairs:
-                if action.action_type is not ActionType.SPINOFF:
-                    continue
-                for parent_id in real_ids:
-                    derived_provenance[_spinoff_fill_id(parent_id, action)] = (
-                        parent_id,
-                        action_id,
-                    )
+            #
+            # The candidate parents are the CLOSURE of the fetched ids under the
+            # spinoff actions, not the fetched ids alone: a spinoff whose source
+            # instrument is another spinoff's resulting instrument applies to the
+            # first one's synthetic child, and seeding with real_ids only would
+            # leave that grandchild inverting to nothing -- which raised
+            # UnattributableDerivedFillError for the whole account, on every
+            # regroup, exactly the wedge this branch exists to remove.
+            #
+            # The round bound is what makes this terminate. _ordered_actions
+            # applies each action at most once per lineage, so no real chain can
+            # be deeper than the number of spinoff actions; without the bound the
+            # closure would keep hashing its own output forever, since applying an
+            # action to its own child yields a fresh id every time.
+            #
+            # What is recorded as the parent is the lineage ROOT -- the real fill
+            # the chain started from -- not the immediate parent. For a one-step
+            # spinoff those are the same id. For a chain they are not, and the
+            # root is the only one that can be stored: derived_fill.
+            # derived_from_fill_id references fill(id), and an intermediate
+            # derived fill has no `fill` row (verified: the immediate parent
+            # raises ForeignKeyViolationError on derived_fill_derived_from_fill_id_fkey).
+            # Nothing is lost that cannot be reconstructed -- corporate_action_id
+            # names the exact action, and the stored action set gives every
+            # intermediate step. Recovering the immediate parent directly would
+            # need a derived_from_derived_fill_id column; recorded as a gap.
+            spinoffs = [(aid, a) for aid, a in pairs if a.action_type is ActionType.SPINOFF]
+            candidates = set(real_ids)
+            roots: dict[UUID, UUID] = {fill_id: fill_id for fill_id in real_ids}
+            for _round in range(len(spinoffs)):
+                minted: set[UUID] = set()
+                for action_id, action in spinoffs:
+                    for parent_id in candidates:
+                        child_id = _spinoff_fill_id(parent_id, action)
+                        if child_id in derived_provenance:
+                            continue
+                        derived_provenance[child_id] = (roots[parent_id], action_id)
+                        roots[child_id] = roots[parent_id]
+                        minted.add(child_id)
+                if not minted:
+                    break
+                candidates |= minted
             fills = adjust_fills(fills, [a for _id, a in pairs])
 
     derived = [f for f in fills if f.id not in real_ids]
@@ -203,7 +238,12 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             # adjust_fills minted an id we do not model, and inserting it with
             # NULL provenance would bury that.
             raise UnattributableDerivedFillError(d.id)
-        parent_id, action_id = provenance
+        # `root_fill_id`, not `parent_id`: derived_from_fill_id holds the REAL
+        # fill the lineage started from. For a one-step spinoff that is the
+        # immediate parent; for a chained one it is the grandparent, because the
+        # immediate parent is itself a derived_fill row and this column
+        # references fill(id). See the closure above.
+        root_fill_id, action_id = provenance
         await conn.execute(
             """
             INSERT INTO derived_fill
@@ -224,7 +264,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             d.price,
             d.fee,
             d.is_estimated,
-            parent_id,
+            root_fill_id,
             action_id,
         )
 

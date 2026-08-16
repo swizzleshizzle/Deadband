@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
@@ -11,7 +12,7 @@ from db.fills import fetch_fills, insert_fills
 from db.instruments import upsert_instrument
 from db.positions import open_positions
 from db.trades import UnattributableDerivedFillError, list_trades, regroup_account
-from ledger.corporate import adjust_fills
+from ledger.corporate import _spinoff_fill_id, adjust_fills
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
@@ -1307,26 +1308,94 @@ async def test_the_derived_fill_records_its_parent_and_its_action(
     assert row["instrument_id"] == zxcb
 
 
-async def test_a_spinoff_off_a_spun_off_child_is_refused_not_guessed(
+async def test_a_synthetic_fill_that_inverts_to_nothing_is_refused(
+    conn, account_with_1800, zxcb, monkeypatch
+):
+    """PINS THE GUARD'S BEHAVIOUR, NOT A REACHABLE PATH. Under the provenance
+    closure I could construct no input reaching this branch through
+    regroup_account: every id adjust_fills can mint comes from a (candidate
+    parent, stored spinoff) pair, and the closure enumerates all of them within
+    its round bound. The trigger below is therefore fabricated, deliberately and
+    visibly.
+
+    The guard still earns its keep, and section 5.1a mandates it: its real job is
+    a sixth action type that starts minting ids the closure does not model. Left
+    uncovered, the day that action type lands is the day derived rows start
+    carrying NULL provenance instead of raising."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    real_adjust_fills = adjust_fills
+
+    def _also_mints_an_unmodelled_id(fills, actions):
+        adjusted = real_adjust_fills(fills, actions)
+        return [*adjusted, replace(adjusted[0], id=uuid4())]
+
+    monkeypatch.setattr("db.trades.adjust_fills", _also_mints_an_unmodelled_id)
+    with pytest.raises(UnattributableDerivedFillError):
+        await regroup_account(conn, account_id)
+
+
+async def test_a_spinoff_off_a_spun_off_child_is_attributed_to_the_lineage_root(
     conn, account_with_1800, zxcb, zxcc
 ):
-    """The provenance map is built over the fills that were FETCHED, so a
-    spinoff whose parent is itself a synthetic child inverts to nothing. That
-    state is reachable -- holding ZXCB directly pulls the ZXCB spinoff into this
-    account's action set, and it then applies to the ZXCO->ZXCB child as well as
-    to the real ZXCB fill -- and it is a bug, not a row to insert with NULLs:
-    derived_from_fill_id references `fill`, which the child is not in. Refusing
-    by name beats a foreign-key violation, and beats silently attributing the
-    grandchild to whichever action happened to be first."""
+    """A spinoff whose source instrument is another spinoff's resulting
+    instrument applies to the first one's synthetic child, so the provenance map
+    must be the closure of the fetched ids under the spinoff actions rather than
+    the fetched ids alone. Reachable: holding ZXCB directly is what pulls the
+    ZXCB spinoff into this account's action set, and it then applies to the
+    ZXCO->ZXCB child as well as to the real ZXCB fill. Seeded with real_ids
+    only, the grandchild inverts to nothing and the WHOLE ACCOUNT fails to
+    regroup, on every run.
+
+    The grandchild's immediate parent is the first child's synthetic id -- a
+    derived_fill row, with no `fill` row behind it -- and
+    derived_fill.derived_from_fill_id references fill(id). So what is stored is
+    the lineage ROOT: the real ZXCO fill the chain started from. Verified that
+    the immediate parent is not merely undesirable but unstorable: it raises
+    ForeignKeyViolationError on derived_fill_derived_from_fill_id_fkey."""
     account_id, instrument_id = account_with_1800
     await insert_fills(
         conn,
         [_fill(account_id, zxcb, side=Side.BUY, quantity="10", price="2.00", ref="zxcb-buy")],
     )
-    await add_action(conn, _spinoff(instrument_id, zxcb))
-    await add_action(conn, _spinoff(zxcb, zxcc, ex_date=date(2026, 4, 2)))
-    with pytest.raises(UnattributableDerivedFillError):
-        await regroup_account(conn, account_id)
+    fills = {f.instrument_id: f.id for f in await fetch_fills(conn, account_id)}
+    first = await add_action(conn, _spinoff(instrument_id, zxcb))
+    second = await add_action(conn, _spinoff(zxcb, zxcc, ex_date=date(2026, 4, 2)))
+    intermediate = _spinoff_fill_id(fills[instrument_id], _spinoff(instrument_id, zxcb))
+
+    await regroup_account(conn, account_id)
+
+    rows = {
+        r["id"]: r
+        for r in await conn.fetch(
+            "SELECT id, instrument_id, derived_from_fill_id, corporate_action_id "
+            "  FROM derived_fill WHERE account_id = $1",
+            account_id,
+        )
+    }
+    assert {
+        (r["instrument_id"], r["derived_from_fill_id"], r["corporate_action_id"])
+        for r in rows.values()
+    } == {
+        (zxcb, fills[instrument_id], first),  # ZXCO -> ZXCB
+        (zxcc, fills[zxcb], second),  # the real ZXCB holding -> ZXCC
+        (zxcc, fills[instrument_id], second),  # the spun-off ZXCB child -> ZXCC
+    }
+
+    # The ruling, asserted head-on rather than left to fall out of the set above:
+    # the grandchild's recorded parent is the ROOT real fill, and specifically NOT
+    # the intermediate derived fill whose hash actually minted it.
+    grandchild = rows[
+        _spinoff_fill_id(intermediate, _spinoff(zxcb, zxcc, ex_date=date(2026, 4, 2)))
+    ]
+    assert grandchild["derived_from_fill_id"] == fills[instrument_id]
+    assert grandchild["derived_from_fill_id"] != intermediate
+    assert grandchild["corporate_action_id"] == second
+
+    # And the chain reaches the ledger: 1800 ZXCO spins off 180 ZXCB, which joins
+    # the 10 held directly, and 1/10th of those 190 spins off again as ZXCC.
+    positions = {p.instrument_id: p.quantity for p in await open_positions(conn, account_id)}
+    assert positions[zxcc] == Decimal(19)
 
 
 async def test_two_spinoffs_are_not_cross_attributed(conn, account_with_1800, zxcb, zxcc):
