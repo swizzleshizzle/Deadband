@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -14,6 +15,7 @@ import pytest_asyncio
 
 import cli
 from db.accounts import create_account
+from db.corporate import add_action, list_actions
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, set_mark
@@ -22,6 +24,7 @@ from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _split
 
 pytestmark = requires_db
 
@@ -2838,3 +2841,606 @@ async def test_reconcile_refuses_an_unparseable_as_of(conn, monkeypatch, capsys)
     err = capsys.readouterr().err.lower()
     assert "not a valid date or timestamp" in err
     assert "not-a-date" in err
+
+
+# --- `deadband corporate` (spec 2026-08-15, §5-§6) -------------------------
+# The engine (ledger/corporate.py's adjust_fills) and the storage layer
+# (db/corporate.py) are both already tested. What is new here is the WIRING:
+# that a stored action reaches adjust_fills and that its result reaches the
+# materialised `trade` rows positions are read from. `_split` and
+# `account_with_1800` come from tests/db/conftest.py rather than being
+# redefined here -- the fixture's single BUY of 1800 is executed 2026-02-01,
+# deliberately BEFORE the 2026-03-02 ex-date these tests use, so the split
+# actually applies to it.
+
+
+def _corporate_args(**kw):
+    """Same hand-built argparse.Namespace pattern as `_args` (marks) and
+    `_snapshot_args` (snapshots) above, named distinctly from both so it cannot
+    silently widen either.
+
+    Every flag the three `corporate` subparsers register is present, defaulted
+    the way argparse would default it, so a handler reading a flag this call
+    didn't pass sees the parser's own default rather than an AttributeError the
+    real CLI could never produce. An unrecognised keyword is a hard error
+    instead of a silently-added attribute: a typo'd `ex_date=` would otherwise
+    leave the real flag at None and the test would pass for the wrong reason.
+    """
+    defaults = {
+        "type": None,
+        "symbol": None,
+        "ex_date": None,
+        "ratio": None,
+        "resulting_symbol": None,
+        "basis_allocation": None,
+        "note": None,
+        "id": None,
+        "commit": False,
+    }
+    unknown = set(kw) - set(defaults)
+    if unknown:
+        raise TypeError(f"no such corporate flag(s): {', '.join(sorted(unknown))}")
+    return argparse.Namespace(**{**defaults, **kw})
+
+
+async def test_corporate_add_previews_without_writing(conn, account_with_1800, monkeypatch, capsys):
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=False
+        )
+    )
+    assert rc == 0
+    assert await list_actions(conn, instrument_id) == []
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    # The adjusted quantity, not just a row count: a preview that prints "1
+    # fill affected" without saying what it becomes cannot catch an inverted
+    # ratio, which is the mistake the spec singles out.
+    assert "300" in out
+
+
+async def test_corporate_add_commits_and_regroups(conn, account_with_1800, monkeypatch):
+    """Positions come from materialised trade rows, so an add that does not
+    regroup leaves them silently stale."""
+    account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 0
+    assert len(await list_actions(conn, instrument_id)) == 1
+    (position,) = await open_positions(conn, account_id)
+    # 1800 * 1/6. An inverted --ratio would make this 10800 and every
+    # individual step would still look plausible.
+    assert position.quantity == Decimal(300)
+
+
+async def test_corporate_add_refuses_a_duplicate_without_writing(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """The same 1:6 split entered twice is a 1:36 restatement that looks
+    plausible at every individual step."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = _corporate_args(
+        type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+    )
+    assert await cli.cmd_corporate_add(args) == 0
+    assert await cli.cmd_corporate_add(args) == 2
+    assert len(await list_actions(conn, instrument_id)) == 1
+    assert "already" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize(
+    ("action_type", "extra_flags"),
+    [
+        ("merger", {"resulting_symbol": "ZXCB"}),
+        ("spinoff", {"resulting_symbol": "ZXCB", "basis_allocation": "0.25"}),
+        ("symbol_change", {"resulting_symbol": "ZXCB"}),
+    ],
+)
+async def test_corporate_add_refuses_an_identity_changing_type(
+    conn, account_with_1800, monkeypatch, capsys, action_type, extra_flags
+):
+    """The three types that change WHICH INSTRUMENT a fill belongs to are
+    refused outright (docs/known-gaps.md gap #39). `ledger/corporate.py` derives
+    all five correctly; the ledger cannot materialise these three, because
+    adjustments are derived at read time over a `fill` table that is never
+    rewritten:
+
+      * `db/positions.py` reads a position's instrument from the RAW opening
+        fill while `db/trades.py` writes primary_underlying from the ADJUSTED
+        one, so a merger or symbol change reports the position under the OLD
+        symbol and a mark on the new symbol never prices it;
+      * a spinoff's synthetic child fill has no `fill` row, so
+        trade_opening_fill_fk -- a non-deferrable composite FK -- rejects it.
+
+    Each case passes EVERY flag its type requires, so the refusal cannot be
+    the older "requires --resulting-symbol" / "requires --basis-allocation"
+    one firing early and making this pass for the wrong reason.
+
+    The message, not just the exit code: a bare `rc == 2` would be satisfied by
+    a handler failing for an unrelated reason, and the whole point of refusing
+    here (rather than through argparse's `choices`) is that a user with a real
+    merger to record learns WHY and that it is a recorded limitation.
+    fake_create_pool raises rather than returning a stand-in pool, so "opens no
+    connection, and therefore no write transaction" is structural.
+    """
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            commit=True, **extra_flags,
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"--type {action_type}" in err
+    assert "cannot be recorded" in err
+    # Named as a recorded limitation with a stated remedy, not a bare
+    # "unsupported": the gap it is recorded under, and the fact that lifting it
+    # is a schema change, both have to reach the user.
+    assert "gap #39" in err
+    assert "docs/known-gaps.md" in err
+    assert "schema change" in err
+    # Scoped to the one instrument this test's fixture created, never an
+    # unqualified count: the test database is shared and `instrument` rows are
+    # global.
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize(
+    ("action_type", "flag", "value", "named"),
+    [
+        ("split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
+        ("reverse_split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
+        ("split", "basis_allocation", "0.25", "--basis-allocation"),
+        ("reverse_split", "basis_allocation", "0.25", "--basis-allocation"),
+    ],
+)
+async def test_corporate_add_refuses_a_flag_the_type_does_not_use(
+    conn, account_with_1800, monkeypatch, capsys, action_type, flag, value, named
+):
+    """A flag the type does not use is not harmless decoration.
+
+    `--type split --resulting-symbol ZXCB` was accepted and STORED, and
+    `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    `resulting_instrument_id` as well as `instrument_id` -- so that row joined
+    ZXCB's action set, entered `_ordered_actions`' dependency graph, and could
+    raise `ValueError: circular corporate-action dependency` out of
+    `adjust_fills`, inside `regroup_account`, for every account holding either
+    instrument, on every regroup including `import --commit`, naming neither the
+    offending action nor how to remove it.
+
+    Flag-level, so it must refuse before any connection is opened -- ZXCB is
+    never created here, and a version that resolved symbols first would refuse
+    for the wrong reason.
+    """
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:6",
+            commit=True, **{flag: value},
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    # The offending flag and the type are both named: "error: bad flags" would
+    # leave the user to guess which of the two to drop.
+    assert named in err
+    assert f"--type {action_type}" in err
+    assert "does not use" in err
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_a_malformed_ratio_without_writing(
+    conn, account_with_1800, monkeypatch
+):
+    """Whether a ratio parses depends only on the argument, never on the
+    database, so this too must be refused before a connection is opened."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02",
+            ratio="one-to-six", commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize("bad_ratio", ["1:NaN", "Infinity:6", "1:0", "-1:6", "1:6:2", "1:six"])
+async def test_corporate_add_refuses_a_ratio_component_that_is_not_positive_and_finite(
+    conn, account_with_1800, monkeypatch, bad_ratio
+):
+    """Decimal("NaN") and Decimal("Infinity") CONSTRUCT successfully and slip
+    past the InvalidOperation catch entirely -- is_finite() is this codebase's
+    established guard (see cmd_marks_set). A zero or negative component would
+    reach CorporateAction.__post_init__ and surface as an uncaught ValueError
+    traceback rather than a clean refusal."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02",
+            ratio=bad_ratio, commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_an_unparseable_ex_date(conn, account_with_1800, monkeypatch):
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="not-a-date", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
+
+
+# Two tests were REMOVED here rather than kept green, when the three
+# identity-changing types began being refused outright (gap #39):
+# "refuses a merger with no --resulting-symbol" and "refuses a spinoff with a
+# --basis-allocation that is not a finite number". Both still exited 2 and wrote
+# nothing afterwards -- and both had stopped exercising the check they named,
+# since the type refusal now fires first for every input either one could
+# supply. A test that passes for a reason its docstring does not describe is the
+# vacuous-assertion shape this file's own comments keep warning about, so they
+# are gone. The checks themselves are still in cli.py, deliberately unreachable,
+# with a comment saying why (they are what a re-enabled merger or spinoff would
+# need), and CorporateAction.__post_init__ enforces both invariants regardless
+# of the CLI -- tests/test_corporate.py pins the basis_allocation half of that
+# directly.
+
+
+async def test_corporate_add_refuses_an_unknown_symbol(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """Follows test_marks_set_refuses_an_ambiguous_symbol_without_writing:
+    db.marks.resolve_instrument_by_symbol's OWN message must survive into
+    stderr, not just some exit code. A `print` that dropped `{exc}` -- or a
+    handler that returned 2 for an entirely unrelated reason -- would satisfy
+    a bare `rc == 2` and tell the user nothing about which symbol failed."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="NOSUCH", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no instrument with symbol" in err
+    assert "NOSUCH" in err
+    # Scoped to the one instrument this test's fixture created, never an
+    # unqualified count: the test database is shared and `instrument` rows are
+    # global.
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_allows_an_instrument_with_no_fills(conn, monkeypatch, capsys):
+    """Spec §6's last row: an action on an instrument nobody holds is a
+    legitimately pre-recorded future action, so it is ALLOWED and reports that
+    nothing is affected -- it must not be mistaken for an error, and it must
+    still be stored."""
+    instrument_id = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="split", symbol="ZXCO", ex_date="2026-03-02", ratio="3:1", commit=True
+        )
+    )
+    assert rc == 0
+    assert len(await list_actions(conn, instrument_id)) == 1
+    assert "no fills affected" in capsys.readouterr().out
+
+
+async def test_corporate_list_shows_stored_actions(conn, account_with_1800, monkeypatch, capsys):
+    _account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_list(_corporate_args(symbol="ZXCO"))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "reverse_split" in out
+    # The id is what `corporate remove` takes, so a listing that omits it
+    # cannot do the job spec §5 gives it.
+    assert str(action_id) in out
+
+
+async def test_corporate_remove_undoes_the_adjustment(conn, account_with_1800, monkeypatch):
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    # Guard: if the split never reached the position in the first place, the
+    # 1800 asserted below would be true whether or not remove did anything.
+    (adjusted,) = await open_positions(conn, account_id)
+    assert adjusted.quantity == Decimal(300)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(action_id), commit=True))
+    assert rc == 0
+    assert await list_actions(conn, instrument_id) == []
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(1800)
+
+
+async def test_corporate_remove_previews_without_deleting(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """`remove` mirrors `add`: preview by default, write only with --commit."""
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(action_id), commit=False))
+    assert rc == 0
+    assert "preview only" in capsys.readouterr().out
+    assert len(await list_actions(conn, instrument_id)) == 1
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(300)
+
+
+async def test_corporate_remove_refuses_an_unknown_id(conn, account_with_1800, monkeypatch, capsys):
+    """A bare `rc == 2` would hold for a handler that refused for an unrelated
+    reason, and would not notice a `remove` that deleted the wrong row on its
+    way to reporting failure. So: the refusal names the id that was not found,
+    and a real stored action -- one this test created, on a different id --
+    is still there afterwards, with the position it adjusts untouched."""
+    account_id, instrument_id = account_with_1800
+    kept = await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    missing = uuid4()
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id=str(missing), commit=True))
+    assert rc == 2
+    assert str(missing) in capsys.readouterr().err
+    assert [r["id"] for r in await list_actions(conn, instrument_id)] == [kept]
+    (position,) = await open_positions(conn, account_id)
+    assert position.quantity == Decimal(300)
+
+
+async def test_corporate_remove_refuses_a_malformed_id(conn, monkeypatch):
+    """main()'s UUID guard covers --account only, so a mistyped positional id
+    would otherwise surface as a raw ValueError traceback."""
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_remove(_corporate_args(id="not-a-uuid", commit=True))
+    assert rc == 2
+
+
+# Deliberately BEFORE the 2026-03-02 ex-date every corporate test here uses.
+# `_position_fill` above executes at 2026-08-01, which is AFTER it, so a
+# fixture built on that helper unmodified would put both fills on the wrong
+# side of the split and every assertion below would pass vacuously -- the same
+# trap tests/db/conftest.py's own `_T0` comment describes.
+_PRE_EX_DATE = datetime(2026, 2, 1, 9, 0, tzinfo=UTC)
+
+
+@pytest_asyncio.fixture
+async def two_accounts_holding_zxco(conn):
+    """TWO accounts, each holding a BUY on the SAME fabricated ZXCO equity.
+
+    `account_with_1800` (tests/db/conftest.py) is a single account, which is
+    why the mutation "regroup only the first holding account" survived the
+    whole gate: with one holder, `account_ids[:1]` and `account_ids` are the
+    same list. This is the fixture that tells them apart.
+
+    The two quantities are DIFFERENT (1800 and 600 -> 300 and 100 after a 1:6
+    reverse split) so the assertion binds each account to its own figure and
+    cannot be satisfied by regrouping one account twice.
+    """
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    accounts = []
+    for name, quantity, ref in (("CorpA", "1800", "zx2a"), ("CorpB", "600", "zx2b")):
+        acc = await create_account(conn, name=name, venue="manual", account_type="cash")
+        fill = replace(
+            _position_fill(acc, inst, side=Side.BUY, quantity=quantity, price="0.05", ref=ref),
+            executed_at=_PRE_EX_DATE,
+        )
+        await insert_fills(conn, [fill])
+        accounts.append(acc)
+    return accounts[0], accounts[1], inst
+
+
+async def test_corporate_add_commits_and_regroups_every_holding_account(
+    conn, two_accounts_holding_zxco, monkeypatch
+):
+    """Spec decision C7. A corporate action is GLOBAL -- the corporate_action
+    table deliberately has no account_id, because a split affects every holder
+    -- and positions come from materialised trade rows, so an add that regroups
+    only some holders leaves the rest reporting pre-split quantities with
+    nothing about the position saying so.
+
+    The account order `SELECT DISTINCT account_id` returns is not defined, so
+    this must hold whichever account comes first: each expected quantity is
+    bound to its own account, and an unregrouped account has no trade rows at
+    all, which fails the single-position unpack rather than passing quietly.
+    """
+    acc_a, acc_b, instrument_id = two_accounts_holding_zxco
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="reverse_split", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 0
+    (position_a,) = await open_positions(conn, acc_a)
+    (position_b,) = await open_positions(conn, acc_b)
+    assert (position_a.quantity, position_b.quantity) == (Decimal(300), Decimal(100))
+
+
+# --- the `corporate` subparser wiring -------------------------------------
+# Every test above hands its handler a namespace built by `_corporate_args`,
+# which hardcodes the dest names. A flag registered under a dest no handler
+# reads -- or a subcommand missing its set_defaults(fn=...) -- would ship with
+# all of them green. These two drive the real parser through cli.main() with a
+# monkeypatched sys.argv, the same way
+# test_marks_set_requires_exactly_one_of_symbol_or_natural_key above does.
+
+
+@pytest.mark.parametrize(
+    ("argv", "handler"),
+    [
+        (
+            [
+                "deadband", "corporate", "add", "--type", "reverse_split",
+                "--symbol", "ZXCO", "--ex-date", "2026-03-02", "--ratio", "1:6",
+            ],
+            "cmd_corporate_add",
+        ),
+        (["deadband", "corporate", "list", "--symbol", "ZXCO"], "cmd_corporate_list"),
+        (
+            ["deadband", "corporate", "remove", "3f1b2c9e-0000-4000-8000-000000000001"],
+            "cmd_corporate_remove",
+        ),
+    ],
+)
+def test_corporate_parser_routes_each_subcommand_to_its_handler(monkeypatch, argv, handler):
+    """main() resolves `fn` at parse time, so a subcommand whose
+    set_defaults(fn=...) was omitted or pointed at the wrong handler fails
+    here. No database is involved: the handler itself is replaced."""
+    called = []
+
+    async def spy(args):
+        called.append(args)
+        return 0
+
+    monkeypatch.setattr(cli, handler, spy)
+    monkeypatch.setattr("sys.argv", argv)
+    assert cli.main() == 0
+    assert len(called) == 1
+
+
+def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monkeypatch):
+    """One invocation carrying every flag `corporate add` registers, asserted
+    against the exact attribute names cmd_corporate_add reads. A renamed flag,
+    a missing `default=None`, or a --commit that did not store True would be
+    invisible to every namespace-built test in this file.
+
+    `--type spinoff` is used because it is the only type that exercises BOTH
+    --resulting-symbol and --basis-allocation in one invocation. The real
+    handler refuses that type (gap #39) and refuses those two flags for the
+    types it accepts -- which is exactly why the check has to happen inside the
+    handler and all five members stay in argparse's `choices`. This test
+    replaces the handler with a spy, so it pins the parser's flag-to-dest
+    mapping and nothing about what the handler does with it."""
+    captured = []
+
+    async def spy(args):
+        captured.append(args)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_corporate_add", spy)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "deadband", "corporate", "add", "--type", "spinoff", "--symbol", "ZXCO",
+            "--ex-date", "2026-03-02", "--ratio", "1:1", "--resulting-symbol", "ZXCB",
+            "--basis-allocation", "0.25", "--note", "a spinoff", "--commit",
+        ],
+    )
+    assert cli.main() == 0
+    (args,) = captured
+    assert (args.type, args.symbol, args.ex_date, args.ratio) == (
+        "spinoff", "ZXCO", "2026-03-02", "1:1",
+    )
+    assert (args.resulting_symbol, args.basis_allocation, args.note) == (
+        "ZXCB", "0.25", "a spinoff",
+    )
+    assert args.commit is True

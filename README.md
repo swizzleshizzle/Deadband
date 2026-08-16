@@ -101,6 +101,69 @@ it was never going to be part of the import. See
 expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
 `REVERSE SPLIT`, and others), and backdated `as of` correction rows.
 
+### Corporate actions
+
+`corporate add`, `corporate list` and `corporate remove` manage **split and reverse-split**
+records. A stored action is never applied to a fill in place — it is applied at read time,
+inside `regroup_account`, so raw fills stay ground truth and removing an action is a
+genuine undo rather than a second restatement.
+
+That read-time design is also why the other three `ActionType` members — `merger`,
+`spinoff` and `symbol_change` — are **refused**, with exit 2 and an explanation, rather
+than stored. `ledger/corporate.py` computes all five correctly, but an action that changes
+*which instrument* a fill belongs to cannot be materialised into a `trade` row while the
+`fill` table is never rewritten: the position would keep reporting under the old symbol
+(disagreeing with `deadband trades`, and never priced by a mark on the new one), and a
+spinoff's synthetic child fill has no `fill` row for `trade.opening_fill_id`'s composite
+foreign key to point at. It is a recorded limitation, not a bug —
+[`docs/known-gaps.md`](docs/known-gaps.md) gap #39 states what closing it would take.
+
+```bash
+uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
+    --ex-date 2026-03-02 --ratio 1:6                                       # preview only
+
+uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
+    --ex-date 2026-03-02 --ratio 1:6 --commit                              # write + regroup every holder
+
+uv run python cli.py corporate list --symbol ZXCO
+
+uv run python cli.py corporate remove <action-id>                          # preview only
+uv run python cli.py corporate remove <action-id> --commit                 # delete + regroup every holder
+```
+
+`add` and `remove` both **preview by default and write only with `--commit`**, the same
+convention `import` uses. The preview reports how many fills, across how many accounts,
+would change given everything already stored plus (or minus) the action in question — it
+opens a connection to resolve symbols but writes nothing. `--commit` writes (or deletes)
+the row and then regroups every account holding the instrument, all inside one
+transaction, so a crash between the write and a regroup can never leave one account
+adjusted and another stale.
+
+`--type` accepts `split` and `reverse_split`. `merger`, `spinoff` and `symbol_change` are
+still offered by `--type` — they stay in its choices deliberately, so the refusal comes
+from the handler and can explain itself rather than from argparse as a bare "invalid
+choice" — but supplying one exits 2, writes nothing, and opens no connection. Neither
+accepted type uses `--resulting-symbol` or `--basis-allocation`, so passing either is also
+refused: a stored `resulting_instrument_id` joins that instrument's action set and can
+raise `circular corporate-action dependency` out of every later regroup, including
+`import --commit`.
+
+`--ratio NEW:OLD` maps directly onto `ratio_numerator:ratio_denominator`, the direction
+`adjust_fills` consumes: a quantity is scaled by `numerator / denominator`. A 1-for-6
+reverse split is `--ratio 1:6` and scales 1,800 shares to 300; a 3-for-1 forward split is
+`--ratio 3:1`. Worth stating plainly, not pedantry — inverting the pair turns that reverse
+split into a 6x forward split, wrong by a factor of 36, with every individual step still
+looking plausible.
+
+`corporate list` optionally filters with `--symbol` and prints, per action, the id
+`remove` needs, its ex-date, symbol, type, ratio, resulting symbol (if any), and basis
+allocation (if any). See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–39) for what
+this leaves open: corporate actions still can't be *imported* from a venue export, manual
+trades aren't split-adjusted, merger cash isn't modelled, there's no audit trail on a
+restatement, no database-level duplicate guard, an action recorded against the result of an
+earlier one regroups nothing, and the three identity-changing types are refused rather than
+supported.
+
 ### Reconciliation
 
 `snapshot add` records a broker statement's figures by hand; `reconcile` compares the
