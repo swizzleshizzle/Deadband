@@ -1468,7 +1468,7 @@ async def cmd_corporate_add(args) -> int:
     # the type does not use is not harmless:
     #
     #   `--type split --resulting-symbol ZXCB` used to be accepted and stored.
-    #   `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    #   `actions_with_ids_for_instruments` (db/corporate.py) matches on
     #   `resulting_instrument_id` as well as `instrument_id`, so that row joins
     #   ZXCB's action set, enters `_ordered_actions`' dependency graph, and can
     #   raise `ValueError: circular corporate-action dependency` out of

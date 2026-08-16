@@ -3029,7 +3029,7 @@ async def test_corporate_add_refuses_a_flag_the_type_does_not_use(
     """A flag the type does not use is not harmless decoration.
 
     `--type split --resulting-symbol ZXCB` was accepted and STORED, and
-    `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    `actions_with_ids_for_instruments` (db/corporate.py) matches on
     `resulting_instrument_id` as well as `instrument_id` -- so that row joined
     ZXCB's action set, entered `_ordered_actions`' dependency graph, and could
     raise `ValueError: circular corporate-action dependency` out of

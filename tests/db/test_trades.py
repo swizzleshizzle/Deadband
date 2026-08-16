@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -10,10 +10,13 @@ from db.corporate import add_action, remove_action
 from db.fills import fetch_fills, insert_fills
 from db.instruments import upsert_instrument
 from db.positions import open_positions
-from db.trades import list_trades, regroup_account
+from db.trades import UnattributableDerivedFillError, list_trades, regroup_account
+from ledger.corporate import adjust_fills
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
-from tests.db.conftest import _split  # account_with_1800 is auto-discovered from conftest.py
+
+# account_with_1800, zxcb and zxcc are fixtures, auto-discovered from conftest.py.
+from tests.db.conftest import _fill, _merger, _spinoff, _split, _symbol_change
 
 pytestmark = requires_db
 
@@ -1201,3 +1204,186 @@ async def test_an_account_with_no_actions_is_unaffected(conn, account_with_1800)
     await regroup_account(conn, account_id)
     (position,) = await open_positions(conn, account_id)
     assert position.quantity == Decimal(1800)
+
+
+# After both spinoff ex-dates used below, so a fill dated with it is deterministically
+# ordered AFTER the synthetic child in grouping. tests/db/conftest.py's _fill defaults
+# to a time before the ex-dates, and two fills sharing a timestamp are ordered by
+# str(id) -- which for a uuid4 SELL is a coin toss between closing the spun-off long
+# and opening its own short.
+_AFTER_EX_DATE = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)
+
+
+async def test_a_spinoff_survives_a_second_regroup(conn, account_with_1800, zxcb):
+    """THE reaping test. Both the protection UPDATE and the final DELETE treat
+    opening_fill_id IS NULL as stale, and a derived trade has no opening fill by
+    construction -- so a first regroup can write it and the next statement can
+    reap it. One regroup cannot tell a correct implementation from that."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    await regroup_account(conn, account_id)
+    positions = await open_positions(conn, account_id)
+    assert {p.instrument_id for p in positions} == {instrument_id, zxcb}
+
+
+async def test_a_spinoff_creates_the_child_position(conn, account_with_1800, zxcb):
+    """1800 shares, 1:10 spinoff, 37.5% of basis allocated -> 180 shares of ZXCB."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    positions = {p.instrument_id: p for p in await open_positions(conn, account_id)}
+    assert positions[zxcb].quantity == Decimal(180)
+    assert positions[instrument_id].quantity == Decimal(1800)
+
+
+async def test_removing_a_spinoff_removes_its_derived_fill(conn, account_with_1800, zxcb):
+    """Derived rows must not outlive the action that produced them, or removal
+    stops being a genuine undo and becomes a second restatement."""
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _spinoff(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    assert await conn.fetchval(
+        "SELECT count(*) FROM derived_fill WHERE account_id = $1", account_id
+    ) == 1
+    await remove_action(conn, action_id)
+    await regroup_account(conn, account_id)
+    assert await conn.fetchval(
+        "SELECT count(*) FROM derived_fill WHERE account_id = $1", account_id
+    ) == 0
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+
+
+async def test_a_derived_fill_no_longer_produced_is_reaped(conn, account_with_1800, zxcb):
+    """The removal test above cannot see the reap at all: derived_fill.
+    corporate_action_id is ON DELETE CASCADE, so deleting the action takes the
+    row with it whether or not regroup_account reaps anything. (Verified --
+    deleting the reap leaves that test green.) A derived fill also goes stale
+    while BOTH its action and its parent fill still exist, and no cascade covers
+    that: here the parent fill is taken over whole by a manual trade, so the
+    fill never reaches adjust_fills and this run produces no derived fill at
+    all. Only the reap can remove the row left behind by the previous run."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    assert await conn.fetchval(
+        "SELECT count(*) FROM derived_fill WHERE account_id = $1", account_id
+    ) == 1
+
+    # The ZXCO trade already holds the whole 1800 of the fill through trade_fill;
+    # making it manual is what puts the fill wholly out of the auto pass's reach.
+    # Direct UPDATE for the same reason partly_manual_account uses direct
+    # INSERTs: manual grouping has no db/ entry point yet.
+    await conn.execute(
+        "UPDATE trade SET grouping_mode = 'manual' "
+        " WHERE account_id = $1 AND opening_fill_id IS NOT NULL",
+        account_id,
+    )
+    await regroup_account(conn, account_id)
+
+    assert await conn.fetchval(
+        "SELECT count(*) FROM derived_fill WHERE account_id = $1", account_id
+    ) == 0
+    assert await conn.fetchval(
+        "SELECT count(*) FROM corporate_action WHERE instrument_id = $1", instrument_id
+    ) == 1
+
+
+async def test_the_derived_fill_records_its_parent_and_its_action(
+    conn, account_with_1800, zxcb
+):
+    """Provenance is recovered by inverting _spinoff_fill_id, not guessed. A row
+    that cannot be attributed is a bug, not a row to insert with NULLs."""
+    account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _spinoff(instrument_id, zxcb))
+    (parent,) = await fetch_fills(conn, account_id)
+    await regroup_account(conn, account_id)
+    row = await conn.fetchrow(
+        "SELECT * FROM derived_fill WHERE account_id = $1", account_id
+    )
+    assert row["derived_from_fill_id"] == parent.id
+    assert row["corporate_action_id"] == action_id
+    assert row["instrument_id"] == zxcb
+
+
+async def test_a_spinoff_off_a_spun_off_child_is_refused_not_guessed(
+    conn, account_with_1800, zxcb, zxcc
+):
+    """The provenance map is built over the fills that were FETCHED, so a
+    spinoff whose parent is itself a synthetic child inverts to nothing. That
+    state is reachable -- holding ZXCB directly pulls the ZXCB spinoff into this
+    account's action set, and it then applies to the ZXCO->ZXCB child as well as
+    to the real ZXCB fill -- and it is a bug, not a row to insert with NULLs:
+    derived_from_fill_id references `fill`, which the child is not in. Refusing
+    by name beats a foreign-key violation, and beats silently attributing the
+    grandchild to whichever action happened to be first."""
+    account_id, instrument_id = account_with_1800
+    await insert_fills(
+        conn,
+        [_fill(account_id, zxcb, side=Side.BUY, quantity="10", price="2.00", ref="zxcb-buy")],
+    )
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    await add_action(conn, _spinoff(zxcb, zxcc, ex_date=date(2026, 4, 2)))
+    with pytest.raises(UnattributableDerivedFillError):
+        await regroup_account(conn, account_id)
+
+
+async def test_two_spinoffs_are_not_cross_attributed(conn, account_with_1800, zxcb, zxcc):
+    """_spinoff_fill_id hashes the resulting instrument and the ex-date, so two
+    spinoffs off the same parent must land on different derived rows pointing at
+    different actions."""
+    account_id, instrument_id = account_with_1800
+    first = await add_action(conn, _spinoff(instrument_id, zxcb))
+    second = await add_action(
+        conn, _spinoff(instrument_id, zxcc, ex_date=date(2026, 4, 2))
+    )
+    await regroup_account(conn, account_id)
+    rows = await conn.fetch(
+        "SELECT instrument_id, corporate_action_id FROM derived_fill WHERE account_id = $1",
+        account_id,
+    )
+    assert {(r["instrument_id"], r["corporate_action_id"]) for r in rows} == {
+        (zxcb, first),
+        (zxcc, second),
+    }
+
+
+async def test_the_spun_off_shares_can_be_sold(conn, account_with_1800, zxcb):
+    """D6: a view cannot be closed. A real SELL on the resulting instrument has
+    to find a real opening trade to close against."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _spinoff(instrument_id, zxcb))
+    await insert_fills(
+        conn,
+        [
+            _fill(account_id, zxcb, side=Side.SELL, quantity="180", price="1.00",
+                  ref="zxcb-sell", executed_at=_AFTER_EX_DATE)
+        ],
+    )
+    await regroup_account(conn, account_id)
+    positions = {p.instrument_id for p in await open_positions(conn, account_id)}
+    assert zxcb not in positions
+    # "No open ZXCB position" is also true when regroup produced no ZXCB trade at
+    # all -- which is exactly what the reaping bug does. Pin the closed trade
+    # itself, so the absence above is a close-out rather than a disappearance.
+    zxcb_trades = [
+        t for t in await list_trades(conn, account_id) if t["effective_instrument_id"] == zxcb
+    ]
+    assert [t["status"] for t in zxcb_trades] == ["closed"]
+
+
+async def test_only_a_spinoff_mints_a_fill_id(conn, account_with_1800, zxcb):
+    """Section 5.1: derived fills are identified by set difference against the
+    fetched ids. That is only sound while spinoff is the sole action type that
+    invents an id. If another type ever starts minting them, this reddens instead
+    of silently mis-filing them as real."""
+    account_id, instrument_id = account_with_1800
+    before = {f.id for f in await fetch_fills(conn, account_id)}
+    for action in (
+        _split(instrument_id),
+        _symbol_change(instrument_id, zxcb),
+        _merger(instrument_id, zxcb),
+    ):
+        adjusted = adjust_fills(await fetch_fills(conn, account_id), [action])
+        assert {f.id for f in adjusted} <= before

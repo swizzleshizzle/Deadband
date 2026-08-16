@@ -45,7 +45,7 @@ def _to_action(row: asyncpg.Record) -> CorporateAction:
     )
 
 
-async def _fetch_actions_for_instruments(
+async def actions_with_ids_for_instruments(
     conn: asyncpg.Connection, instrument_ids: Sequence[UUID]
 ) -> list[tuple[UUID, CorporateAction]]:
     """(id, CorporateAction) pairs for every action touching any of
@@ -58,6 +58,10 @@ async def _fetch_actions_for_instruments(
     written queries that happen to usually agree. The `removing=` branch needs
     the id to drop by; `actions_for_instruments` only needs the dataclass, so
     it discards the id at the end.
+
+    Public rather than private because regroup_account is a third caller that
+    must record WHICH action produced a derived fill: derived_fill.
+    corporate_action_id is NOT NULL and the pure dataclass carries no row id.
     """
     if not instrument_ids:
         return []
@@ -145,7 +149,7 @@ async def find_duplicate(
 async def actions_for_instruments(
     conn: asyncpg.Connection, instrument_ids: Sequence[UUID]
 ) -> list[CorporateAction]:
-    pairs = await _fetch_actions_for_instruments(conn, instrument_ids)
+    pairs = await actions_with_ids_for_instruments(conn, instrument_ids)
     return [action for _id, action in pairs]
 
 
@@ -163,13 +167,13 @@ async def preview_effect(
     print the same plausible 1800 -> 300 while the stored state silently became
     1800 -> 50. See the design's section 5.
 
-    `stored` and `proposed` are both built from `_fetch_actions_for_instruments`,
+    `stored` and `proposed` are both built from `actions_with_ids_for_instruments`,
     the same helper `actions_for_instruments` uses -- so they differ by exactly
     the added/removed action, not by two queries with different predicates
     (one scoped by instrument_id only, the other also matching
     resulting_instrument_id) that could silently select different row sets.
     """
-    pairs = await _fetch_actions_for_instruments(conn, [instrument_id])
+    pairs = await actions_with_ids_for_instruments(conn, [instrument_id])
     stored = [action for _id, action in pairs]
     if adding is not None:
         proposed = [*stored, adding]
