@@ -1,8 +1,20 @@
+from datetime import date
+from decimal import Decimal
+from uuid import uuid4
+
 import asyncpg
 import pytest
 
+from db.accounts import create_account
+from db.corporate import add_action
+from db.fills import insert_fills
+from db.instruments import upsert_instrument
 from db.migrate import apply
+from db.trades import regroup_account
+from ledger.corporate import ActionType, CorporateAction
+from ledger.types import AssetClass, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _fill
 
 pytestmark = requires_db
 
@@ -211,3 +223,96 @@ async def test_deleting_account_cascades_fills_trades_and_allocations(conn):
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
     assert await conn.fetchval("SELECT count(*) FROM trade WHERE account_id = $1", acc) == 0
     assert await conn.fetchval("SELECT count(*) FROM trade_fill WHERE account_id = $1", acc) == 0
+
+
+async def test_migration_003_survives_a_populated_trade_fill(conn):
+    """The trade_fill PK rework is the only destructive step in 003. An empty
+    database cannot exercise it: the failure mode is a NOT NULL or PK violation
+    on rows that already exist."""
+    acc = await create_account(conn, name="Mig3", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, quantity="10", price="1.00", ref="mig3")]
+    )
+    await regroup_account(conn, acc)
+    before = await conn.fetchval(
+        "SELECT count(*) FROM trade_fill WHERE account_id = $1", acc
+    )
+    assert before > 0
+
+    await apply(conn)  # re-run: schema.sql + every migration, including 003
+
+    after = await conn.fetch(
+        "SELECT id, fill_id, derived_fill_id FROM trade_fill WHERE account_id = $1", acc
+    )
+    assert len(after) == before
+    assert all(r["id"] is not None for r in after)
+    assert all(r["fill_id"] is not None and r["derived_fill_id"] is None for r in after)
+
+
+async def test_derived_fill_rejects_a_cross_account_trade_reference(conn):
+    """derived_fill carries UNIQUE (id, account_id) so composite FKs get the
+    same cross-account guard fill_id_account_uniq gives. Without it a trade in
+    account B could anchor on a derived fill from account A.
+
+    Rewritten from an introspection-only check (does some unique constraint
+    exist on derived_fill?) to a behavioural one: insert a derived_fill row
+    under account A directly (no code writes them until Task 3), then try to
+    anchor a trade in account B on it, and assert the composite FK
+    (trade_opening_derived_fill_fk, which needs derived_fill_id_account_uniq
+    to exist at all) rejects it."""
+    acc_a = await create_account(conn, name="DerivA", venue="manual", account_type="cash")
+    acc_b = await create_account(conn, name="DerivB", venue="manual", account_type="cash")
+    parent_inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    child_inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCB", quote_currency="USD"),
+    )
+    parent_fill = _fill(
+        acc_a, parent_inst, side=Side.BUY, quantity="10", price="1.00", ref="deriv-parent"
+    )
+    await insert_fills(conn, [parent_fill])
+
+    action_id = await add_action(
+        conn,
+        CorporateAction(
+            instrument_id=parent_inst,
+            action_type=ActionType.SPINOFF,
+            ex_date=date(2026, 3, 2),
+            ratio_numerator=Decimal("1"),
+            ratio_denominator=Decimal("1"),
+            resulting_instrument_id=child_inst,
+            basis_allocation=Decimal("0.1"),
+        ),
+    )
+
+    derived_id = uuid4()
+    await conn.execute(
+        """
+        INSERT INTO derived_fill
+            (id, account_id, instrument_id, executed_at, side, quantity, price,
+             derived_from_fill_id, corporate_action_id)
+        VALUES ($1, $2, $3, now(), 'buy', 1, 1, $4, $5)
+        """,
+        derived_id,
+        acc_a,
+        child_inst,
+        parent_fill.id,
+        action_id,
+    )
+
+    with pytest.raises(
+        asyncpg.exceptions.ForeignKeyViolationError, match="trade_opening_derived_fill_fk"
+    ):
+        await conn.execute(
+            "INSERT INTO trade (account_id, direction, status, opening_derived_fill_id, opened_at) "
+            "VALUES ($1, 'long', 'open', $2, now())",
+            acc_b,
+            derived_id,
+        )
