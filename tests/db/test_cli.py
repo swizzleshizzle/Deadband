@@ -3113,6 +3113,64 @@ async def test_corporate_add_commits_a_spinoff(conn, account_with_1800, zxcb, mo
     assert positions["ZXCB"].quantity == Decimal(180)
 
 
+async def test_corporate_add_previews_a_spinoffs_new_position_without_writing(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """`_print_effect`'s `for fill in preview.created:` loop (cli.py) is the
+    only thing that ever renders the child a spinoff preview is about to
+    create. `preview_effect`'s `created` list is pinned by
+    tests/db/test_corporate_actions.py's
+    test_preview_of_an_added_spinoff_reports_the_child_it_creates, but nothing
+    asserted that rendering ever reached a user before this test existed --
+    `corporate add` previews by default, so a preview that silently omitted
+    the position it is about to create was exactly the failure Task 3 existed
+    to remove, and only the inner half (preview_effect itself) was pinned.
+
+    The input that would make this fail: deleting the `for fill in
+    preview.created:` loop at the bottom of `_print_effect` (cli.py). That
+    change leaves `preview.fills_changed` and the parent's basis reduction
+    still printed -- this test's assertions on "new:", "180.00" and "0.1875"
+    are what catch the child going unmentioned; a version of this test that
+    only checked `rc == 0` or "preview only" would stay green.
+    """
+    account_id, instrument_id = account_with_1800
+    # account_with_1800 only inserts the fill -- positions are read from
+    # materialised `trade` rows (db/positions.py), not fills directly, so
+    # without this the account has no position at all yet and "nothing
+    # changed" below would hold vacuously regardless of what --commit=False
+    # did. Regrouping first gives a real ZXCO position to prove untouched.
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation="0.375", commit=False,
+        )
+    )
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    # 1800 * 1/10 shares at (1800 * 0.05 * 0.375) / 180 -- same figures
+    # test_preview_of_an_added_spinoff_reports_the_child_it_creates pins on
+    # `preview.created` directly. Checked against imports/ (`grep -rn
+    # "0\.1875" imports/` and `grep -rnw "180" imports/`, both empty): neither
+    # is a real broker figure this repo could be mistaken for.
+    assert "new: 180.00 @ 0.1875" in out
+
+    # Nothing written: no action stored, and the pre-existing ZXCO position is
+    # unchanged with no ZXCB position minted alongside it.
+    assert await list_actions(conn, instrument_id) == []
+    positions = {p.symbol: p for p in await open_positions(conn, account_id)}
+    assert positions.keys() == {"ZXCO"}
+    assert positions["ZXCO"].quantity == Decimal(1800)
+
+
 async def test_a_mark_on_the_new_symbol_prices_the_position_after_a_symbol_change(
     conn, account_with_1800, zxcb, monkeypatch, capsys
 ):

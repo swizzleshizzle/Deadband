@@ -221,16 +221,21 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # differing only in their source mint the same child id for a given parent.
     # The argument that survives that: the map only ever grows (`if child_id in
     # derived_provenance: continue` means no round ever rewrites an entry an
-    # earlier round wrote), and the enumeration order within a round is fixed by
-    # actions_with_ids_for_instruments' ORDER BY, so first-writer-wins picks the
-    # same action whether we stop here or expand fully. Any id that IS looked up
-    # therefore resolves to exactly the pair a full expansion would have given
-    # it; what a later round would add is exactly the entries nothing asks for.
-    # (Whether first-writer-wins picks the RIGHT action when the hash collides is
-    # gap #41's question, not this early exit's -- stopping early cannot change
-    # the answer either way.) Real, unchained spinoffs finish in one round at
-    # R*n; a genuine depth-2 chain pays R*(n+1)^2. The guard below still fires
-    # once the budget is spent.
+    # earlier round wrote), so whichever action writes a given child id first
+    # stays written for the rest of THIS run, whether we stop here or expand
+    # fully -- stable within a run, but NOT because
+    # actions_with_ids_for_instruments' `ORDER BY ex_date` breaks the tie
+    # between colliding actions. It cannot: two actions that collide share an
+    # ex-date by construction (ex_date is inside the hash, ledger/corporate.py),
+    # so that ordering does not distinguish them -- the iteration is over a
+    # `set` of candidates besides. Any id that IS looked up therefore resolves
+    # to exactly the pair a full expansion would have given it in this run;
+    # what a later round would add is exactly the entries nothing asks for.
+    # (WHICH of two colliding actions wins first-writer-wins is gap #41's
+    # question -- unspecified, not decided by this early exit -- stopping
+    # early cannot change the answer either way.) Real, unchained spinoffs
+    # finish in one round at R*n; a genuine depth-2 chain pays R*(n+1)^2. The
+    # guard below still fires once the budget is spent.
     #
     # The candidates must be the closure and not just real_ids: a spinoff whose
     # source instrument is another spinoff's resulting instrument applies to the

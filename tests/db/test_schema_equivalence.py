@@ -203,8 +203,40 @@ async def test_schema_sql_then_migrations_upgrades_a_pre_existing_database(conn)
 
     try:
         await _build(conn, "eq_fresh", [DB_DIR / "schema.sql"])
+        await _build(conn, "eq_upgraded", pre_existing)
+
+        # The whole test rests on the pre-existing side genuinely lacking these
+        # columns -- if tests/fixtures/schema_baseline_a1.sql were ever
+        # regenerated from a current dump, it would already carry them, the
+        # comparison below would become fresh-vs-fresh, and the test would keep
+        # passing while covering nothing.
+        drifted = await conn.fetch(
+            """SELECT table_name, column_name
+                 FROM information_schema.columns
+                WHERE table_schema = $1
+                  AND (table_name, column_name) IN (
+                      ('trade', 'effective_instrument_id'),
+                      ('trade', 'opening_derived_fill_id'),
+                      ('trade_fill', 'derived_fill_id')
+                  )""",
+            "eq_upgraded",
+        )
+        assert drifted == [], (
+            "the pre-existing namespace (BASELINE + 001 + 002) already has "
+            f"{[tuple(r) for r in drifted]} before schema.sql has even run -- "
+            "tests/fixtures/schema_baseline_a1.sql has drifted forward (most "
+            "likely regenerated from a current dump) and this test has stopped "
+            "covering the upgrade path: it would now be comparing schema.sql+"
+            "migrations against an already-current database instead of a "
+            "genuinely pre-existing one, and could pass even with every ADD "
+            "COLUMN IF NOT EXISTS statement deleted from schema.sql"
+        )
+
         # apply()'s real order, against a database that already has its tables.
-        await _build(conn, "eq_upgraded", [*pre_existing, DB_DIR / "schema.sql", *migrations])
+        await conn.execute('SET search_path TO "eq_upgraded"')
+        for path in (DB_DIR / "schema.sql", *migrations):
+            await conn.execute(path.read_text())
+        await conn.execute("SET search_path TO public")
 
         fresh = await _describe(conn, "eq_fresh")
         upgraded = await _describe(conn, "eq_upgraded")
