@@ -2951,70 +2951,6 @@ async def test_corporate_add_refuses_a_duplicate_without_writing(
 
 
 @pytest.mark.parametrize(
-    ("action_type", "extra_flags"),
-    [
-        ("merger", {"resulting_symbol": "ZXCB"}),
-        ("spinoff", {"resulting_symbol": "ZXCB", "basis_allocation": "0.25"}),
-        ("symbol_change", {"resulting_symbol": "ZXCB"}),
-    ],
-)
-async def test_corporate_add_refuses_an_identity_changing_type(
-    conn, account_with_1800, monkeypatch, capsys, action_type, extra_flags
-):
-    """The three types that change WHICH INSTRUMENT a fill belongs to are
-    refused outright (docs/known-gaps.md gap #39). `ledger/corporate.py` derives
-    all five correctly; the ledger cannot materialise these three, because
-    adjustments are derived at read time over a `fill` table that is never
-    rewritten:
-
-      * `db/positions.py` reads a position's instrument from the RAW opening
-        fill while `db/trades.py` writes primary_underlying from the ADJUSTED
-        one, so a merger or symbol change reports the position under the OLD
-        symbol and a mark on the new symbol never prices it;
-      * a spinoff's synthetic child fill has no `fill` row, so
-        trade_opening_fill_fk -- a non-deferrable composite FK -- rejects it.
-
-    Each case passes EVERY flag its type requires, so the refusal cannot be
-    the older "requires --resulting-symbol" / "requires --basis-allocation"
-    one firing early and making this pass for the wrong reason.
-
-    The message, not just the exit code: a bare `rc == 2` would be satisfied by
-    a handler failing for an unrelated reason, and the whole point of refusing
-    here (rather than through argparse's `choices`) is that a user with a real
-    merger to record learns WHY and that it is a recorded limitation.
-    fake_create_pool raises rather than returning a stand-in pool, so "opens no
-    connection, and therefore no write transaction" is structural.
-    """
-    _account_id, instrument_id = account_with_1800
-
-    async def fake_create_pool(*_a, **_kw):
-        raise AssertionError("must refuse before opening a connection")
-
-    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
-
-    rc = await cli.cmd_corporate_add(
-        _corporate_args(
-            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
-            commit=True, **extra_flags,
-        )
-    )
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert f"--type {action_type}" in err
-    assert "cannot be recorded" in err
-    # Named as a recorded limitation with a stated remedy, not a bare
-    # "unsupported": the gap it is recorded under, and the fact that lifting it
-    # is a schema change, both have to reach the user.
-    assert "gap #39" in err
-    assert "docs/known-gaps.md" in err
-    assert "schema change" in err
-    # Scoped to the one instrument this test's fixture created, never an
-    # unqualified count: the test database is shared and `instrument` rows are
-    # global.
-    assert await list_actions(conn, instrument_id) == []
-
-
-@pytest.mark.parametrize(
     ("action_type", "flag", "value", "named"),
     [
         ("split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
@@ -3129,19 +3065,127 @@ async def test_corporate_add_refuses_an_unparseable_ex_date(conn, account_with_1
     assert await list_actions(conn, instrument_id) == []
 
 
-# Two tests were REMOVED here rather than kept green, when the three
-# identity-changing types began being refused outright (gap #39):
-# "refuses a merger with no --resulting-symbol" and "refuses a spinoff with a
-# --basis-allocation that is not a finite number". Both still exited 2 and wrote
-# nothing afterwards -- and both had stopped exercising the check they named,
-# since the type refusal now fires first for every input either one could
-# supply. A test that passes for a reason its docstring does not describe is the
-# vacuous-assertion shape this file's own comments keep warning about, so they
-# are gone. The checks themselves are still in cli.py, deliberately unreachable,
-# with a comment saying why (they are what a re-enabled merger or spinoff would
-# need), and CorporateAction.__post_init__ enforces both invariants regardless
-# of the CLI -- tests/test_corporate.py pins the basis_allocation half of that
-# directly.
+async def test_corporate_add_commits_a_symbol_change(conn, account_with_1800, zxcb, monkeypatch):
+    """The refusal added in 8292e9e (docs/known-gaps.md gap #39) comes off here.
+    Before Tasks 1-3, this stored an action whose effect was reported under the
+    OLD instrument -- db/positions.py resolved a position's instrument from the
+    raw opening fill, which the adjustment never rewrote."""
+    account_id, _instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="symbol_change", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", commit=True,
+        )
+    )
+    assert rc == 0
+    (position,) = await open_positions(conn, account_id)
+    assert position.symbol == "ZXCB"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_corporate_add_commits_a_spinoff(conn, account_with_1800, zxcb, monkeypatch):
+    """1800 shares, 1:10 spinoff, 37.5% of basis allocated -> the parent keeps
+    reporting 1800 (spinoffs only rescale basis, not quantity) and a new 180
+    share ZXCB position appears, persisted as a `derived_fill` row (Task 3)."""
+    account_id, _instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation="0.375", commit=True,
+        )
+    )
+    assert rc == 0
+    positions = {p.symbol: p for p in await open_positions(conn, account_id)}
+    assert positions.keys() == {"ZXCO", "ZXCB"}
+    assert positions["ZXCO"].quantity == Decimal(1800)
+    assert positions["ZXCB"].quantity == Decimal(180)
+
+
+async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """RESTORED from PR #10, which deleted it as vacuous once merger was refused
+    outright. The guard it covers (cli.py's `_RESULTING_INSTRUMENT_TYPES` check)
+    is live code again now that the type-level refusal is gone. Flag-level, so
+    it must refuse before any connection is opened -- ZXCB is never created
+    here, and a version that resolved symbols first would refuse for the wrong
+    reason."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="merger", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+    assert "resulting" in capsys.readouterr().err.lower()
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_a_spinoff_with_no_basis_allocation(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """RESTORED from PR #10. Refuses in stage 1, before a connection is opened
+    -- which is why ZXCB never needs to exist for this test."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", commit=True,
+        )
+    )
+    assert rc == 2
+    assert "basis" in capsys.readouterr().err.lower()
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize("allocation", ["NaN", "abc"])
+async def test_corporate_add_refuses_a_basis_allocation_that_is_not_a_finite_number(
+    conn, account_with_1800, monkeypatch, capsys, allocation
+):
+    """RESTORED from PR #10. InvalidOperation is NOT a ValueError subclass, and
+    an ordering comparison against Decimal('NaN') raises rather than returning
+    False -- so the is_finite() guard is load-bearing, not decorative. Also
+    stage 1: whether a basis allocation parses does not depend on the
+    database."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation=allocation, commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
 
 
 async def test_corporate_add_refuses_an_unknown_symbol(
@@ -3414,10 +3458,7 @@ def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monk
     invisible to every namespace-built test in this file.
 
     `--type spinoff` is used because it is the only type that exercises BOTH
-    --resulting-symbol and --basis-allocation in one invocation. The real
-    handler refuses that type (gap #39) and refuses those two flags for the
-    types it accepts -- which is exactly why the check has to happen inside the
-    handler and all five members stay in argparse's `choices`. This test
+    --resulting-symbol and --basis-allocation in one invocation. This test
     replaces the handler with a spy, so it pins the parser's flag-to-dest
     mapping and nothing about what the handler does with it."""
     captured = []
