@@ -14,6 +14,23 @@ from ledger.types import Direction
 # trade has opening_fill_id NULL (the composite FK is ON DELETE SET NULL),
 # and an inner join would silently drop it from a listing whose whole job is
 # to show everything the account holds.
+#
+# The COALESCE below is not a defensive default. effective_instrument_id is
+# written by regroup_account from the ADJUSTED fill, so it is the only place a
+# symbol change or merger is visible: `fill` is never rewritten, so f.instrument_id
+# still names the instrument the position was opened in. It stays NULL for trades
+# written before the column existed, which is why the fallback is required rather
+# than merely tidy.
+#
+# `AND t.opening_fill_id IS NOT NULL` gates the whole COALESCE, not just the
+# f.instrument_id fallback. effective_instrument_id has its own plain FK to
+# instrument -- unlike opening_fill_id, nothing nulls it when the opening fill
+# is deleted (schema.sql's trade_opening_fill_fk is ON DELETE SET NULL only on
+# opening_fill_id). Without this gate, a trade orphaned by a raw fill delete
+# (no protection pass, no regroup) would keep resolving through its now-stale
+# effective_instrument_id and look reachable again -- exactly the "real
+# quantity under an unreachable instrument" case open_quantity/open_cost_basis
+# below are already forced to None for.
 _SQL = """
     SELECT t.id,
            t.direction,
@@ -34,7 +51,8 @@ _SQL = """
       -- case here to protect against.
       JOIN account a         ON a.id = t.account_id
       LEFT JOIN fill f       ON f.id = t.opening_fill_id
-      LEFT JOIN instrument i ON i.id = f.instrument_id
+      LEFT JOIN instrument i ON i.id = COALESCE(t.effective_instrument_id, f.instrument_id)
+                             AND t.opening_fill_id IS NOT NULL
      WHERE t.status = 'open'
        AND ($1::uuid IS NULL OR t.account_id = $1)
 """

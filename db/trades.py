@@ -128,9 +128,10 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         for g in groups:
             pnl = compute_pnl(g.allocations, by_id, multipliers, g.direction)
             # The opening allocation is this trade's stable identity across regroups.
-            opening_fill_id = min(
+            opening_allocation = min(
                 g.allocations, key=lambda a: (by_id[a.fill_id].executed_at, str(a.fill_id))
-            ).fill_id
+            )
+            opening_fill_id = opening_allocation.fill_id
             seen_openings.append(opening_fill_id)
 
             # Any estimated fill taints the trade -- an opening-balance fill
@@ -147,35 +148,39 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             trade_id = await conn.fetchval(
                 """
                 INSERT INTO trade (
-                    account_id, opening_fill_id, primary_underlying, direction, status,
-                    intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
-                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
-                    fees_realized, open_quantity, open_cost_basis, is_estimated
-                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                    account_id, opening_fill_id, primary_underlying, effective_instrument_id,
+                    direction, status, intent, grouping_mode, opened_at, closed_at, qty_opened,
+                    qty_closed, avg_entry, avg_exit, realized_pnl, gross_realized_pnl,
+                    fees_total, fees_realized, open_quantity, open_cost_basis, is_estimated
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,'auto',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+                )
                 ON CONFLICT (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL
                 DO UPDATE SET
-                    primary_underlying = EXCLUDED.primary_underlying,
-                    direction          = EXCLUDED.direction,
-                    status             = EXCLUDED.status,
-                    opened_at          = EXCLUDED.opened_at,
-                    closed_at          = EXCLUDED.closed_at,
-                    qty_opened         = EXCLUDED.qty_opened,
-                    qty_closed         = EXCLUDED.qty_closed,
-                    avg_entry          = EXCLUDED.avg_entry,
-                    avg_exit           = EXCLUDED.avg_exit,
-                    realized_pnl       = EXCLUDED.realized_pnl,
-                    gross_realized_pnl = EXCLUDED.gross_realized_pnl,
-                    fees_total         = EXCLUDED.fees_total,
-                    fees_realized      = EXCLUDED.fees_realized,
-                    open_quantity      = EXCLUDED.open_quantity,
-                    open_cost_basis    = EXCLUDED.open_cost_basis,
-                    is_estimated       = EXCLUDED.is_estimated,
-                    updated_at         = now()
+                    primary_underlying       = EXCLUDED.primary_underlying,
+                    effective_instrument_id  = EXCLUDED.effective_instrument_id,
+                    direction                = EXCLUDED.direction,
+                    status                   = EXCLUDED.status,
+                    opened_at                = EXCLUDED.opened_at,
+                    closed_at                = EXCLUDED.closed_at,
+                    qty_opened               = EXCLUDED.qty_opened,
+                    qty_closed               = EXCLUDED.qty_closed,
+                    avg_entry                = EXCLUDED.avg_entry,
+                    avg_exit                 = EXCLUDED.avg_exit,
+                    realized_pnl             = EXCLUDED.realized_pnl,
+                    gross_realized_pnl       = EXCLUDED.gross_realized_pnl,
+                    fees_total               = EXCLUDED.fees_total,
+                    fees_realized            = EXCLUDED.fees_realized,
+                    open_quantity            = EXCLUDED.open_quantity,
+                    open_cost_basis          = EXCLUDED.open_cost_basis,
+                    is_estimated             = EXCLUDED.is_estimated,
+                    updated_at               = now()
                 RETURNING id
                 """,
                 account_id,
                 opening_fill_id,
                 underlyings.get(g.instrument_ids[0]),
+                by_id[opening_allocation.fill_id].instrument_id,
                 g.direction.value,
                 g.status.value,
                 intent,

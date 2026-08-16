@@ -5,12 +5,14 @@ from uuid import uuid4
 import pytest_asyncio
 
 from db.accounts import create_account
+from db.corporate import add_action
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.positions import open_positions
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _merger, _split, _symbol_change
 
 pytestmark = requires_db
 
@@ -402,3 +404,65 @@ async def test_an_orphaned_trade_with_a_real_quantity_is_still_unvaluable(conn):
     assert len(ps) == 1
     assert ps[0].unvaluable_reason is not None
     assert ps[0].quantity == Decimal(0)  # the real 7 must NOT be reported
+
+
+async def test_a_symbol_change_reports_the_position_under_the_new_instrument(
+    conn, account_with_1800, zxcb
+):
+    """Before this, open_positions resolved the instrument from the RAW opening
+    fill, which the adjustment never rewrites -- so the position kept reporting
+    under the old symbol while `deadband trades` reported the new one, and a mark
+    on the new symbol never priced it.
+
+    Regrouped once BEFORE the action exists (so the trade row is INSERTed with
+    effective_instrument_id pointing at the raw instrument) and once AFTER (so
+    the same row is hit by the UPSERT's DO UPDATE branch, not another INSERT).
+    A single regroup only ever exercises the INSERT branch, which would leave
+    an UPDATE-only regression -- e.g. effective_instrument_id dropped from the
+    DO UPDATE SET list -- undetected."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == zxcb
+    assert position.symbol == "ZXCB"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_a_merger_reports_the_new_instrument_and_the_rescaled_quantity(
+    conn, account_with_1800, zxcb
+):
+    """A merger changes instrument AND magnitude. 1800 at 1:6 -> 300 of ZXCB."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _merger(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == zxcb
+    assert position.quantity == Decimal(300)
+
+
+async def test_a_reverse_split_leaves_the_instrument_alone(conn, account_with_1800):
+    """effective_instrument_id is written for every trade, not only relabelled
+    ones. A split must record the instrument it already had, not NULL and not
+    something else."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+    assert position.quantity == Decimal(300)
+
+
+async def test_a_trade_predating_the_column_still_reports_its_fills_instrument(
+    conn, account_with_1800
+):
+    """effective_instrument_id is nullable and pre-existing rows are not
+    backfilled, so the COALESCE fallback is load-bearing rather than defensive."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await conn.execute(
+        "UPDATE trade SET effective_instrument_id = NULL WHERE account_id = $1", account_id
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
