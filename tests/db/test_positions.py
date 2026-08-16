@@ -445,10 +445,23 @@ async def test_a_merger_reports_the_new_instrument_and_the_rescaled_quantity(
 async def test_a_reverse_split_leaves_the_instrument_alone(conn, account_with_1800):
     """effective_instrument_id is written for every trade, not only relabelled
     ones. A split must record the instrument it already had, not NULL and not
-    something else."""
+    something else.
+
+    Reads the column directly rather than only through open_positions: a
+    split never changes the instrument, so effective_instrument_id (if
+    written) and the COALESCE fallback f.instrument_id are the SAME value --
+    a read through open_positions alone cannot tell "written correctly" from
+    "never written, read-side fallback happened to agree." A conditional bug
+    that only writes the column when a relabelling action fired (leaving it
+    NULL for every split-only trade) would pass a read-side-only assertion
+    here. Querying the column pins the write itself."""
     account_id, instrument_id = account_with_1800
     await add_action(conn, _split(instrument_id))
     await regroup_account(conn, account_id)
+    written = await conn.fetchval(
+        "SELECT effective_instrument_id FROM trade WHERE account_id = $1", account_id
+    )
+    assert written == instrument_id
     (position,) = await open_positions(conn, account_id)
     assert position.instrument_id == instrument_id
     assert position.quantity == Decimal(300)
@@ -516,17 +529,31 @@ async def test_a_trade_with_no_opening_fill_but_an_effective_instrument_still_re
 async def test_a_trade_with_both_openings_null_resolves_no_instrument(
     conn, account_with_1800
 ):
-    """The genuine orphan case, exactly what regroup_account's protection step
-    leaves behind: opening_fill_id AND effective_instrument_id both NULL. This
-    must stay unresolvable -- proving the previous test's resolution comes
-    specifically from effective_instrument_id being set, not from some other
-    leniency in the query."""
+    """The genuine orphan case: opening_fill_id AND opening_derived_fill_id
+    both NULL -- no live opening allocation of any kind, whether created by
+    regroup_account's protection step or by a raw fill/derived_fill delete
+    with no regroup afterward.
+
+    effective_instrument_id is left NON-NULL and pointing at a real
+    instrument here, deliberately -- a stale value, exactly what a direct
+    delete outside regroup_account produces, since nothing at the database
+    level nulls it to match either opening pointer. With NULL, COALESCE(NULL,
+    f.instrument_id) is already NULL before any gate runs (f cannot join when
+    opening_fill_id is NULL), so a NULL effective_instrument_id can't tell a
+    correct gate from no gate at all, or from the single-column
+    `opening_fill_id IS NOT NULL` gate this branch tried and rejected -- every
+    one of them passes identically. Only a STALE, non-NULL
+    effective_instrument_id with both opening pointers NULL falsifies a wrong
+    gate: it proves the join is keyed on having an opening of some kind, not
+    on whether effective_instrument_id happens to be populated. This is the
+    executable form of the argument that ruled out the single-column gate."""
     account_id, instrument_id = account_with_1800
     await regroup_account(conn, account_id)
     await conn.execute(
-        "UPDATE trade SET opening_fill_id = NULL, effective_instrument_id = NULL "
-        "WHERE account_id = $1",
+        "UPDATE trade SET opening_fill_id = NULL, opening_derived_fill_id = NULL, "
+        "effective_instrument_id = $2 WHERE account_id = $1",
         account_id,
+        instrument_id,
     )
     (position,) = await open_positions(conn, account_id)
     assert position.unvaluable_reason is not None
