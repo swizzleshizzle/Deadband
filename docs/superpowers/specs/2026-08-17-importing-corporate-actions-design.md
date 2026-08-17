@@ -110,9 +110,21 @@ fails if one rule shadows another; that test is what proves all five are live, s
 seen to fail if a rule is ordered wrongly.
 
 **Recognition is the missing half of gap #33**, and it is the first task and independently
-shippable. At that point a history export imports — given `--account`, which already works —
-with the corporate-action rows reported as recognised and unhandled. Everything after it
-improves the report rather than unblocking anything.
+shippable. At that point a history export's corporate-action rows are reported as recognised
+and unhandled rather than refusing the file. Everything after it improves the report rather
+than unblocking anything.
+
+> **Correction, verified by parsing every real history export.** This section originally said
+> that at that point "a history export imports — given `--account`." **That overstates what
+> this branch delivers.** Five of the eleven real history files still produce blocking entries,
+> on verbs entirely unrelated to corporate actions — rollover cash checks, ACAT asset
+> transfers, an early distribution, a cancelled buy, and a plain (non-spinoff) distribution.
+> Those hit the same money-carrying-unmapped policy, and gap #31 already names several of them.
+>
+> So the accurate claim is narrower and must be stated that way everywhere: **this branch
+> removes the corporate-action class of blocker.** It does not make the two accounts importable
+> end to end, and any document saying otherwise contradicts a still-open gap in the same
+> repository.
 
 The precedent is `investment_gain_loss`, added for exactly this shape: a money-carrying row
 that no rule matched, which blocked the commit, and which a real export "could not be imported
