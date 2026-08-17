@@ -24,7 +24,7 @@ from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Direction, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
-from tests.db.conftest import _split
+from tests.db.conftest import _split, _symbol_change
 
 pytestmark = requires_db
 
@@ -2951,70 +2951,6 @@ async def test_corporate_add_refuses_a_duplicate_without_writing(
 
 
 @pytest.mark.parametrize(
-    ("action_type", "extra_flags"),
-    [
-        ("merger", {"resulting_symbol": "ZXCB"}),
-        ("spinoff", {"resulting_symbol": "ZXCB", "basis_allocation": "0.25"}),
-        ("symbol_change", {"resulting_symbol": "ZXCB"}),
-    ],
-)
-async def test_corporate_add_refuses_an_identity_changing_type(
-    conn, account_with_1800, monkeypatch, capsys, action_type, extra_flags
-):
-    """The three types that change WHICH INSTRUMENT a fill belongs to are
-    refused outright (docs/known-gaps.md gap #39). `ledger/corporate.py` derives
-    all five correctly; the ledger cannot materialise these three, because
-    adjustments are derived at read time over a `fill` table that is never
-    rewritten:
-
-      * `db/positions.py` reads a position's instrument from the RAW opening
-        fill while `db/trades.py` writes primary_underlying from the ADJUSTED
-        one, so a merger or symbol change reports the position under the OLD
-        symbol and a mark on the new symbol never prices it;
-      * a spinoff's synthetic child fill has no `fill` row, so
-        trade_opening_fill_fk -- a non-deferrable composite FK -- rejects it.
-
-    Each case passes EVERY flag its type requires, so the refusal cannot be
-    the older "requires --resulting-symbol" / "requires --basis-allocation"
-    one firing early and making this pass for the wrong reason.
-
-    The message, not just the exit code: a bare `rc == 2` would be satisfied by
-    a handler failing for an unrelated reason, and the whole point of refusing
-    here (rather than through argparse's `choices`) is that a user with a real
-    merger to record learns WHY and that it is a recorded limitation.
-    fake_create_pool raises rather than returning a stand-in pool, so "opens no
-    connection, and therefore no write transaction" is structural.
-    """
-    _account_id, instrument_id = account_with_1800
-
-    async def fake_create_pool(*_a, **_kw):
-        raise AssertionError("must refuse before opening a connection")
-
-    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
-
-    rc = await cli.cmd_corporate_add(
-        _corporate_args(
-            type=action_type, symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
-            commit=True, **extra_flags,
-        )
-    )
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert f"--type {action_type}" in err
-    assert "cannot be recorded" in err
-    # Named as a recorded limitation with a stated remedy, not a bare
-    # "unsupported": the gap it is recorded under, and the fact that lifting it
-    # is a schema change, both have to reach the user.
-    assert "gap #39" in err
-    assert "docs/known-gaps.md" in err
-    assert "schema change" in err
-    # Scoped to the one instrument this test's fixture created, never an
-    # unqualified count: the test database is shared and `instrument` rows are
-    # global.
-    assert await list_actions(conn, instrument_id) == []
-
-
-@pytest.mark.parametrize(
     ("action_type", "flag", "value", "named"),
     [
         ("split", "resulting_symbol", "ZXCB", "--resulting-symbol"),
@@ -3029,7 +2965,7 @@ async def test_corporate_add_refuses_a_flag_the_type_does_not_use(
     """A flag the type does not use is not harmless decoration.
 
     `--type split --resulting-symbol ZXCB` was accepted and STORED, and
-    `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    `actions_with_ids_for_instruments` (db/corporate.py) matches on
     `resulting_instrument_id` as well as `instrument_id` -- so that row joined
     ZXCB's action set, entered `_ordered_actions`' dependency graph, and could
     raise `ValueError: circular corporate-action dependency` out of
@@ -3129,19 +3065,276 @@ async def test_corporate_add_refuses_an_unparseable_ex_date(conn, account_with_1
     assert await list_actions(conn, instrument_id) == []
 
 
-# Two tests were REMOVED here rather than kept green, when the three
-# identity-changing types began being refused outright (gap #39):
-# "refuses a merger with no --resulting-symbol" and "refuses a spinoff with a
-# --basis-allocation that is not a finite number". Both still exited 2 and wrote
-# nothing afterwards -- and both had stopped exercising the check they named,
-# since the type refusal now fires first for every input either one could
-# supply. A test that passes for a reason its docstring does not describe is the
-# vacuous-assertion shape this file's own comments keep warning about, so they
-# are gone. The checks themselves are still in cli.py, deliberately unreachable,
-# with a comment saying why (they are what a re-enabled merger or spinoff would
-# need), and CorporateAction.__post_init__ enforces both invariants regardless
-# of the CLI -- tests/test_corporate.py pins the basis_allocation half of that
-# directly.
+async def test_corporate_add_commits_a_symbol_change(conn, account_with_1800, zxcb, monkeypatch):
+    """The refusal added in 8292e9e (docs/known-gaps.md gap #39) comes off here.
+    Before Tasks 1-3, this stored an action whose effect was reported under the
+    OLD instrument -- db/positions.py resolved a position's instrument from the
+    raw opening fill, which the adjustment never rewrote."""
+    account_id, _instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="symbol_change", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", commit=True,
+        )
+    )
+    assert rc == 0
+    (position,) = await open_positions(conn, account_id)
+    assert position.symbol == "ZXCB"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_corporate_add_commits_a_spinoff(conn, account_with_1800, zxcb, monkeypatch):
+    """1800 shares, 1:10 spinoff, 37.5% of basis allocated -> the parent keeps
+    reporting 1800 (spinoffs only rescale basis, not quantity) and a new 180
+    share ZXCB position appears, persisted as a `derived_fill` row (Task 3)."""
+    account_id, _instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation="0.375", commit=True,
+        )
+    )
+    assert rc == 0
+    positions = {p.symbol: p for p in await open_positions(conn, account_id)}
+    assert positions.keys() == {"ZXCO", "ZXCB"}
+    assert positions["ZXCO"].quantity == Decimal(1800)
+    assert positions["ZXCB"].quantity == Decimal(180)
+
+
+async def test_corporate_add_previews_a_spinoffs_new_position_without_writing(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """`_print_effect`'s `for fill in preview.created:` loop (cli.py) is the
+    only thing that ever renders the child a spinoff preview is about to
+    create. `preview_effect`'s `created` list is pinned by
+    tests/db/test_corporate_actions.py's
+    test_preview_of_an_added_spinoff_reports_the_child_it_creates, but nothing
+    asserted that rendering ever reached a user before this test existed --
+    `corporate add` previews by default, so a preview that silently omitted
+    the position it is about to create was exactly the failure Task 3 existed
+    to remove, and only the inner half (preview_effect itself) was pinned.
+
+    The input that would make this fail: deleting the `for fill in
+    preview.created:` loop at the bottom of `_print_effect` (cli.py). That
+    change leaves `preview.fills_changed` and the parent's basis reduction
+    still printed -- this test's assertions on "new:", "180.00" and "0.1875"
+    are what catch the child going unmentioned; a version of this test that
+    only checked `rc == 0` or "preview only" would stay green.
+    """
+    account_id, instrument_id = account_with_1800
+    # account_with_1800 only inserts the fill -- positions are read from
+    # materialised `trade` rows (db/positions.py), not fills directly, so
+    # without this the account has no position at all yet and "nothing
+    # changed" below would hold vacuously regardless of what --commit=False
+    # did. Regrouping first gives a real ZXCO position to prove untouched.
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation="0.375", commit=False,
+        )
+    )
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "preview only" in out
+    # 1800 * 1/10 shares at (1800 * 0.05 * 0.375) / 180 -- same figures
+    # test_preview_of_an_added_spinoff_reports_the_child_it_creates pins on
+    # `preview.created` directly. Checked against imports/ (`grep -rn
+    # "0\.1875" imports/` and `grep -rnw "180" imports/`, both empty): neither
+    # is a real broker figure this repo could be mistaken for.
+    assert "new: 180.00 @ 0.1875" in out
+
+    # Nothing written: no action stored, and the pre-existing ZXCO position is
+    # unchanged with no ZXCB position minted alongside it.
+    assert await list_actions(conn, instrument_id) == []
+    positions = {p.symbol: p for p in await open_positions(conn, account_id)}
+    assert positions.keys() == {"ZXCO"}
+    assert positions["ZXCO"].quantity == Decimal(1800)
+
+
+async def test_a_mark_on_the_new_symbol_prices_the_position_after_a_symbol_change(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """Spec §8, and Half A's whole user-visible payoff. Marks are looked up by
+    `position.instrument_id`, which since this branch comes from
+    `COALESCE(t.effective_instrument_id, f.instrument_id)` (db/positions.py) --
+    so a mark set on the instrument the position moved TO is what prices it.
+    That was sound by inspection and asserted nowhere.
+
+    A mark is deliberately set on BOTH instruments, at different prices. A test
+    that marked only ZXCB could not tell "priced by the new symbol" from "priced
+    by whatever mark happens to exist"; with both set, the unrealized figure
+    names which one was used.
+
+    The inputs that would make this fail:
+      * dropping the COALESCE, so the position resolves back to ZXCO -- the row
+        then prints 1674.00 (the ZXCO mark) instead of 702.00;
+      * dropping `effective_instrument_id` from the trade upsert's DO UPDATE SET
+        or its INSERT column list -- the position resolves to ZXCO the same way;
+      * `latest_marks` keyed on the opening fill's instrument rather than the
+        position's -- same 1674.00.
+    """
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    now = datetime.now(UTC)
+    await set_mark(conn, zxcb, Decimal("0.44"), now)
+    # The decoy: a mark on the instrument the position is no longer reported
+    # under. Nothing must reach for it.
+    await set_mark(conn, instrument_id, Decimal("0.98"), now)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_positions(_positions_args(account=str(account_id)))
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+
+    assert "ZXCB" in out
+    assert "ZXCO" not in out
+    # The mark column carries the price and its date, so an unpriced row would
+    # render "--" here instead.
+    assert "0.44 @" in out
+    assert "702.00" in out    # (0.44 - 0.05) * 1800 * 1
+    assert "1674.00" not in out  # what the ZXCO decoy mark would have produced
+
+
+async def test_trades_and_positions_agree_on_the_symbol_after_a_symbol_change(
+    conn, account_with_1800, zxcb, monkeypatch, capsys
+):
+    """Spec §8. The two commands read different columns for the same fact:
+    `deadband trades` prints `trade.primary_underlying`, written by
+    regroup_account from the ADJUSTED fill's instrument, while `deadband
+    positions` prints `instrument.symbol` resolved through
+    `COALESCE(t.effective_instrument_id, f.instrument_id)`. Before this branch
+    those disagreed after a symbol change -- trades said ZXCB, positions said
+    ZXCO -- which is the exact split gap #38 recorded.
+
+    Compares the two rendered symbol fields to each OTHER, not each to a
+    hardcoded "ZXCB" separately: two independent assertions can both be edited
+    to a new expected value and stay green while the commands disagree. This
+    one cannot pass unless they match.
+
+    The input that would make it fail: reverting db/positions.py's COALESCE to
+    `f.instrument_id`. `trades` still prints ZXCB (primary_underlying comes from
+    the adjusted fill), `positions` prints ZXCO, and the equality below breaks.
+    """
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    assert await cli.cmd_trades(argparse.Namespace(account=str(account_id))) == 0
+    trades_out = capsys.readouterr().out
+    assert await cli.cmd_positions(_positions_args(account=str(account_id))) == 0
+    positions_out = capsys.readouterr().out
+
+    # One fill, so exactly one row from each command. `trades` renders
+    # "<date>  <symbol> <direction> ...", `positions` renders
+    # "<symbol> <account> ...".
+    (trades_row,) = trades_out.splitlines()
+    (positions_row,) = positions_out.splitlines()
+    assert trades_row.split()[1] == positions_row.split()[0] == "ZXCB"
+
+
+async def test_corporate_add_refuses_a_merger_with_no_resulting_symbol(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """RESTORED from PR #10, which deleted it as vacuous once merger was refused
+    outright. The guard it covers (cli.py's `_RESULTING_INSTRUMENT_TYPES` check)
+    is live code again now that the type-level refusal is gone. Flag-level, so
+    it must refuse before any connection is opened -- ZXCB is never created
+    here, and a version that resolved symbols first would refuse for the wrong
+    reason."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="merger", symbol="ZXCO", ex_date="2026-03-02", ratio="1:6", commit=True
+        )
+    )
+    assert rc == 2
+    assert "resulting" in capsys.readouterr().err.lower()
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_corporate_add_refuses_a_spinoff_with_no_basis_allocation(
+    conn, account_with_1800, monkeypatch, capsys
+):
+    """RESTORED from PR #10. Refuses in stage 1, before a connection is opened
+    -- which is why ZXCB never needs to exist for this test."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:1",
+            resulting_symbol="ZXCB", commit=True,
+        )
+    )
+    assert rc == 2
+    assert "basis" in capsys.readouterr().err.lower()
+    assert await list_actions(conn, instrument_id) == []
+
+
+@pytest.mark.parametrize("allocation", ["NaN", "abc"])
+async def test_corporate_add_refuses_a_basis_allocation_that_is_not_a_finite_number(
+    conn, account_with_1800, monkeypatch, capsys, allocation
+):
+    """RESTORED from PR #10. InvalidOperation is NOT a ValueError subclass, and
+    an ordering comparison against Decimal('NaN') raises rather than returning
+    False -- so the is_finite() guard is load-bearing, not decorative. Also
+    stage 1: whether a basis allocation parses does not depend on the
+    database."""
+    _account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must refuse before opening a connection")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_corporate_add(
+        _corporate_args(
+            type="spinoff", symbol="ZXCO", ex_date="2026-03-02", ratio="1:10",
+            resulting_symbol="ZXCB", basis_allocation=allocation, commit=True,
+        )
+    )
+    assert rc == 2
+    assert await list_actions(conn, instrument_id) == []
 
 
 async def test_corporate_add_refuses_an_unknown_symbol(
@@ -3414,10 +3607,7 @@ def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monk
     invisible to every namespace-built test in this file.
 
     `--type spinoff` is used because it is the only type that exercises BOTH
-    --resulting-symbol and --basis-allocation in one invocation. The real
-    handler refuses that type (gap #39) and refuses those two flags for the
-    types it accepts -- which is exactly why the check has to happen inside the
-    handler and all five members stay in argparse's `choices`. This test
+    --resulting-symbol and --basis-allocation in one invocation. This test
     replaces the handler with a spy, so it pins the parser's flag-to-dest
     mapping and nothing about what the handler does with it."""
     captured = []

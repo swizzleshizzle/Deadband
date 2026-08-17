@@ -10,13 +10,76 @@ from uuid import UUID
 import asyncpg
 
 from db.accounts import UnknownAccountError, get_account
-from db.corporate import actions_for_instruments
+from db.corporate import actions_with_ids_for_instruments
 from db.fills import fetch_fills
 from db.instruments import get_multipliers
-from ledger.corporate import adjust_fills
+
+# `_spinoff_fill_id` is private by name, but this is the allowed import direction
+# (db -> ledger; the purity test only forbids the reverse), and inverting this
+# exact hash is how a derived fill's provenance is recovered without re-deriving
+# WHICH fills a spinoff applies to. See the design's section 5.1a.
+from ledger.corporate import (
+    ActionType,
+    CorporateAction,
+    _spinoff_fill_id,
+    adjust_fills,
+)
 from ledger.grouping import group_fills
 from ledger.pnl import compute_pnl
 from ledger.types import TradeIntent
+
+
+class UnattributableDerivedFillError(RuntimeError):
+    """adjust_fills produced a synthetic fill whose id inverts to no known
+    (parent, action) pair. See the design's section 5.1a."""
+
+    def __init__(self, fill_id: UUID) -> None:
+        super().__init__(f"cannot attribute derived fill {fill_id} to a corporate action")
+        self.fill_id = fill_id
+
+
+# The trade UPSERT, in two forms. A spinoff-derived trade's opening allocation is
+# a derived_fill row rather than a fill row, so its id belongs in
+# opening_derived_fill_id and its ON CONFLICT target is the partial unique index
+# over that column instead. Both forms are generated from one body so the column
+# list, the placeholders and the DO UPDATE SET cannot drift apart -- in
+# particular effective_instrument_id must be written by both, since it is the
+# only place a derived trade's instrument comes from at all (db/positions.py).
+# Only one of the two opening columns is ever written; the other stays NULL,
+# which is what trade's "at most one opening" CHECK requires.
+_TRADE_UPSERT_BODY = """
+                INSERT INTO trade (
+                    account_id, {opening}, primary_underlying, effective_instrument_id,
+                    direction, status, intent, grouping_mode, opened_at, closed_at, qty_opened,
+                    qty_closed, avg_entry, avg_exit, realized_pnl, gross_realized_pnl,
+                    fees_total, fees_realized, open_quantity, open_cost_basis, is_estimated
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,'auto',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+                )
+                ON CONFLICT (account_id, {opening}) WHERE {opening} IS NOT NULL
+                DO UPDATE SET
+                    primary_underlying       = EXCLUDED.primary_underlying,
+                    effective_instrument_id  = EXCLUDED.effective_instrument_id,
+                    direction                = EXCLUDED.direction,
+                    status                   = EXCLUDED.status,
+                    opened_at                = EXCLUDED.opened_at,
+                    closed_at                = EXCLUDED.closed_at,
+                    qty_opened               = EXCLUDED.qty_opened,
+                    qty_closed               = EXCLUDED.qty_closed,
+                    avg_entry                = EXCLUDED.avg_entry,
+                    avg_exit                 = EXCLUDED.avg_exit,
+                    realized_pnl             = EXCLUDED.realized_pnl,
+                    gross_realized_pnl       = EXCLUDED.gross_realized_pnl,
+                    fees_total               = EXCLUDED.fees_total,
+                    fees_realized            = EXCLUDED.fees_realized,
+                    open_quantity            = EXCLUDED.open_quantity,
+                    open_cost_basis          = EXCLUDED.open_cost_basis,
+                    is_estimated             = EXCLUDED.is_estimated,
+                    updated_at               = now()
+                RETURNING id
+"""
+_TRADE_UPSERT_ON_FILL = _TRADE_UPSERT_BODY.format(opening="opening_fill_id")
+_TRADE_UPSERT_ON_DERIVED = _TRADE_UPSERT_BODY.format(opening="opening_derived_fill_id")
 
 
 async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
@@ -57,6 +120,19 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # hold only PART of a zero-crossing fill, so excluding the fill whole would
     # strand -- and then reap -- the remainder. Reduce the available quantity
     # instead, and let the pure grouper allocate what is left.
+    #
+    # `tf.fill_id IS NOT NULL` is not defensive tidying. Since this branch,
+    # trade_fill rows come in two kinds -- one carries fill_id, the other
+    # derived_fill_id, and trade_fill_one_source_chk guarantees exactly one is
+    # set. Without the filter, a manual trade holding derived allocations
+    # groups them all under the key NULL and produces a `manual_held[None]`
+    # entry, which no fill's id can ever match: the derived quantity would be
+    # reserved against nothing, the derived fill regenerated in full below, and
+    # allocated a second time. UNREACHABLE TODAY -- manual grouping has no db/
+    # entry point at all, so nothing can create a manual trade that owns a
+    # derived allocation -- but this branch is what made the shape
+    # representable, and this is the function the repo treats as most
+    # load-bearing.
     manual_held: dict[UUID, Decimal] = {
         r["fill_id"]: r["held"]
         for r in await conn.fetch(
@@ -64,6 +140,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                  FROM trade_fill tf
                  JOIN trade t ON t.id = tf.trade_id
                 WHERE t.account_id = $1 AND t.grouping_mode = 'manual'
+                  AND tf.fill_id IS NOT NULL
              GROUP BY tf.fill_id""",
             account_id,
         )
@@ -96,14 +173,171 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     # A consequence, recorded as a gap rather than solved here: fills WHOLLY
     # owned by a manual trade never reach this point (they are skipped above),
     # so manual groupings are not split-adjusted.
+    #
+    # Every action type except spinoff rescales or remaps a fill in place, keeping
+    # its id; a spinoff additionally MINTS a second fill for the child instrument
+    # (spec section 5.1). Those synthetic ids have no `fill` row behind them, so
+    # they are identified here by set difference against the ids that were
+    # fetched, and persisted to `derived_fill` below before any trade points at
+    # them.
+    real_ids = {f.id for f in fills}
+    derived_provenance: dict[UUID, tuple[UUID, UUID]] = {}
+    spinoffs: list[tuple[UUID, CorporateAction]] = []
+
     if fills:
-        actions = await actions_for_instruments(
+        pairs = await actions_with_ids_for_instruments(
             conn, list({f.instrument_id for f in fills})
         )
-        if actions:
-            fills = adjust_fills(fills, actions)
+        if pairs:
+            # Kept for the provenance pass below, which runs AFTER adjustment so
+            # it can stop as soon as the fills that actually exist are attributed.
+            spinoffs = [(aid, a) for aid, a in pairs if a.action_type is ActionType.SPINOFF]
+            fills = adjust_fills(fills, [a for _id, a in pairs])
 
+    derived = [f for f in fills if f.id not in real_ids]
+
+    # Recover each derived fill's provenance by inverting _spinoff_fill_id over
+    # (candidate parent x spinoff action), giving the (root real fill, action)
+    # each minted id would have come from. adjust_fills returns bare Fills with no
+    # link back to the action that produced them, and derived_fill's two
+    # provenance columns are NOT NULL. Enumerating a hash cannot drift from
+    # adjust_fills; re-deciding WHICH fills a spinoff applies to would duplicate
+    # _ordered_actions' ordering and ex-date rules in a second place and silently
+    # disagree the first time either changes. See the design's section 5.1a.
+    #
+    # EXPANDED LAZILY, ONE ROUND AT A TIME, AND THAT IS LOAD-BEARING FOR COST.
+    # A round applies every spinoff action to every candidate, including the ids
+    # that action just minted -- applying an action to its own child always yields
+    # a fresh, never-mapped id, because _spinoff_fill_id hashes the parent. So a
+    # closure that always exhausts its round budget is R*(n+1)^n wide, for R fills
+    # and n spinoff actions: n=6 over 200 fills is ~23.5M entries, several GB, and
+    # regroup_account runs on every `import --commit`. The round bound makes it
+    # terminate; only stopping early makes it affordable.
+    #
+    # Stopping early is semantics-preserving, and the argument rests on
+    # MONOTONICITY ALONE -- deliberately not on the preimage being unique, which
+    # gap #41 records as FALSE: _spinoff_fill_id hashes (parent, resulting
+    # instrument, ex-date) and not the source instrument, so two spinoff actions
+    # differing only in their source mint the same child id for a given parent.
+    # The argument that survives that: the map only ever grows (`if child_id in
+    # derived_provenance: continue` means no round ever rewrites an entry an
+    # earlier round wrote), so whichever action writes a given child id first
+    # stays written for the rest of THIS run, whether we stop here or expand
+    # fully -- stable within a run, but NOT because
+    # actions_with_ids_for_instruments' `ORDER BY ex_date` breaks the tie
+    # between colliding actions. It cannot: two actions that collide share an
+    # ex-date by construction (ex_date is inside the hash, ledger/corporate.py),
+    # so that ordering does not distinguish them -- the iteration is over a
+    # `set` of candidates besides. Any id that IS looked up therefore resolves
+    # to exactly the pair a full expansion would have given it in this run;
+    # what a later round would add is exactly the entries nothing asks for.
+    # (WHICH of two colliding actions wins first-writer-wins is gap #41's
+    # question -- unspecified, not decided by this early exit -- stopping
+    # early cannot change the answer either way.) Real, unchained spinoffs
+    # finish in one round at R*n; a genuine depth-2 chain pays R*(n+1)^2. The
+    # guard below still fires once the budget is spent.
+    #
+    # The candidates must be the closure and not just real_ids: a spinoff whose
+    # source instrument is another spinoff's resulting instrument applies to the
+    # first one's synthetic child, and real_ids alone leaves that grandchild
+    # inverting to nothing -- which raised UnattributableDerivedFillError for the
+    # whole account, on every regroup, exactly the wedge this branch removes.
+    #
+    # What is recorded as the parent is the lineage ROOT -- the real fill the
+    # chain started from -- not the immediate parent. For a one-step spinoff those
+    # are the same id. For a chain they are not, and the root is the only one that
+    # can be stored: derived_fill.derived_from_fill_id references fill(id), and an
+    # intermediate derived fill has no `fill` row (verified: the immediate parent
+    # raises ForeignKeyViolationError on derived_fill_derived_from_fill_id_fkey).
+    # Nothing is lost that cannot be reconstructed -- corporate_action_id names
+    # the exact action, and the stored action set gives every intermediate step.
+    # Recovering the immediate parent directly would need a
+    # derived_from_derived_fill_id column; recorded as a gap.
+    if derived:
+        candidates = set(real_ids)
+        roots: dict[UUID, UUID] = {fill_id: fill_id for fill_id in real_ids}
+        for _round in range(len(spinoffs)):
+            minted: set[UUID] = set()
+            for action_id, action in spinoffs:
+                for parent_id in candidates:
+                    child_id = _spinoff_fill_id(parent_id, action)
+                    if child_id in derived_provenance:
+                        continue
+                    derived_provenance[child_id] = (roots[parent_id], action_id)
+                    roots[child_id] = roots[parent_id]
+                    minted.add(child_id)
+            if not minted:
+                break  # a further round cannot add anything a previous one did not
+            candidates |= minted
+            if all(d.id in derived_provenance for d in derived):
+                break  # every fill that actually exists is attributed
+
+    # Write order is forced by the foreign keys (spec section 5.2): the derived
+    # rows exist before the trades and trade_fill rows that reference them, and
+    # the stale ones are reaped at the very end, after those references are gone.
+    # ON CONFLICT (id) DO UPDATE rather than delete-and-insert: the uuid5 is
+    # stable across regroups, so a live derived fill keeps its identity (and any
+    # trade opening on it) while its quantity and price are refreshed.
+    for d in derived:
+        provenance = derived_provenance.get(d.id)
+        if provenance is None:
+            # Not a guess-and-insert: a synthetic fill we cannot attribute means
+            # adjust_fills minted an id we do not model, and inserting it with
+            # NULL provenance would bury that.
+            raise UnattributableDerivedFillError(d.id)
+        # `root_fill_id`, not `parent_id`: derived_from_fill_id holds the REAL
+        # fill the lineage started from. For a one-step spinoff that is the
+        # immediate parent; for a chained one it is the grandparent, because the
+        # immediate parent is itself a derived_fill row and this column
+        # references fill(id). See the closure above.
+        root_fill_id, action_id = provenance
+        await conn.execute(
+            """
+            INSERT INTO derived_fill
+                (id, account_id, instrument_id, executed_at, side, quantity, price,
+                 fee, is_estimated, derived_from_fill_id, corporate_action_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            -- Every column the INSERT supplies is refreshed, not just the three
+            -- a spinoff visibly moves. The narrower list was safe only because
+            -- ledger/corporate.py's spinoff branch happens to derive the others
+            -- from fields the uuid5 id already pins; the day that derivation
+            -- changes (a fee convention on the child, a different executed_at,
+            -- is_estimated turning off), a live row would keep its stale value
+            -- forever while a freshly-created one got the new one -- two
+            -- meanings in one column, with no error. `id` is excluded because
+            -- it is the conflict target and `account_id` because it is part of
+            -- the row's identity via derived_fill_id_account_uniq; neither can
+            -- change without minting a different row.
+            ON CONFLICT (id) DO UPDATE SET
+                instrument_id        = EXCLUDED.instrument_id,
+                executed_at          = EXCLUDED.executed_at,
+                side                 = EXCLUDED.side,
+                quantity             = EXCLUDED.quantity,
+                price                = EXCLUDED.price,
+                fee                  = EXCLUDED.fee,
+                is_estimated         = EXCLUDED.is_estimated,
+                derived_from_fill_id = EXCLUDED.derived_from_fill_id,
+                corporate_action_id  = EXCLUDED.corporate_action_id
+            """,
+            d.id,
+            account_id,
+            d.instrument_id,
+            d.executed_at,
+            d.side.value,
+            d.quantity,
+            d.price,
+            d.fee,
+            d.is_estimated,
+            root_fill_id,
+            action_id,
+        )
+
+    derived_ids = {f.id for f in derived}
+    # Two seen-lists, not one: each trade's opening allocation is either a real
+    # fill or a derived one, and the reaping predicates below have to test
+    # membership in whichever list matches that trade's opening kind.
     seen_openings: list[UUID] = []
+    seen_derived_openings: list[UUID] = []
     written = 0
 
     if fills:
@@ -128,10 +362,18 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         for g in groups:
             pnl = compute_pnl(g.allocations, by_id, multipliers, g.direction)
             # The opening allocation is this trade's stable identity across regroups.
-            opening_fill_id = min(
+            opening_allocation = min(
                 g.allocations, key=lambda a: (by_id[a.fill_id].executed_at, str(a.fill_id))
-            ).fill_id
-            seen_openings.append(opening_fill_id)
+            )
+            # `opening_id`, not `opening_fill_id`: for a spinoff-derived trade it
+            # is a derived_fill id, and which of trade's two opening columns it
+            # is written to below follows from that.
+            opening_id = opening_allocation.fill_id
+            is_derived_opening = opening_id in derived_ids
+            if is_derived_opening:
+                seen_derived_openings.append(opening_id)
+            else:
+                seen_openings.append(opening_id)
 
             # Any estimated fill taints the trade -- an opening-balance fill
             # makes the whole trade's P&L an estimate (spec section 4). ANY,
@@ -145,37 +387,11 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             # user-authored ones (intent override, planned_risk, strategy_tag, notes,
             # and B's thesis link) are left exactly as the user set them.
             trade_id = await conn.fetchval(
-                """
-                INSERT INTO trade (
-                    account_id, opening_fill_id, primary_underlying, direction, status,
-                    intent, grouping_mode, opened_at, closed_at, qty_opened, qty_closed,
-                    avg_entry, avg_exit, realized_pnl, gross_realized_pnl, fees_total,
-                    fees_realized, open_quantity, open_cost_basis, is_estimated
-                ) VALUES ($1,$2,$3,$4,$5,$6,'auto',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-                ON CONFLICT (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL
-                DO UPDATE SET
-                    primary_underlying = EXCLUDED.primary_underlying,
-                    direction          = EXCLUDED.direction,
-                    status             = EXCLUDED.status,
-                    opened_at          = EXCLUDED.opened_at,
-                    closed_at          = EXCLUDED.closed_at,
-                    qty_opened         = EXCLUDED.qty_opened,
-                    qty_closed         = EXCLUDED.qty_closed,
-                    avg_entry          = EXCLUDED.avg_entry,
-                    avg_exit           = EXCLUDED.avg_exit,
-                    realized_pnl       = EXCLUDED.realized_pnl,
-                    gross_realized_pnl = EXCLUDED.gross_realized_pnl,
-                    fees_total         = EXCLUDED.fees_total,
-                    fees_realized      = EXCLUDED.fees_realized,
-                    open_quantity      = EXCLUDED.open_quantity,
-                    open_cost_basis    = EXCLUDED.open_cost_basis,
-                    is_estimated       = EXCLUDED.is_estimated,
-                    updated_at         = now()
-                RETURNING id
-                """,
+                _TRADE_UPSERT_ON_DERIVED if is_derived_opening else _TRADE_UPSERT_ON_FILL,
                 account_id,
-                opening_fill_id,
+                opening_id,
                 underlyings.get(g.instrument_ids[0]),
+                by_id[opening_allocation.fill_id].instrument_id,
                 g.direction.value,
                 g.status.value,
                 intent,
@@ -215,25 +431,56 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             # a cross-account allocation is unrepresentable. The brief's original
             # insert omitted the column and would raise NotNullViolationError on
             # every call.
+            #
+            # Each allocation routes to exactly one of fill_id / derived_fill_id
+            # (trade_fill_one_source_chk requires exactly one to be non-NULL), on
+            # the same membership test the opening allocation used above. A
+            # synthetic id sent to fill_id violates trade_fill_fill_fk.
             await conn.executemany(
-                "INSERT INTO trade_fill (trade_id, fill_id, account_id, quantity) "
-                "VALUES ($1,$2,$3,$4)",
-                [(trade_id, a.fill_id, account_id, a.quantity) for a in g.allocations],
+                "INSERT INTO trade_fill "
+                "(trade_id, fill_id, derived_fill_id, account_id, quantity) "
+                "VALUES ($1,$2,$3,$4,$5)",
+                [
+                    (
+                        trade_id,
+                        None if a.fill_id in derived_ids else a.fill_id,
+                        a.fill_id if a.fill_id in derived_ids else None,
+                        account_id,
+                        a.quantity,
+                    )
+                    for a in g.allocations
+                ],
             )
             written += 1
 
     # Single protection step, AFTER grouping and BEFORE the final DELETE. A trade
-    # is stale here if it either lost its opening fill entirely
-    # (opening_fill_id IS NULL — deleted) or its opening fill no longer opens
-    # anything (NOT IN seen_openings — a backdated fill changed the grouping).
+    # is stale here if it either lost its opening allocation entirely (BOTH
+    # opening columns NULL — deleted) or its opening allocation no longer opens
+    # anything (not in the seen-list matching its opening kind — a backdated fill
+    # changed the grouping).
+    #
+    # The predicate tests each trade against the ONE list its opening kind belongs
+    # to (spec section 5.3). A spinoff-derived trade has opening_fill_id NULL by
+    # construction, so the older `opening_fill_id IS NULL OR ...` spelling called
+    # every such trade stale and reaped it in the very next statement — quietly,
+    # since it happens after the trade was correctly written. "Both columns NULL"
+    # is still stale, which preserves the orphan path exactly.
     # By this point every live fill, including any that partially belonged to a
     # stale trade via a zero-crossing split, has already been reallocated in
     # full to a fresh auto trade above — that is what makes a single pass here
     # correct where the old two-pass version was not. If a stale trade carries
-    # user content, convert it to a permanent manual record: free its
-    # opening_fill_id (so a future auto upsert can never collide with it) and
-    # null every derived column (it owns zero fills now; leaving stale P&L on
-    # it would double-count against whatever trade its fills now belong to).
+    # user content, convert it to a permanent manual record: free BOTH opening
+    # columns (so a future auto upsert can never collide with it on either
+    # partial unique index) and null every derived column (it owns zero fills
+    # now; leaving stale P&L on it would double-count against whatever trade its
+    # fills now belong to).
+    # effective_instrument_id is one of those derived columns: it is written
+    # only from a live opening allocation's fill, so once opening_fill_id is
+    # freed there is no live fill left to have derived it from. Leaving it
+    # behind would let db/positions.py's COALESCE resolve a stale instrument
+    # for a trade that no longer has one -- the same "unreachable instrument
+    # must not look reachable" contract open_quantity/open_cost_basis are
+    # nulled here to uphold.
     # `status` is left as-is — it is NOT NULL and no longer meaningful once the
     # row is judgment-only, but there is no null-able substitute for it.
     # `is_estimated` is likewise NOT NULL DEFAULT FALSE, so NULL isn't an option
@@ -248,6 +495,8 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
            SET grouping_mode = 'manual',
                updated_at = now(),
                opening_fill_id = NULL,
+               opening_derived_fill_id = NULL,
+               effective_instrument_id = NULL,
                qty_opened = NULL, qty_closed = NULL,
                avg_entry = NULL, avg_exit = NULL,
                realized_pnl = NULL, gross_realized_pnl = NULL,
@@ -257,7 +506,11 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                is_estimated = FALSE
          WHERE account_id = $1
            AND grouping_mode = 'auto'
-           AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))
+           AND ((opening_fill_id IS NULL AND opening_derived_fill_id IS NULL)
+                OR (opening_fill_id IS NOT NULL
+                    AND NOT (opening_fill_id = ANY($2::uuid[])))
+                OR (opening_derived_fill_id IS NOT NULL
+                    AND NOT (opening_derived_fill_id = ANY($4::uuid[]))))
            AND (notes IS NOT NULL OR planned_risk IS NOT NULL
                 OR strategy_tag IS NOT NULL OR intent <> $3)
         RETURNING id
@@ -265,6 +518,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         account_id,
         seen_openings,
         intent,
+        seen_derived_openings,
     )
     if protected:
         await conn.execute(
@@ -281,10 +535,32 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
         DELETE FROM trade
          WHERE account_id = $1
            AND grouping_mode = 'auto'
-           AND (opening_fill_id IS NULL OR NOT (opening_fill_id = ANY($2::uuid[])))
+           AND ((opening_fill_id IS NULL AND opening_derived_fill_id IS NULL)
+                OR (opening_fill_id IS NOT NULL
+                    AND NOT (opening_fill_id = ANY($2::uuid[])))
+                OR (opening_derived_fill_id IS NOT NULL
+                    AND NOT (opening_derived_fill_id = ANY($3::uuid[]))))
         """,
         account_id,
         seen_openings,
+        seen_derived_openings,
+    )
+
+    # Derived fills are reaped LAST, after every trade and trade_fill row that
+    # could reference them is gone (spec section 5.2). Doing it earlier would let
+    # trade_opening_derived_fill_fk's ON DELETE SET NULL quietly strip a live
+    # trade's opening. Unconditional, like the trade DELETE above and for the
+    # same reason: when the action that produced a derived fill is removed, this
+    # run produces no derived fills at all and the old rows must not survive it
+    # -- that is what makes removal a genuine undo (spec section 5.4).
+    await conn.execute(
+        """
+        DELETE FROM derived_fill
+         WHERE account_id = $1
+           AND NOT (id = ANY($2::uuid[]))
+        """,
+        account_id,
+        list(derived_ids),
     )
 
     return written

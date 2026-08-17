@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS trade (
     -- trade's user-authored fields (notes, planned_risk, strategy_tag, intent) with it.
     -- A trade orphaned this way keeps its judgment; regroup decides what to do with it.
     opening_fill_id     UUID,
+    -- FK attached below via named ALTER TABLE, not inline: derived_fill does
+    -- not exist yet at this point in the file, and the migration attaches
+    -- this same FK as a named ALTER too -- inline REFERENCES here would get
+    -- a Postgres-generated constraint name instead, and the two files would
+    -- disagree (see test_schema_equivalence.py).
+    effective_instrument_id UUID,
+    opening_derived_fill_id UUID,
     opened_at           TIMESTAMPTZ NOT NULL,
     closed_at           TIMESTAMPTZ,
     qty_opened          NUMERIC,
@@ -141,31 +148,86 @@ CREATE TABLE IF NOT EXISTS trade (
     -- violates account_id's own NOT NULL and makes the fill un-deletable.
     CONSTRAINT trade_opening_fill_fk
         FOREIGN KEY (opening_fill_id, account_id)
-        REFERENCES fill (id, account_id) ON DELETE SET NULL (opening_fill_id)
+        REFERENCES fill (id, account_id) ON DELETE SET NULL (opening_fill_id),
+    -- At most one opening kind. Both NULL stays legal and keeps its existing
+    -- meaning: an orphaned trade that kept its judgment (see regroup_account's
+    -- protection step).
+    CONSTRAINT trade_one_opening_chk
+        CHECK (opening_fill_id IS NULL OR opening_derived_fill_id IS NULL)
 );
+
+-- UPGRADE PATH, NOT REDUNDANT WITH THE INLINE DECLARATIONS ABOVE. DO NOT DELETE.
+--
+-- migrate.apply() runs THIS FILE FIRST and the migrations afterwards (db/migrate.py).
+-- On an existing database `CREATE TABLE IF NOT EXISTS trade` above is skipped whole,
+-- so the two columns declared inside it never appear -- and trade_opening_derived_uniq,
+-- four statements below, indexes one of them. Without these two ALTERs that index
+-- raises `column "opening_derived_fill_id" does not exist`, asyncpg's implicit
+-- transaction rolls the whole file back, and apply() dies BEFORE migration 003 -- the
+-- only thing that would have added the columns -- ever runs. A fresh database is
+-- unaffected, which is why nothing caught it: these are no-ops there.
+--
+-- They add the columns ONLY, and nothing else about them. Everything a pre-003 table
+-- is still missing is supplied afterwards: the named foreign keys by the ALTER ...
+-- ADD CONSTRAINT block at the end of this file (and, identically, by 003), and
+-- trade_one_opening_chk, trade_fill_one_source_chk and trade_fill's surrogate primary
+-- key by migration 003 alone, since those exist here only inline inside a CREATE TABLE
+-- that an existing database skips. This is the minimum that lets the rest of this file
+-- run against a pre-003 table, not a second copy of the migration.
+--
+-- Placement is load-bearing: each ALTER must precede the FIRST statement in this file
+-- that names its column -- for `trade` the indexes immediately below, for `trade_fill`
+-- trade_fill_derived_uniq further down. NOT the ADD CONSTRAINT block near the end of
+-- the file, which is only reached long after both of those indexes have already run.
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS effective_instrument_id UUID;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS opening_derived_fill_id UUID;
 
 CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
 CREATE INDEX IF NOT EXISTS trade_opened_at_idx ON trade (opened_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_fill_uniq
     ON trade (account_id, opening_fill_id) WHERE opening_fill_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS trade_opening_derived_uniq
+    ON trade (account_id, opening_derived_fill_id)
+    WHERE opening_derived_fill_id IS NOT NULL;
 
 -- Association is an allocation, not a foreign key on fill: one fill that crosses
 -- zero belongs to two trades, split by quantity. account_id is a deliberate
 -- denormalization: it is what lets the composite FKs below make a cross-account
 -- allocation impossible to insert, rather than merely unlikely.
+--
+-- Surrogate id, not a composite PRIMARY KEY (trade_id, fill_id): a spinoff
+-- allocation has no fill_id, and a composite primary key cannot contain a
+-- nullable column. The old uniqueness is preserved instead by the two partial
+-- indexes below.
 CREATE TABLE IF NOT EXISTS trade_fill (
-    trade_id    UUID NOT NULL,
-    fill_id     UUID NOT NULL,
-    account_id  UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-    quantity    NUMERIC NOT NULL CHECK (quantity > 0),
-    PRIMARY KEY (trade_id, fill_id),
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    trade_id        UUID NOT NULL,
+    fill_id         UUID,
+    derived_fill_id UUID,
+    account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    quantity        NUMERIC NOT NULL CHECK (quantity > 0),
     CONSTRAINT trade_fill_trade_fk FOREIGN KEY (trade_id, account_id)
         REFERENCES trade (id, account_id) ON DELETE CASCADE,
     CONSTRAINT trade_fill_fill_fk FOREIGN KEY (fill_id, account_id)
-        REFERENCES fill (id, account_id) ON DELETE CASCADE
+        REFERENCES fill (id, account_id) ON DELETE CASCADE,
+    -- Exactly one of fill_id / derived_fill_id -- trade_fill_derived_fk (below,
+    -- after derived_fill exists) attaches the second half of this pairing.
+    CONSTRAINT trade_fill_one_source_chk CHECK (num_nonnulls(fill_id, derived_fill_id) = 1)
 );
 
+-- UPGRADE PATH, NOT REDUNDANT WITH THE INLINE DECLARATION ABOVE. DO NOT DELETE.
+-- Same reason as the pair above `trade_account_status_idx`: on an existing database
+-- the CREATE TABLE is skipped, and trade_fill_derived_uniq just below indexes this
+-- column. Migration 003 still supplies the surrogate `id`, the primary key rework and
+-- trade_fill_one_source_chk; trade_fill_derived_fk is attached by the ADD CONSTRAINT
+-- block at the end of this file as well as by 003.
+ALTER TABLE trade_fill ADD COLUMN IF NOT EXISTS derived_fill_id UUID;
+
 CREATE INDEX IF NOT EXISTS trade_fill_fill_idx ON trade_fill (fill_id);
+CREATE UNIQUE INDEX IF NOT EXISTS trade_fill_real_uniq
+    ON trade_fill (trade_id, fill_id) WHERE fill_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS trade_fill_derived_uniq
+    ON trade_fill (trade_id, derived_fill_id) WHERE derived_fill_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS cash_movement (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -209,6 +271,66 @@ CREATE TABLE IF NOT EXISTS corporate_action (
     note                    TEXT,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Spinoff children are the only fills adjust_fills invents rather than rescales:
+-- ledger/corporate.py mints a uuid5 for them, and no `fill` row exists to match.
+-- trade.opening_fill_id and trade_fill.fill_id are non-deferrable COMPOSITE foreign
+-- keys into fill (id, account_id), so persisting one raises ForeignKeyViolationError.
+--
+-- Fills stay ground truth (design D1): derived rows get their own table rather than a
+-- flag on `fill`. regroup_account regenerates this table on every run and never reads
+-- it back -- its job is to give the foreign keys something real to point at, and to
+-- let a human answer "where did this position come from?".
+--
+-- Declared here, after corporate_action, not up near fill/trade/trade_fill: it
+-- references corporate_action, which is declared later in this file, and table
+-- order is not reshuffled for this. The three foreign keys that point at it from
+-- trade and trade_fill are attached below as named ALTER TABLE statements instead
+-- of inline, for the same reason -- see trade_effective_instrument_fk's comment.
+CREATE TABLE IF NOT EXISTS derived_fill (
+    id                   UUID PRIMARY KEY,          -- supplied, never defaulted: it is
+                                                    -- _spinoff_fill_id's uuid5, which is
+                                                    -- what makes ON CONFLICT (id) stable
+    account_id           UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    instrument_id        UUID NOT NULL REFERENCES instrument(id),
+    executed_at          TIMESTAMPTZ NOT NULL,
+    side                 TEXT NOT NULL CHECK (side IN ('buy','sell')),
+    quantity             NUMERIC NOT NULL
+                         CHECK (quantity > 0 AND quantity < 'Infinity'::numeric),
+    price                NUMERIC NOT NULL
+                         CHECK (price >= 0 AND price < 'Infinity'::numeric),
+    fee                  NUMERIC NOT NULL DEFAULT 0
+                         CHECK (fee >= 0 AND fee < 'Infinity'::numeric),
+    is_estimated         BOOLEAN NOT NULL DEFAULT TRUE,
+    derived_from_fill_id UUID NOT NULL REFERENCES fill(id) ON DELETE CASCADE,
+    corporate_action_id  UUID NOT NULL REFERENCES corporate_action(id) ON DELETE CASCADE,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Composite target, mirroring fill_id_account_uniq.
+    CONSTRAINT derived_fill_id_account_uniq UNIQUE (id, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS derived_fill_account_idx ON derived_fill (account_id);
+
+-- Inline REFERENCES would get a Postgres-generated constraint name
+-- (trade_effective_instrument_id_fkey); the migration attaches this same FK as
+-- the named ALTER below, so both must use ALTER or schema.sql and the
+-- migration would disagree on the constraint name (test_schema_equivalence.py).
+ALTER TABLE trade DROP CONSTRAINT IF EXISTS trade_effective_instrument_fk;
+ALTER TABLE trade ADD  CONSTRAINT trade_effective_instrument_fk
+    FOREIGN KEY (effective_instrument_id) REFERENCES instrument(id);
+
+-- Column-scoped SET NULL (PG15+), for the same reason trade_opening_fill_fk needs it:
+-- a bare ON DELETE SET NULL on a composite FK nulls account_id too, which then violates
+-- its own NOT NULL and makes the referenced row un-deletable.
+ALTER TABLE trade DROP CONSTRAINT IF EXISTS trade_opening_derived_fill_fk;
+ALTER TABLE trade ADD  CONSTRAINT trade_opening_derived_fill_fk
+    FOREIGN KEY (opening_derived_fill_id, account_id)
+    REFERENCES derived_fill (id, account_id) ON DELETE SET NULL (opening_derived_fill_id);
+
+ALTER TABLE trade_fill DROP CONSTRAINT IF EXISTS trade_fill_derived_fk;
+ALTER TABLE trade_fill ADD  CONSTRAINT trade_fill_derived_fk
+    FOREIGN KEY (derived_fill_id, account_id)
+    REFERENCES derived_fill (id, account_id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS account_snapshot (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

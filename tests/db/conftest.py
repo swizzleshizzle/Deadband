@@ -40,12 +40,60 @@ def _split(
     )
 
 
-def _fill(acc, inst, *, side, quantity, price, ref):
+def _symbol_change(instrument_id, resulting_instrument_id, *, ex_date=date(2026, 3, 2)):
+    return CorporateAction(
+        instrument_id=instrument_id,
+        action_type=ActionType.SYMBOL_CHANGE,
+        ex_date=ex_date,
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=resulting_instrument_id,
+    )
+
+
+def _merger(
+    instrument_id, resulting_instrument_id, *, num="1", den="6", ex_date=date(2026, 3, 2)
+):
+    return CorporateAction(
+        instrument_id=instrument_id,
+        action_type=ActionType.MERGER,
+        ex_date=ex_date,
+        ratio_numerator=Decimal(num),
+        ratio_denominator=Decimal(den),
+        resulting_instrument_id=resulting_instrument_id,
+    )
+
+
+def _spinoff(
+    instrument_id,
+    resulting_instrument_id,
+    *,
+    num="1",
+    den="10",
+    allocation="0.375",
+    ex_date=date(2026, 3, 2),
+):
+    return CorporateAction(
+        instrument_id=instrument_id,
+        action_type=ActionType.SPINOFF,
+        ex_date=ex_date,
+        ratio_numerator=Decimal(num),
+        ratio_denominator=Decimal(den),
+        resulting_instrument_id=resulting_instrument_id,
+        basis_allocation=Decimal(allocation),
+    )
+
+
+def _fill(acc, inst, *, side, quantity, price, ref, executed_at=_T0):
+    """`executed_at` defaults to _T0, which is BEFORE the 2026-03-02 ex-date the
+    action helpers above default to -- the side of the ex-date a fill falls on is
+    what decides whether an action applies to it at all. Override it only to put
+    a fill deliberately after an action (e.g. selling spun-off shares)."""
     return Fill(
         id=uuid4(),
         account_id=acc,
         instrument_id=inst,
-        executed_at=_T0,
+        executed_at=executed_at,
         side=side,
         quantity=Decimal(quantity),
         price=Decimal(price),
@@ -71,3 +119,22 @@ async def account_with_1800(conn):
         conn, [_fill(acc, inst, side=Side.BUY, quantity="1800", price="0.05", ref="zx1800")]
     )
     return acc, inst
+
+
+@pytest_asyncio.fixture
+async def zxcb(conn):
+    """The instrument a symbol change, merger or spinoff resolves TO."""
+    return await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCB", quote_currency="USD"),
+    )
+
+
+@pytest_asyncio.fixture
+async def zxcc(conn):
+    """A second resulting instrument, so two actions off the same parent can be
+    told apart."""
+    return await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCC", quote_currency="USD"),
+    )

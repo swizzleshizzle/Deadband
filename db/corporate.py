@@ -27,6 +27,11 @@ class EffectPreview:
     # (before, after) pairs, capped -- the preview is for a human deciding
     # whether the ratio is right, not an audit log.
     samples: tuple[tuple[Fill, Fill], ...]
+    # Fills the proposed action would MINT, which by definition have no
+    # `before` half and so cannot ride in `samples`. Today only a spinoff
+    # produces these (`ledger.corporate.adjust_fills` is the authority on
+    # which types may mint an id). Same cap, same purpose.
+    created: tuple[Fill, ...] = ()
 
 
 _SAMPLE_CAP = 3
@@ -45,7 +50,7 @@ def _to_action(row: asyncpg.Record) -> CorporateAction:
     )
 
 
-async def _fetch_actions_for_instruments(
+async def actions_with_ids_for_instruments(
     conn: asyncpg.Connection, instrument_ids: Sequence[UUID]
 ) -> list[tuple[UUID, CorporateAction]]:
     """(id, CorporateAction) pairs for every action touching any of
@@ -58,6 +63,10 @@ async def _fetch_actions_for_instruments(
     written queries that happen to usually agree. The `removing=` branch needs
     the id to drop by; `actions_for_instruments` only needs the dataclass, so
     it discards the id at the end.
+
+    Public rather than private because regroup_account is a third caller that
+    must record WHICH action produced a derived fill: derived_fill.
+    corporate_action_id is NOT NULL and the pure dataclass carries no row id.
     """
     if not instrument_ids:
         return []
@@ -145,7 +154,7 @@ async def find_duplicate(
 async def actions_for_instruments(
     conn: asyncpg.Connection, instrument_ids: Sequence[UUID]
 ) -> list[CorporateAction]:
-    pairs = await _fetch_actions_for_instruments(conn, instrument_ids)
+    pairs = await actions_with_ids_for_instruments(conn, instrument_ids)
     return [action for _id, action in pairs]
 
 
@@ -163,13 +172,13 @@ async def preview_effect(
     print the same plausible 1800 -> 300 while the stored state silently became
     1800 -> 50. See the design's section 5.
 
-    `stored` and `proposed` are both built from `_fetch_actions_for_instruments`,
+    `stored` and `proposed` are both built from `actions_with_ids_for_instruments`,
     the same helper `actions_for_instruments` uses -- so they differ by exactly
     the added/removed action, not by two queries with different predicates
     (one scoped by instrument_id only, the other also matching
     resulting_instrument_id) that could silently select different row sets.
     """
-    pairs = await _fetch_actions_for_instruments(conn, [instrument_id])
+    pairs = await actions_with_ids_for_instruments(conn, [instrument_id])
     stored = [action for _id, action in pairs]
     if adding is not None:
         proposed = [*stored, adding]
@@ -188,6 +197,7 @@ async def preview_effect(
     accounts = 0
     changed = 0
     samples: list[tuple[Fill, Fill]] = []
+    created: list[Fill] = []
     for account_id in account_ids:
         fills = await fetch_fills(conn, account_id)
         before = {f.id: f for f in adjust_fills(fills, stored)}
@@ -199,8 +209,26 @@ async def preview_effect(
                 touched += 1
                 if len(samples) < _SAMPLE_CAP and a is not None:
                     samples.append((b, a))
+        # The other direction, and it is not symmetry for its own sake. The loop
+        # above iterates `before` and looks each id up in `after`, so it can see
+        # a fill that DISAPPEARS (`a is None`) but never one that APPEARS. A
+        # spinoff mints a child fill for the resulting instrument -- present only
+        # in `after` -- so previewing `corporate add --type spinoff` reported the
+        # parent's basis reduction and said nothing at all about the new position
+        # it was about to create. Given that `add` previews by default, that is a
+        # preview omitting the most visible thing the action does.
+        for fill_id, a in after.items():
+            if fill_id not in before:
+                touched += 1
+                if len(created) < _SAMPLE_CAP:
+                    created.append(a)
         if touched:
             accounts += 1
             changed += touched
 
-    return EffectPreview(accounts=accounts, fills_changed=changed, samples=tuple(samples))
+    return EffectPreview(
+        accounts=accounts,
+        fills_changed=changed,
+        samples=tuple(samples),
+        created=tuple(created),
+    )

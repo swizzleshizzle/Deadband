@@ -16,7 +16,9 @@ from db.instruments import upsert_instrument
 from ledger.corporate import ActionType, CorporateAction
 from ledger.types import AssetClass, Instrument
 from tests.conftest import requires_db
-from tests.db.conftest import _split  # account_with_1800 is auto-discovered from conftest.py
+
+# account_with_1800 and zxcb are fixtures, auto-discovered from conftest.py.
+from tests.db.conftest import _spinoff, _split
 
 pytestmark = requires_db
 
@@ -128,6 +130,61 @@ async def test_preview_of_a_removal_shows_the_reverse(conn, account_with_1800):
     (before, after), = preview.samples
     assert before.quantity == Decimal(300)
     assert after.quantity == Decimal(1800)
+
+
+async def test_preview_of_an_added_spinoff_reports_the_child_it_creates(
+    conn, account_with_1800, zxcb
+):
+    """A spinoff MINTS a fill for the resulting instrument. preview_effect used
+    to iterate `before` and look each id up in `after`, so a fill present only in
+    `after` was invisible: `corporate add --type spinoff` previewed the parent's
+    basis reduction (0.05 -> 0.03125 at 37.5% allocated) and never mentioned the
+    180 ZXCB shares it was about to create. `add` previews by default, so that is
+    the preview omitting the most visible thing the action does.
+
+    The input that would make this fail: this exact one -- 1800 ZXCO at 0.05,
+    1:10 spinoff to ZXCB with 37.5% of basis allocated. Under the old
+    before-keyed loop `fills_changed` is 1 (the parent) and `created` is empty;
+    both assertions below move.
+
+    Asserts the child's quantity and price, not just a count: a fix that
+    incremented the counter without carrying the fill through would leave the
+    rendering with nothing to print and this test green.
+    """
+    _account_id, instrument_id = account_with_1800
+    preview = await preview_effect(conn, instrument_id, adding=_spinoff(instrument_id, zxcb))
+
+    assert preview.fills_changed == 2  # the parent's basis, AND the new child
+    assert preview.accounts == 1
+    (child,) = preview.created
+    assert child.instrument_id == zxcb
+    assert child.quantity == Decimal(180)          # 1800 * 1/10
+    assert child.price == Decimal("0.1875")        # (1800 * 0.05 * 0.375) / 180
+    # The parent is still reported in `samples`, unchanged in quantity and
+    # reduced in basis -- the new counting must add to the old, not replace it.
+    ((before, after),) = preview.samples
+    assert before.quantity == after.quantity == Decimal(1800)
+    assert after.price == Decimal("0.03125")       # 0.05 * (1 - 0.375)
+
+
+async def test_preview_of_a_removed_spinoff_reports_the_child_disappearing(
+    conn, account_with_1800, zxcb
+):
+    """The mirror of the test above, and the reason the asymmetry was worth
+    fixing rather than working around: removal was ALREADY counted (the loop
+    over `before` sees the child vanish as `a is None`), so before this change
+    adding a spinoff and removing it reported different fill counts for the same
+    one action. `created` stays empty here -- nothing is minted by a removal.
+
+    The input that would make this fail: making creations count by dropping the
+    `a is None` branch instead of adding a second loop -- this would then report
+    1 rather than 2.
+    """
+    _account_id, instrument_id = account_with_1800
+    action_id = await add_action(conn, _spinoff(instrument_id, zxcb))
+    preview = await preview_effect(conn, instrument_id, removing=action_id)
+    assert preview.fills_changed == 2
+    assert preview.created == ()
 
 
 async def test_preview_of_an_instrument_with_no_fills_is_empty(conn, an_instrument):

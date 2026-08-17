@@ -103,20 +103,29 @@ expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
 
 ### Corporate actions
 
-`corporate add`, `corporate list` and `corporate remove` manage **split and reverse-split**
-records. A stored action is never applied to a fill in place — it is applied at read time,
-inside `regroup_account`, so raw fills stay ground truth and removing an action is a
-genuine undo rather than a second restatement.
+`corporate add`, `corporate list` and `corporate remove` manage all five `ActionType`
+members — `split`, `reverse_split`, `merger`, `spinoff` and `symbol_change`. A stored
+action is never applied to a fill in place — it is applied at read time, inside
+`regroup_account`, so raw fills stay ground truth and removing an action is a genuine
+undo rather than a second restatement.
 
-That read-time design is also why the other three `ActionType` members — `merger`,
-`spinoff` and `symbol_change` — are **refused**, with exit 2 and an explanation, rather
-than stored. `ledger/corporate.py` computes all five correctly, but an action that changes
-*which instrument* a fill belongs to cannot be materialised into a `trade` row while the
-`fill` table is never rewritten: the position would keep reporting under the old symbol
-(disagreeing with `deadband trades`, and never priced by a mark on the new one), and a
-spinoff's synthetic child fill has no `fill` row for `trade.opening_fill_id`'s composite
-foreign key to point at. It is a recorded limitation, not a bug —
-[`docs/known-gaps.md`](docs/known-gaps.md) gap #39 states what closing it would take.
+That read-time design used to make the three identity-changing types unrepresentable: an
+action that moves a fill to a different instrument, or invents one outright, could not be
+materialised into a `trade` row while `fill` is deliberately never rewritten. Two schema
+additions close that. `trade.effective_instrument_id` is written by `regroup_account` from
+each trade's *adjusted* opening fill, and `open_positions` prefers it over the raw
+fill-instrument join — so a `merger` or `symbol_change` now reports, and prices off a mark
+on the new symbol, under the resulting instrument rather than the source one. A spinoff's
+synthetic child fill is persisted to a new `derived_fill` table instead of being conjured
+fresh on every read, which gives `trade.opening_fill_id`'s composite foreign key a real
+row to point at and lets `corporate remove` reap it cleanly.
+
+**A spinoff creates a second position.** The parent trade keeps its full quantity; only
+its cost basis shrinks, by `--basis-allocation` — the fraction of the *parent's* cost
+basis that moves to the child — and a new trade opens on the resulting instrument holding
+that allocated basis. `--basis-allocation` is required for `spinoff` only, must be between
+0 and 1, and is refused for every other type, for the same reason `--resulting-symbol` is
+refused outside the three types that produce one (below).
 
 ```bash
 uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
@@ -124,6 +133,11 @@ uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
 
 uv run python cli.py corporate add --type reverse_split --symbol ZXCO \
     --ex-date 2026-03-02 --ratio 1:6 --commit                              # write + regroup every holder
+
+uv run python cli.py corporate add --type spinoff --symbol ZXCO \
+    --ex-date 2026-03-02 --ratio 1:1 --resulting-symbol ZXCB \
+    --basis-allocation 0.2 --commit          # ZXCO keeps its quantity, 20% of its cost
+                                              # basis moves to a new ZXCB position
 
 uv run python cli.py corporate list --symbol ZXCO
 
@@ -139,14 +153,11 @@ the row and then regroups every account holding the instrument, all inside one
 transaction, so a crash between the write and a regroup can never leave one account
 adjusted and another stale.
 
-`--type` accepts `split` and `reverse_split`. `merger`, `spinoff` and `symbol_change` are
-still offered by `--type` — they stay in its choices deliberately, so the refusal comes
-from the handler and can explain itself rather than from argparse as a bare "invalid
-choice" — but supplying one exits 2, writes nothing, and opens no connection. Neither
-accepted type uses `--resulting-symbol` or `--basis-allocation`, so passing either is also
-refused: a stored `resulting_instrument_id` joins that instrument's action set and can
-raise `circular corporate-action dependency` out of every later regroup, including
-`import --commit`.
+`--type` accepts all five `ActionType` members. `--resulting-symbol` is required for
+`merger`, `spinoff` and `symbol_change` — the instrument the action produces — and refused
+for `split`/`reverse_split`, which produce none: storing one anyway would join the action
+into the resulting instrument's own action set and can raise `circular corporate-action
+dependency` out of every later regroup, including `import --commit`.
 
 `--ratio NEW:OLD` maps directly onto `ratio_numerator:ratio_denominator`, the direction
 `adjust_fills` consumes: a quantity is scaled by `numerator / denominator`. A 1-for-6
@@ -157,12 +168,15 @@ looking plausible.
 
 `corporate list` optionally filters with `--symbol` and prints, per action, the id
 `remove` needs, its ex-date, symbol, type, ratio, resulting symbol (if any), and basis
-allocation (if any). See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–39) for what
-this leaves open: corporate actions still can't be *imported* from a venue export, manual
-trades aren't split-adjusted, merger cash isn't modelled, there's no audit trail on a
-restatement, no database-level duplicate guard, an action recorded against the result of an
-earlier one regroups nothing, and the three identity-changing types are refused rather than
-supported.
+allocation (if any) — but nothing about a derived position it produced; see the gaps
+below. See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–41) for what this branch
+leaves open: corporate actions still can't be *imported* from a venue export, manual
+trades aren't split-adjusted, merger cash isn't modelled (and is now reachable in
+practice, since `merger` is no longer refused), there's no audit trail on a restatement,
+no database-level duplicate guard, an action recorded against the result of an earlier one
+still regroups nothing, `derived_fill` has no CLI visibility, and the invariants that let
+spinoffs identify their own synthetic fills are conventions the schema cannot enforce, not
+constraints.
 
 ### Reconciliation
 

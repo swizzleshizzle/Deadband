@@ -5,12 +5,14 @@ from uuid import uuid4
 import pytest_asyncio
 
 from db.accounts import create_account
+from db.corporate import add_action
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.positions import open_positions
 from db.trades import list_trades, regroup_account
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
+from tests.db.conftest import _merger, _split, _symbol_change
 
 pytestmark = requires_db
 
@@ -402,3 +404,157 @@ async def test_an_orphaned_trade_with_a_real_quantity_is_still_unvaluable(conn):
     assert len(ps) == 1
     assert ps[0].unvaluable_reason is not None
     assert ps[0].quantity == Decimal(0)  # the real 7 must NOT be reported
+
+
+async def test_a_symbol_change_reports_the_position_under_the_new_instrument(
+    conn, account_with_1800, zxcb
+):
+    """Before this, open_positions resolved the instrument from the RAW opening
+    fill, which the adjustment never rewrites -- so the position kept reporting
+    under the old symbol while `deadband trades` reported the new one, and a mark
+    on the new symbol never priced it.
+
+    Regrouped once BEFORE the action exists (so the trade row is INSERTed with
+    effective_instrument_id pointing at the raw instrument) and once AFTER (so
+    the same row is hit by the UPSERT's DO UPDATE branch, not another INSERT).
+    A single regroup only ever exercises the INSERT branch, which would leave
+    an UPDATE-only regression -- e.g. effective_instrument_id dropped from the
+    DO UPDATE SET list -- undetected."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await add_action(conn, _symbol_change(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == zxcb
+    assert position.symbol == "ZXCB"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_a_merger_reports_the_new_instrument_and_the_rescaled_quantity(
+    conn, account_with_1800, zxcb
+):
+    """A merger changes instrument AND magnitude. 1800 at 1:6 -> 300 of ZXCB."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _merger(instrument_id, zxcb))
+    await regroup_account(conn, account_id)
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == zxcb
+    assert position.quantity == Decimal(300)
+
+
+async def test_a_reverse_split_leaves_the_instrument_alone(conn, account_with_1800):
+    """effective_instrument_id is written for every trade, not only relabelled
+    ones. A split must record the instrument it already had, not NULL and not
+    something else.
+
+    Reads the column directly rather than only through open_positions: a
+    split never changes the instrument, so effective_instrument_id (if
+    written) and the COALESCE fallback f.instrument_id are the SAME value --
+    a read through open_positions alone cannot tell "written correctly" from
+    "never written, read-side fallback happened to agree." A conditional bug
+    that only writes the column when a relabelling action fired (leaving it
+    NULL for every split-only trade) would pass a read-side-only assertion
+    here. Querying the column pins the write itself."""
+    account_id, instrument_id = account_with_1800
+    await add_action(conn, _split(instrument_id))
+    await regroup_account(conn, account_id)
+    written = await conn.fetchval(
+        "SELECT effective_instrument_id FROM trade WHERE account_id = $1", account_id
+    )
+    assert written == instrument_id
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+    assert position.quantity == Decimal(300)
+
+
+async def test_a_trade_predating_the_column_still_reports_its_fills_instrument(
+    conn, account_with_1800
+):
+    """effective_instrument_id is nullable and pre-existing rows are not
+    backfilled, so the COALESCE fallback is load-bearing rather than defensive."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await conn.execute(
+        "UPDATE trade SET effective_instrument_id = NULL WHERE account_id = $1", account_id
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+
+
+async def test_a_trade_with_no_opening_fill_but_an_effective_instrument_still_resolves(
+    conn, account_with_1800
+):
+    """Pins the shape Task 3's spinoff-derived trades will have: opening_fill_id
+    NULL (a spinoff's opening allocation is a synthetic row in `derived_fill`,
+    which has no `fill` counterpart -- that is the entire reason `derived_fill`
+    exists), but opening_derived_fill_id AND effective_instrument_id both set.
+
+    This branch first gated db/positions.py's instrument join on
+    `t.opening_fill_id IS NOT NULL` alone, reasoning that opening_fill_id
+    nullity meant "orphaned, so unreachable." That gate would have made every
+    spinoff-derived position resolve no instrument and no symbol at all --
+    wrong for a trade that isn't orphaned, just fillless by construction. The
+    gate must accept EITHER opening column: opening_fill_id for a normal
+    trade, opening_derived_fill_id for a spinoff-derived one.
+
+    Task 3 does not exist yet, so a derived_fill row is constructed by hand
+    here purely to give opening_derived_fill_id (a real FK) something valid
+    to reference -- its content is not semantically a spinoff, only a row
+    the constraint will accept."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    action_id = await add_action(conn, _split(instrument_id))
+    fill_id = await conn.fetchval("SELECT id FROM fill WHERE account_id = $1", account_id)
+    derived_id = uuid4()
+    await conn.execute(
+        """
+        INSERT INTO derived_fill (
+            id, account_id, instrument_id, executed_at, side, quantity, price,
+            derived_from_fill_id, corporate_action_id
+        ) VALUES ($1, $2, $3, now(), 'buy', 1, 1, $4, $5)
+        """,
+        derived_id, account_id, instrument_id, fill_id, action_id,
+    )
+    await conn.execute(
+        "UPDATE trade SET opening_fill_id = NULL, opening_derived_fill_id = $2 "
+        "WHERE account_id = $1",
+        account_id, derived_id,
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.instrument_id == instrument_id
+    assert position.symbol == "ZXCO"
+    assert position.quantity == Decimal(1800)
+
+
+async def test_a_trade_with_both_openings_null_resolves_no_instrument(
+    conn, account_with_1800
+):
+    """The genuine orphan case: opening_fill_id AND opening_derived_fill_id
+    both NULL -- no live opening allocation of any kind, whether created by
+    regroup_account's protection step or by a raw fill/derived_fill delete
+    with no regroup afterward.
+
+    effective_instrument_id is left NON-NULL and pointing at a real
+    instrument here, deliberately -- a stale value, exactly what a direct
+    delete outside regroup_account produces, since nothing at the database
+    level nulls it to match either opening pointer. With NULL, COALESCE(NULL,
+    f.instrument_id) is already NULL before any gate runs (f cannot join when
+    opening_fill_id is NULL), so a NULL effective_instrument_id can't tell a
+    correct gate from no gate at all, or from the single-column
+    `opening_fill_id IS NOT NULL` gate this branch tried and rejected -- every
+    one of them passes identically. Only a STALE, non-NULL
+    effective_instrument_id with both opening pointers NULL falsifies a wrong
+    gate: it proves the join is keyed on having an opening of some kind, not
+    on whether effective_instrument_id happens to be populated. This is the
+    executable form of the argument that ruled out the single-column gate."""
+    account_id, instrument_id = account_with_1800
+    await regroup_account(conn, account_id)
+    await conn.execute(
+        "UPDATE trade SET opening_fill_id = NULL, opening_derived_fill_id = NULL, "
+        "effective_instrument_id = $2 WHERE account_id = $1",
+        account_id,
+        instrument_id,
+    )
+    (position,) = await open_positions(conn, account_id)
+    assert position.unvaluable_reason is not None
+    assert position.quantity == Decimal(0)

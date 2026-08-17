@@ -1270,52 +1270,6 @@ _RESULTING_INSTRUMENT_TYPES = {ActionType.MERGER, ActionType.SPINOFF, ActionType
 # for nothing else, so the flag-level refusal below cannot drift from it.
 _BASIS_ALLOCATION_TYPES = {ActionType.SPINOFF}
 
-# The three types this CLI REFUSES to record. Written out as its own set rather
-# than aliased to _RESULTING_INSTRUMENT_TYPES above: the two coincide today, and
-# not by accident -- a type needs a resulting instrument precisely because it
-# moves a fill to a different instrument or creates a new one -- but they are
-# different claims ("needs a flag" vs. "cannot be materialised at all") and a
-# future member should have to answer both questions separately.
-#
-# WHY, in full, because a bare "unsupported" would send a user with a real
-# merger to record hunting a bug that isn't there:
-#
-# `ledger/corporate.py` computes all five types correctly and is not the
-# problem. The problem is that the design derives adjustments at READ time over
-# a `fill` table that is never rewritten (that is what makes `corporate remove`
-# a genuine undo rather than a second restatement), and the two facts a position
-# is built from disagree for any action that changes a fill's IDENTITY rather
-# than only its magnitude:
-#
-#   * `db/positions.py` resolves a position's instrument through
-#     `LEFT JOIN fill f ON f.id = t.opening_fill_id` -> `f.instrument_id`, i.e.
-#     from the RAW fill, while `db/trades.py` writes `trade.primary_underlying`
-#     from the ADJUSTED one. A merger or symbol change therefore leaves
-#     `deadband positions` reporting the OLD symbol while `deadband trades`
-#     reports the new one -- and a mark set on the new symbol never prices the
-#     position at all. Verified against the real database: both types report
-#     the position under the source symbol.
-#   * A spinoff's synthetic child fill (`ledger/corporate.py:215`) is given a
-#     `uuid5` id that has no row in `fill`. `trade.opening_fill_id` and
-#     `trade_fill.fill_id` are non-deferrable COMPOSITE foreign keys into
-#     `fill (id, account_id)` (`db/schema.sql:143-144`, `:164-165`), so
-#     persisting a trade opened by that fill raises
-#     ForeignKeyViolationError on `trade_opening_fill_fk`. Also verified.
-#
-# `split` and `reverse_split` only rescale `quantity`/`price` on a row that
-# already exists, so they round-trip correctly and are accepted.
-#
-# Supporting the other three is a SCHEMA change -- an `effective_instrument_id`
-# column on `trade`, spinoff fills actually persisted, and `open_positions`
-# preferring the stored column over the join -- and is deliberately out of
-# scope. Recorded as gap #39 in docs/known-gaps.md.
-#
-# All five members stay in `--type`'s argparse `choices` on purpose: the refusal
-# has to come from here, with that explanation, rather than from argparse as a
-# bare usage error that says only "invalid choice".
-_UNMATERIALISABLE_TYPES = {ActionType.MERGER, ActionType.SPINOFF, ActionType.SYMBOL_CHANGE}
-
-
 def _parse_ex_date(raw: str) -> date | None:
     """`--ex-date` -> a plain date. NOT `_parse_as_of`: an ex-date is a
     calendar day the exchange declares, never a timestamp, and
@@ -1397,6 +1351,15 @@ def _print_effect(headline: str, preview: EffectPreview) -> None:
             f"    {_fmt_decimal(before.quantity)} @ {_fmt_decimal(before.price)}"
             f"  ->  {_fmt_decimal(after.quantity)} @ {_fmt_decimal(after.price)}"
         )
+    # A minted fill has no "before" half, so it cannot ride in the arrow form
+    # above. Rendered on its own line rather than as "-- -> qty @ price": a
+    # spinoff's child is the new POSITION the action creates, which is the most
+    # visible thing about it, and the preview said nothing about it at all until
+    # this line existed. The resulting symbol is not repeated here -- it is
+    # already on the command line the user just typed, and preview_effect deals
+    # in instrument ids, not symbols.
+    for fill in preview.created:
+        print(f"    new: {_fmt_decimal(fill.quantity)} @ {_fmt_decimal(fill.price)}")
 
 
 async def _regroup_holders(conn, instrument_id: UUID) -> int:
@@ -1427,34 +1390,6 @@ async def cmd_corporate_add(args) -> int:
     action_type = ActionType(args.type)
 
     # --- stage 1: flag-level only, before any connection is opened ---
-    #
-    # FIRST, before even the ratio and ex-date are parsed: a user recording a
-    # merger must not be sent away to fix a ratio for a command that was never
-    # going to be accepted. See _UNMATERIALISABLE_TYPES above for the full
-    # reasoning this message is a condensed form of.
-    if action_type in _UNMATERIALISABLE_TYPES:
-        print(
-            f"error: --type {action_type} cannot be recorded. This is a recorded "
-            "limitation of this ledger (docs/known-gaps.md gap #39), not a mistake in "
-            "your input and not a bug to report.\n"
-            f"  A {action_type} changes WHICH INSTRUMENT a fill belongs to, and corporate "
-            "actions are applied at read time over a `fill` table that is deliberately "
-            "never rewritten. A position's instrument comes from its opening fill "
-            "(db/positions.py joins fill.instrument_id) while trade.primary_underlying "
-            "comes from the adjusted fill, so the position would keep reporting under the "
-            "OLD symbol, disagreeing with `deadband trades`, and a mark set on the new "
-            "symbol would never price it. A spinoff additionally needs a `fill` row for "
-            "the synthetic child it creates, and trade.opening_fill_id's composite "
-            "foreign key into fill (id, account_id) has nothing to point at.\n"
-            "  Supporting these needs a schema change -- an effective_instrument_id "
-            "column on `trade`, persisted spinoff fills, and open_positions preferring "
-            "that column -- which is out of scope for this branch.\n"
-            "  Accepted today: --type split and --type reverse_split, which only rescale "
-            "a fill that already exists.",
-            file=sys.stderr,
-        )
-        return 2
-
     ratio = _parse_ratio(args.ratio)
     if ratio is None:
         return 2
@@ -1468,22 +1403,13 @@ async def cmd_corporate_add(args) -> int:
     # the type does not use is not harmless:
     #
     #   `--type split --resulting-symbol ZXCB` used to be accepted and stored.
-    #   `_fetch_actions_for_instruments` (db/corporate.py) matches on
+    #   `actions_with_ids_for_instruments` (db/corporate.py) matches on
     #   `resulting_instrument_id` as well as `instrument_id`, so that row joins
     #   ZXCB's action set, enters `_ordered_actions`' dependency graph, and can
     #   raise `ValueError: circular corporate-action dependency` out of
     #   `adjust_fills` -- inside `regroup_account`, for EVERY account holding
     #   either instrument, on every regroup including `import --commit`, naming
     #   neither the offending action nor how to remove it.
-    #
-    # The two "requires" checks below are currently UNREACHABLE: the only types
-    # that require either flag are the three _UNMATERIALISABLE_TYPES already
-    # refused above. They are left in rather than deleted, the same way
-    # ledger/corporate.py keeps its `if i != j` self-dependency guard after
-    # __post_init__ made it unreachable -- deleting them would silently drop
-    # the flag-level refusal (and with it the "refused before any connection is
-    # opened" property) the day those types are re-enabled, leaving only
-    # CorporateAction.__post_init__'s database-dependent version.
     if action_type in _RESULTING_INSTRUMENT_TYPES and args.resulting_symbol is None:
         print(f"error: --type {action_type} requires --resulting-symbol", file=sys.stderr)
         return 2
@@ -1513,12 +1439,6 @@ async def cmd_corporate_add(args) -> int:
 
     basis_allocation: Decimal | None = None
     if args.basis_allocation is not None:
-        # Unreachable today for the same reason the two "requires" checks above
-        # are -- spinoff is the only type that uses this flag and every other
-        # type now refuses it outright -- and kept for the same reason: it is
-        # what a re-enabled spinoff needs, and losing it would put a Decimal NaN
-        # in front of __post_init__'s ordering comparison.
-        #
         # Same InvalidOperation/is_finite pair as --ratio above, and the
         # is_finite half is load-bearing here: an ORDERING comparison against
         # a Decimal NaN raises InvalidOperation rather than returning False
