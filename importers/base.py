@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
 from typing import Protocol
 from uuid import UUID
@@ -152,6 +152,27 @@ class CanonicalCash:
 
 
 @dataclass(frozen=True, slots=True)
+class CorporateActionProposal:
+    """A logical corporate action, grouped from one or more recognised
+    CORPORATE_ACTION rows (see importers/fidelity.py's Outcome.CORPORATE_ACTION
+    and _group_corporate_actions). Never written anywhere -- `cli.py`'s
+    `corporate add` is the only path that turns one into a stored action, and
+    nothing in this import pipeline calls it. `ratio` is always None coming
+    out of `importers/`; Task 3 fills it (spec §6), and the spinoff case is
+    filled later still, by `cli.py` against a ledger holding (spec §6, last
+    row of the table) -- which is why the field is optional here at all.
+    """
+    kind: str                       # 'reverse_split' | 'name_change' | 'merger' | 'spinoff'
+    ex_date: date
+    source_cusip: str | None
+    resulting_cusip: str | None
+    description: str                # the venue's own text, for a human to identify it
+    quantities: tuple[Decimal, ...]  # the evidence the ratio was derived from
+    ratio: tuple[Decimal, Decimal] | None = None   # filled by Task 3; None until then
+    group_ref: str | None = None    # the #REOR reference, or None when the fallback keyed it
+
+
+@dataclass(frozen=True, slots=True)
 class ImportBatch:
     fills: tuple[CanonicalFill, ...] = ()
     cash: tuple[CanonicalCash, ...] = ()
@@ -185,6 +206,20 @@ class ImportBatch:
     # route_batch runs, rather than refusing on blocking unconditionally
     # before an account's ignore status is even known.
     blocking: tuple[tuple[str | None, str], ...] = ()
+    # Proposed corporate actions grouped from CORPORATE_ACTION rows (spec
+    # §5) -- never applied here. `cli.py`'s `corporate add` is the only
+    # place one of these is turned into a stored action; nothing in this
+    # pipeline calls it. Empty means either no corporate-action rows were
+    # present, or every group found was reported as unrecognised instead
+    # (see `warnings`) -- never "recognised but silently dropped."
+    corporate_actions: tuple[CorporateActionProposal, ...] = ()
+    # Cash-in-lieu-of-fractional-shares rows, kept OUT of `corporate_actions`
+    # deliberately: it moves real cash (gap #35's arithmetic) and is never
+    # applied, so listing it beside the proposals would imply an action
+    # `corporate add` can record, which it cannot (spec §7, D6). Each entry
+    # is the row's own description text, verbatim, so a human can still see
+    # it happened even though nothing acts on it.
+    cash_in_lieu: tuple[str, ...] = ()
 
 
 def _locator(where: int | str) -> str:

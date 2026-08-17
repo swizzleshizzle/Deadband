@@ -7,12 +7,13 @@ import enum
 import io
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 from importers.base import (
     CanonicalCash,
     CanonicalFill,
+    CorporateActionProposal,
     ImportBatch,
     normalize_field,
     zero_amount_warning,
@@ -228,6 +229,185 @@ def classify(action: str, symbol: str) -> Rule | None:
     return None
 
 
+# The `#REOR` reorganisation reference. Verified against the real exports,
+# not invented -- see tests/test_fidelity_history.py's module docstring,
+# which spec §5 requires this to be derived from rather than guessed at. A
+# reference is a shared BASE plus a trailing per-leg suffix: e.g.
+# `M9990000010001` and `M9990000010000` are two legs of ONE event because
+# they share the base `M999000001` (drop the last 4 characters), NOT because
+# the two full references are equal, and NOT because the trailing suffix's
+# last digit (observed values 0, 1, 2, 4 -- not a contiguous run from zero)
+# predicts anything about the row's role in the event -- see
+# _derive_cusip_pair below for why role is read from quantity sign instead.
+_REOR_RE = re.compile(r"#REOR\s+(\S+)")
+_REOR_LEG_SUFFIX_LEN = 4
+
+
+def _reor_base(token: str) -> str:
+    """The shared portion of a #REOR reference that ties one event's rows
+    together -- see _REOR_RE's comment just above for the verified example
+    this is pinned against. Do not change the suffix length without
+    re-reading tests/test_fidelity_history.py's module docstring; it is not
+    a guess."""
+    if len(token) <= _REOR_LEG_SUFFIX_LEN:
+        return token
+    return token[:-_REOR_LEG_SUFFIX_LEN]
+
+
+# A cusip-shaped token immediately before "#REOR" -- present on FROM/TO rows,
+# absent on PAYOUT rows (nothing sits directly against "#REOR" there but the
+# literal word "PAYOUT", which this pattern's digit requirement excludes).
+_OWN_CUSIP_RE = re.compile(r"([A-Z0-9]{6,12})#REOR")
+# A cusip-shaped token inside parentheses elsewhere in the row. Money
+# notation like "(Cash)" and a bare symbol like "(ZXCO )" never match --
+# both lack digits, which this pattern requires.
+_PAREN_CUSIP_RE = re.compile(r"\(([A-Z]{1,6}\d{5,9})\)")
+
+
+def _parse_reor(action: str) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """Extract the row's own #REOR reference (or None), the cusip-shaped
+    token immediately preceding it (or None), and any cusip-shaped tokens
+    found in parentheses elsewhere in the row's action text."""
+    ref_match = _REOR_RE.search(action)
+    reor_ref = ref_match.group(1) if ref_match else None
+    own_match = _OWN_CUSIP_RE.search(action)
+    own_cusip = own_match.group(1) if own_match else None
+    paren_cusips = tuple(_PAREN_CUSIP_RE.findall(action))
+    return reor_ref, own_cusip, paren_cusips
+
+
+# rule.name -> CorporateActionProposal.kind. cash_in_lieu is deliberately
+# absent: it never becomes a proposal (see ImportBatch.cash_in_lieu).
+_KIND_BY_RULE_NAME: dict[str, str] = {
+    "reverse_split": "reverse_split",
+    "name_change": "name_change",
+    "merger": "merger",
+    "spinoff_distribution": "spinoff",
+}
+
+# Group shapes from spec §5/§1: two legs for a reverse split and a name
+# change, three for a merger, one for a spinoff. A group whose row count
+# doesn't match its kind's entry here is reported as unrecognised rather
+# than coerced into the nearest match (spec §7).
+_EXPECTED_LEG_COUNT: dict[str, int] = {
+    "reverse_split": 2,
+    "name_change": 2,
+    "merger": 3,
+    "spinoff": 1,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _CorporateActionRow:
+    """One recognised, not-yet-grouped CORPORATE_ACTION row (cash-in-lieu
+    excluded -- see ImportBatch.cash_in_lieu). Internal to this module:
+    importers/base.py only ever sees the grouped CorporateActionProposal that
+    _group_corporate_actions produces from a list of these."""
+    line_no: int
+    kind: str
+    ex_date: date
+    quantity: Decimal
+    description: str
+    symbol: str | None
+    own_cusip: str | None
+    group_key: tuple
+
+
+def _group_corporate_actions(
+    rows: list["_CorporateActionRow"],
+) -> tuple[tuple[CorporateActionProposal, ...], tuple[str, ...]]:
+    """Group recognised corporate-action rows into proposals on the venue's
+    own #REOR reference (spec §5), preserving first-seen order. A row with no
+    usable #REOR token (this fixture's spinoff row has none at all) was
+    already assigned a (ex-date, CUSIP-pair) fallback key when it was built
+    -- see the CORPORATE_ACTION branch in parse().
+
+    A group whose row count doesn't match its kind's expected shape, or
+    whose rows disagree on kind (should not happen given RULES, but is
+    checked rather than assumed), is reported as unrecognised -- spec §7 —
+    and produces no proposal.
+    """
+    groups: dict[tuple, list[_CorporateActionRow]] = {}
+    order: list[tuple] = []
+    for row in rows:
+        bucket = groups.setdefault(row.group_key, [])
+        if not bucket:
+            order.append(row.group_key)
+        bucket.append(row)
+
+    proposals: list[CorporateActionProposal] = []
+    warnings: list[str] = []
+
+    for key in order:
+        group_rows = groups[key]
+        lines = ", ".join(str(r.line_no) for r in group_rows)
+        kinds = {r.kind for r in group_rows}
+
+        if len(kinds) != 1:
+            warnings.append(
+                f"unrecognised corporate action: lines {lines} share a "
+                f"reorganisation reference but disagree on kind "
+                f"({sorted(kinds)!r})"
+            )
+            continue
+
+        kind = next(iter(kinds))
+        expected = _EXPECTED_LEG_COUNT[kind]
+        if len(group_rows) != expected:
+            warnings.append(
+                f"unrecognised corporate action: {kind} at lines {lines} has "
+                f"{len(group_rows)} row(s), expected {expected}"
+            )
+            continue
+
+        source_cusip, resulting_cusip = _derive_cusip_pair(group_rows)
+        proposals.append(
+            CorporateActionProposal(
+                kind=kind,
+                ex_date=group_rows[0].ex_date,
+                source_cusip=source_cusip,
+                resulting_cusip=resulting_cusip,
+                description=" | ".join(
+                    r.description for r in group_rows if r.description
+                ),
+                quantities=tuple(r.quantity for r in group_rows),
+                group_ref=key[1] if key[0] == "reor" else None,
+            )
+        )
+
+    return tuple(proposals), tuple(warnings)
+
+
+def _derive_cusip_pair(
+    group_rows: list["_CorporateActionRow"],
+) -> tuple[str | None, str | None]:
+    """Best-effort only -- neither field is asserted by any test, and this
+    deliberately does not try to be more confident than the data supports.
+
+    The cusip-shaped token immediately before #REOR ('own_cusip') is the
+    only position present across FROM/TO rows (PAYOUT rows never carry one),
+    but it is NOT a reliable 'old vs new' signal for every shape: a merger's
+    two FROM legs (going to two different resulting companies) share the
+    SAME own_cusip, because that position names the company being given up,
+    not the one each leg individually receives -- confirmed by inspecting
+    this fixture's own merger rows, not assumed. Reporting that shared value
+    as a single resulting_cusip would be exactly the false-confidence this
+    task's brief warns against (a wrong CUSIP is a smaller error than a wrong
+    ratio, but the shape of the mistake is the same).
+
+    So a side is only resolved when exactly ONE row sits on it: quantity
+    strictly negative (shares given up) is source_cusip, strictly positive
+    (shares received) is resulting_cusip. A merger's two-row positive side
+    (or its own_cusip-less PAYOUT row) therefore yields None on that side --
+    an honest "not derivable from this row shape", not a guess.
+    """
+    negative = [r for r in group_rows if r.quantity < 0]
+    positive = [r for r in group_rows if r.quantity > 0]
+    source_cusip = negative[0].own_cusip if len(negative) == 1 else None
+    resulting_cusip = positive[0].own_cusip if len(positive) == 1 else None
+    return source_cusip, resulting_cusip
+
+
 def parse_option_symbol(symbol: str) -> Instrument | None:
     """Parse Fidelity's option symbol. Returns None for anything that isn't one
     (including a syntactically matching symbol with an impossible calendar date —
@@ -311,6 +491,15 @@ class FidelityImporter:
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
+        # CORPORATE_ACTION rows (cash-in-lieu excluded), collected here and
+        # grouped into CorporateActionProposals AFTER the row loop -- a
+        # reorganisation's legs can arrive on non-adjacent lines (see the
+        # merger's three rows in tests/fixtures/fidelity/real_shape_history.csv),
+        # so grouping cannot happen row-by-row the way fills/cash do.
+        corporate_action_rows: list[_CorporateActionRow] = []
+        # Cash-in-lieu-of-fractional-shares rows -- see ImportBatch.cash_in_lieu
+        # for why these are kept out of corporate_action_rows entirely.
+        cash_in_lieu: list[str] = []
         # Reasons the whole batch must refuse to commit -- see
         # ImportBatch.blocking's docstring for why this is narrower than
         # "every unmapped row" and wider than "none of them". Each entry is
@@ -668,13 +857,65 @@ class FidelityImporter:
                 continue
 
             if rule.outcome is Outcome.CORPORATE_ACTION:
-                # Recognised and DEFERRED, not recorded and not refused. This
-                # row's follow-up is a `corporate add` proposal a later task
-                # emits -- see Outcome.CORPORATE_ACTION's docstring for why
-                # this is neither INTERNAL (no follow-up) nor UNSUPPORTED
-                # (blocks unconditionally). Nothing is appended to `fills`,
-                # `cash`, `unmapped`, or `blocking`: the row is fully
-                # accounted for by being recognised, not by being reported.
+                # Recognised and DEFERRED, not recorded and not refused --
+                # see Outcome.CORPORATE_ACTION's docstring for why this is
+                # neither INTERNAL (no follow-up) nor UNSUPPORTED (blocks
+                # unconditionally). Nothing is appended to `fills`, `cash`,
+                # `unmapped`, or `blocking`: the row is fully accounted for
+                # by being recognised, not by being reported -- except that
+                # it is collected here for grouping (or, for cash-in-lieu,
+                # for its own separate report) after the row loop.
+                description = (row.get("description") or "").strip()
+
+                if rule.name == "cash_in_lieu":
+                    # Recognised, reported separately, never applied (spec
+                    # §7, D6) -- see ImportBatch.cash_in_lieu's docstring.
+                    cash_in_lieu.append(description or action)
+                    continue
+
+                try:
+                    quantity = _decimal(row.get("quantity"))
+                except InvalidOperation as exc:
+                    # Does not block (Outcome.CORPORATE_ACTION never does),
+                    # but silently dropping the row would leave a merger or
+                    # split one leg short with nothing saying why -- warn and
+                    # exclude it from grouping, same "warn rather than fail
+                    # open OR closed" shape as every other guard in this
+                    # file.
+                    warnings.append(
+                        f"line {line_no}: corporate action has unparsable "
+                        f"quantity ({exc}), excluded from grouping"
+                    )
+                    continue
+
+                reor_ref, own_cusip, paren_cusips = _parse_reor(action)
+                if reor_ref:
+                    group_key = ("reor", _reor_base(reor_ref))
+                else:
+                    # Fallback per spec §5: (ex-date, CUSIP pair). No row in
+                    # this fixture's real_shape_history.csv without a #REOR
+                    # token has a cusip-shaped token either (the spinoff row
+                    # has neither), so the symbol is included as a last
+                    # resort to keep such rows from all colliding onto one
+                    # (ex_date, ()) key if more than one ever appears on the
+                    # same date.
+                    cusip_tuple = tuple(
+                        sorted(set(paren_cusips) | ({own_cusip} if own_cusip else set()))
+                    )
+                    group_key = ("fallback", when.date(), cusip_tuple or (symbol or "",))
+
+                corporate_action_rows.append(
+                    _CorporateActionRow(
+                        line_no=line_no,
+                        kind=_KIND_BY_RULE_NAME[rule.name],
+                        ex_date=when.date(),
+                        quantity=quantity,
+                        description=description,
+                        symbol=symbol or None,
+                        own_cusip=own_cusip,
+                        group_key=group_key,
+                    )
+                )
                 continue
 
             if rule.outcome is not Outcome.CASH:
@@ -721,6 +962,9 @@ class FidelityImporter:
                 )
             )
 
+        corporate_actions, group_warnings = _group_corporate_actions(corporate_action_rows)
+        warnings.extend(group_warnings)
+
         return ImportBatch(
             fills=tuple(fills),
             cash=tuple(cash),
@@ -728,4 +972,6 @@ class FidelityImporter:
             unmapped_rows=tuple(unmapped),
             refs_seen=tuple(sorted(refs_seen)),
             blocking=tuple(blocking),
+            corporate_actions=corporate_actions,
+            cash_in_lieu=tuple(cash_in_lieu),
         )

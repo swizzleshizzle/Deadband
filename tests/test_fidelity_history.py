@@ -29,7 +29,7 @@ so Task 2 can be built and tested against it directly.
 import pathlib
 from decimal import Decimal
 
-from importers.fidelity import FidelityImporter
+from importers.fidelity import FidelityImporter, _reor_base
 from ledger.types import Side
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "fidelity" / "real_shape_history.csv"
@@ -93,3 +93,82 @@ def test_corporate_action_rows_produce_exactly_the_ordinary_rows_worth_of_output
     cash = batch.cash[0]
     assert cash.kind == "dividend"
     assert cash.amount == Decimal("6.25")
+
+
+def test_reor_base_matches_the_verified_docstring_examples():
+    """Pins the #REOR base extraction against the exact values this file's
+    own module docstring (above) states were checked directly against the
+    real exports -- the literal verified strings, not a re-derived guess."""
+    assert _reor_base("M9990000010001") == _reor_base("M9990000010000") == "M999000001"
+    assert (
+        _reor_base("M9990000030002")
+        == _reor_base("M9990000030001")
+        == _reor_base("M9990000030000")
+        == "M999000003"
+    )
+
+
+def test_each_reorganisation_becomes_one_proposal():
+    """Grouping is on the venue's own #REOR reference -- Fidelity stating which
+    rows are one event -- not on inference from date and CUSIP."""
+    kinds = [p.kind for p in _batch().corporate_actions]
+    assert sorted(kinds) == ["merger", "name_change", "reverse_split", "spinoff"]
+
+
+def test_the_three_row_merger_is_one_proposal_not_three():
+    """A merger arrives as three rows. Grouping on the REOR reference handles
+    that without a special case; grouping on (date, cusip) would not."""
+    merger = next(p for p in _batch().corporate_actions if p.kind == "merger")
+    assert len(merger.quantities) == 3
+
+
+def test_the_single_row_spinoff_is_one_proposal():
+    """A spinoff has no negative leg -- it adds the child without removing the
+    parent. Gap #33 and the previous design both call these FROM/TO pairs; that
+    is true of the other three types and false of this one."""
+    spinoff = next(p for p in _batch().corporate_actions if p.kind == "spinoff")
+    assert len(spinoff.quantities) == 1
+
+
+def _fixture_with_a_stray_reorganisation_leg() -> str:
+    """The real fixture text plus one extra corporate-action row whose #REOR
+    reference pairs with nothing else in the file -- a lone leg, so its group
+    has the wrong row count for its kind (one row where reverse_split expects
+    two) and must be reported as unrecognised rather than coerced.
+
+    Built by string manipulation on the fixture text, not a fourth fixture
+    file. The base `M999000004` (see the module docstring's #REOR scheme) is
+    new -- 004, where the real rows use 001-003 -- so it cannot collide with
+    an existing group. All values fabricated, same ZXCO/ZXC00000N family the
+    rest of this fixture uses.
+    """
+    text = FIXTURE.read_text(encoding="utf-8")
+    stray_row = (
+        '05/20/2024,REVERSE SPLIT R/S FROM ZXC000006#REOR M9990000040000 '
+        'ZEPHYR EXPLORATION CO COM (ZXC000007) (Cash),"",ZEPHYR EXPLORATION '
+        'CO COM ISIN #ZX0000000099 SEDOL #BZX0099,Cash,"",3,"","","",0.00,'
+        '992.03,""\n'
+    )
+    marker = (
+        '05/12/2024,MERGER MER PAYOUT #REOR M9990000030000 ZEPHYR '
+        'EXPLORATION CO COM (ZXC000001) (Cash),"",ZEPHYR EXPLORATION CO COM '
+        'ISIN #ZX0000000013 SEDOL #BZX0002 *REORGANIZATION*,Cash,"","-26",'
+        '"","","","-14.22",992.03,""\n'
+    )
+    assert marker in text, "fixture row this helper anchors on has changed"
+    return text.replace(marker, marker + stray_row, 1)
+
+
+def test_a_group_of_an_unexpected_shape_is_reported_not_coerced():
+    """Forcing an unknown shape into the nearest match is how a wrong ratio gets
+    proposed with confidence."""
+    batch = FidelityImporter().parse(_fixture_with_a_stray_reorganisation_leg())
+    assert any("unrecognised" in w.lower() for w in batch.warnings)
+
+
+def test_cash_in_lieu_is_reported_separately_from_the_proposals():
+    """It moves real cash and needs gap #35's arithmetic. Listing it beside the
+    proposals would imply an action the user can record."""
+    batch = _batch()
+    assert batch.cash_in_lieu
+    assert not any(p.kind == "cash_in_lieu" for p in batch.corporate_actions)
