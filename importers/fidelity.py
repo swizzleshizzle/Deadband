@@ -383,16 +383,23 @@ def _group_corporate_actions(
             continue
 
         source_cusip, resulting_cusip = _derive_cusip_pair(group_rows)
+        description = " | ".join(r.description for r in group_rows if r.description)
+        ratio, ratio_source, approximate, ratio_warning = _derive_ratio(
+            kind, group_rows, description, lines
+        )
+        if ratio_warning:
+            warnings.append(ratio_warning)
         proposals.append(
             CorporateActionProposal(
                 kind=kind,
                 ex_date=group_rows[0].ex_date,
                 source_cusip=source_cusip,
                 resulting_cusip=resulting_cusip,
-                description=" | ".join(
-                    r.description for r in group_rows if r.description
-                ),
+                description=description,
                 quantities=tuple(r.quantity for r in group_rows),
+                ratio=ratio,
+                ratio_source=ratio_source,
+                approximate=approximate,
                 group_ref=key[1] if key[0] == "reor" else None,
             )
         )
@@ -421,6 +428,120 @@ def _derive_cusip_pair(
     source_cusip = negative[0].row_cusip if len(negative) == 1 else None
     resulting_cusip = positive[0].row_cusip if len(positive) == 1 else None
     return source_cusip, resulting_cusip
+
+
+# Spec §6a: the ratio is also stated in the description text itself, not just
+# implied by the paired quantities. Verified against the real exports (not
+# invented, not just this fixture): "N FOR N" occurs 21 times and "N:N" 10
+# times, alongside R/S and REV SPLIT markers that carry no number of their
+# own and so are not parsed here. FOR is tried first -- it is the more
+# distinctive idiom; a bare colon is more likely to collide with unrelated
+# punctuation in free-form venue text, so it is the fallback, not co-equal.
+_STATED_RATIO_FOR_RE = re.compile(r"(\d+)\s*FOR\s*(\d+)", re.IGNORECASE)
+_STATED_RATIO_COLON_RE = re.compile(r"(?<!\d)(\d{1,4}):(\d{1,4})(?!\d)")
+
+
+def _parse_stated_ratio(text: str) -> tuple[Decimal, Decimal] | None:
+    """The ratio as Fidelity's own text states it, new:old -- the same
+    direction _derive_quantity_ratio computes from the paired quantities.
+    None when neither pattern matches (this fixture's name change and
+    merger rows state no ratio at all)."""
+    match = _STATED_RATIO_FOR_RE.search(text) or _STATED_RATIO_COLON_RE.search(text)
+    if not match:
+        return None
+    return Decimal(match.group(1)), Decimal(match.group(2))
+
+
+def _gcd_decimal(a: Decimal, b: Decimal) -> Decimal:
+    """Euclidean GCD over Decimal -- Decimal in, Decimal out, never float,
+    and no int() truncation, so this stays exact even for a non-integral
+    quantity (none appear in this fixture, but nothing here assumes whole
+    shares)."""
+    a, b = abs(a), abs(b)
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def _reduce_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, Decimal]:
+    """Reduce a (new, old) pair to the smallest integer pair with the same
+    ratio. This ALWAYS "succeeds" mathematically -- a/gcd and b/gcd
+    reconstruct a and b exactly by construction -- so a clean reduction here
+    is never, by itself, evidence the ratio is right. Only a second,
+    independent source (the stated text, spec §6a) can show that -- see
+    CorporateActionProposal.approximate's docstring."""
+    divisor = _gcd_decimal(new_qty, old_qty)
+    if divisor == 0:
+        return new_qty, old_qty
+    return new_qty / divisor, old_qty / divisor
+
+
+def _derive_quantity_ratio(
+    group_rows: list["_CorporateActionRow"],
+) -> tuple[Decimal, Decimal] | None:
+    """(new, old), reduced -- the direction adjust_fills consumes, and the
+    direction the "1 FOR 3" idiom itself uses (1 new FOR 3 old). Only
+    derived when exactly one row sits on each side, the same rule
+    _derive_cusip_pair uses to resolve a single entity: a merger with two
+    DIFFERENT resulting companies (this fixture's merger) has no single "new"
+    quantity to report, and summing across them would silently manufacture a
+    ratio out of shares of two unrelated securities. Ambiguous stays None
+    rather than a guess (spec §7)."""
+    negative = [r.quantity for r in group_rows if r.quantity < 0]
+    positive = [r.quantity for r in group_rows if r.quantity > 0]
+    if len(negative) != 1 or len(positive) != 1:
+        return None
+    return _reduce_ratio(positive[0], abs(negative[0]))
+
+
+def _derive_ratio(
+    kind: str,
+    group_rows: list["_CorporateActionRow"],
+    description: str,
+    lines: str,
+) -> tuple[tuple[Decimal, Decimal] | None, str | None, bool, str | None]:
+    """Ratio, its source, whether it's flagged approximate, and an optional
+    warning to surface a stated/derived disagreement -- spec §6 and §6a.
+    Returns (ratio, ratio_source, approximate, warning)."""
+    if kind == "name_change":
+        return (Decimal(1), Decimal(1)), "constant", False, None
+    if kind == "spinoff":
+        # Not derivable from the file at all -- spec §6, last row: the
+        # child shares are here, the parent holding at the ex-date is not.
+        # cli.py fills this from the ledger.
+        return None, None, False, None
+
+    # reverse_split, merger: derive from the paired quantities, then
+    # cross-check against the stated text.
+    derived = _derive_quantity_ratio(group_rows)
+    if derived is None:
+        # Ambiguous shape (see _derive_quantity_ratio's docstring) -- blank,
+        # never a guess, the same silent-blank precedent _derive_cusip_pair
+        # sets for resulting_cusip in this exact merger.
+        return None, None, False, None
+
+    stated = _parse_stated_ratio(description)
+    if stated is None:
+        return derived, "derived", False, None
+
+    stated_reduced = _reduce_ratio(*stated)
+    if stated_reduced == derived:
+        # Two independent sources agreeing is the strongest evidence
+        # available that this is right (spec §6a).
+        return derived, "derived", False, None
+
+    # Disagreement is the signal that matters (spec §6a): a fractional
+    # remainder paid out as cash in lieu, or a misparse of one side. Never
+    # silently prefer one source -- keep the quantities-derived ratio (§6's
+    # authoritative source for this kind), flag it, and say so where a human
+    # will see it.
+    warning = (
+        f"{kind} at lines {lines}: ratio derived from quantities "
+        f"({derived[0]}:{derived[1]}) disagrees with the ratio stated in "
+        f"the description ({stated_reduced[0]}:{stated_reduced[1]}) -- "
+        "possible cash-in-lieu remainder or misparse"
+    )
+    return derived, "derived", True, warning
 
 
 def parse_option_symbol(symbol: str) -> Instrument | None:

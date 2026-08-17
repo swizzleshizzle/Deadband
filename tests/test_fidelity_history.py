@@ -221,3 +221,120 @@ def test_cash_in_lieu_is_reported_separately_from_the_proposals():
     batch = _batch()
     assert batch.cash_in_lieu
     assert not any(p.kind == "cash_in_lieu" for p in batch.corporate_actions)
+
+
+# --- Task 3: derivation --------------------------------------------------
+#
+# NOTE on the reverse-split expectation below: the brief that accompanied this
+# task asserted (Decimal(1), Decimal(6)). That is wrong for this fixture --
+# the reverse split here is 51 shares -> 17 shares, and its own description
+# (pinned above by test_reverse_split_description_is_captured_verbatim) says
+# "1 FOR 3 R/S", not "1 FOR 6". gcd(17, 51) == 17, so 17/17 : 51/17 reduces to
+# 1:3, agreeing with the stated text exactly. (Decimal(1), Decimal(6)) would
+# fail against this fixture's own data and was never run against it -- the
+# fixture came after the brief's text was written. Derived here from the
+# fixture and the export, not from the brief.
+
+
+def test_a_reverse_split_ratio_is_derived_and_reduced():
+    """NEW:OLD, reduced to the smallest integer pair -- the direction
+    adjust_fills consumes. Inverting it turns a reverse split into a forward
+    one and is wrong by the square of the ratio. 17 new : 51 old reduces to
+    1:3, which also agrees with the "1 FOR 3 R/S" stated in the description
+    (spec §6a) -- two independent sources agreeing is the strongest evidence
+    available that this is right."""
+    split = next(p for p in _batch().corporate_actions if p.kind == "reverse_split")
+    assert split.ratio == (Decimal(1), Decimal(3))
+    assert split.approximate is False
+
+
+def test_a_name_change_ratio_is_one_to_one():
+    change = next(p for p in _batch().corporate_actions if p.kind == "name_change")
+    assert change.ratio == (Decimal(1), Decimal(1))
+    assert change.ratio_source == "constant"
+
+
+def test_a_spinoff_carries_no_ratio_out_of_the_importer():
+    """Not derivable from the file: the row carries only the child shares, and
+    the ratio needs the parent holding at the ex-date. cli.py completes it."""
+    spinoff = next(p for p in _batch().corporate_actions if p.kind == "spinoff")
+    assert spinoff.ratio is None
+
+
+def test_a_merger_with_two_different_resulting_entities_carries_no_ratio():
+    """This fixture's merger (spec §5) has ONE negative leg (26 shares given
+    up) and TWO positive legs of two DIFFERENT resulting companies (9 shares
+    of one, 4 of another) -- summing 9+4 into "13 new shares" would be adding
+    shares of two unrelated securities together and reporting a ratio against
+    them as if they were fungible, which is exactly the confidently-wrong
+    number this design exists to prevent. test_merger_source_resolves_but_
+    resulting_stays_blank already established resulting_cusip is None for the
+    identical reason (no single resulting entity); ratio must follow the same
+    "ambiguous -> blank, never a guess" rule, not silently pick one leg or
+    sum across entities."""
+    merger = next(p for p in _batch().corporate_actions if p.kind == "merger")
+    assert merger.ratio is None
+
+
+def test_every_proposal_keeps_the_quantities_it_derived_from():
+    """The ratio is an inference; the quantities are the evidence. A reverse
+    split whose quantities do not reduce cleanly -- the cash-in-lieu case -- is
+    exactly when a human needs to see both."""
+    for proposal in _batch().corporate_actions:
+        assert proposal.quantities
+
+
+def _fixture_with_a_fractional_split() -> str:
+    """The real fixture text with the reverse split's TO-leg quantity changed
+    from -51 to -50 -- one share's worth short of an exact 1:3 conversion, as
+    if a fractional remainder were paid out as cash in lieu instead of
+    converting. The description text is left untouched, so it still states
+    "1 FOR 3 R/S" -- only the quantity evidence changes, which is exactly the
+    disagreement spec §6a says the proposal must surface.
+
+    Built by string manipulation on the fixture text, not a fourth fixture
+    file. All values fabricated, same ZXCO/ZXC00000N family the rest of this
+    fixture uses.
+    """
+    text = FIXTURE.read_text(encoding="utf-8")
+    original_line = (
+        '03/10/2024,REVERSE SPLIT R/S TO ZXC000002#REOR M9990000010000 ZEPHYR '
+        'EXPLORATION CO COM ISIN #ZX0000000013 1 FOR 3 R/S INTO ZEPHYR '
+        'EXPLORATION CO (ZXC000001) (Cash),"",ZEPHYR EXPLORATION CO COM ISIN '
+        '#ZX0000000013 SEDOL #BZX0002 1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO,'
+        'Cash,"","-51","","","",0.00,1006.25,""\n'
+    )
+    assert original_line in text, "fixture row this helper anchors on has changed"
+    amended_line = original_line.replace('"-51"', '"-50"')
+    return text.replace(original_line, amended_line, 1)
+
+
+def test_a_ratio_that_does_not_reduce_cleanly_is_flagged():
+    """Fractional remainders are paid out as cash in lieu, so raw quantities
+    need not be an exact multiple. Silently rounding would propose a confident
+    wrong ratio. gcd(17, 50) == 1, so the derived pair (17, 50) disagrees with
+    the "1 FOR 3" stated in the description -- that disagreement, not the
+    gcd reduction alone, is what flags this as approximate (see spec §6a:
+    reducing a coprime pair by their own gcd always "succeeds" trivially, so
+    only a second, independent source can show the result is wrong)."""
+    batch = FidelityImporter().parse(_fixture_with_a_fractional_split())
+    split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
+    assert split.approximate is True
+    assert split.ratio == (Decimal(17), Decimal(50))
+    assert any(
+        "disagrees" in w.lower() and "reverse_split" in w.lower()
+        for w in batch.warnings
+    ), "disagreement between stated and derived ratio must be surfaced in warnings"
+
+
+def test_stated_and_derived_ratios_agree_for_every_paired_action_in_the_fixture():
+    """The real fixture's reverse split states "1 FOR 3" in its description
+    and its quantities (17, 51) reduce to the same 1:3 -- the two independent
+    sources spec §6a wants cross-checked. Pinning the agreement here means a
+    future change to either the parser or the fixture that breaks the
+    cross-check shows up as a red test, not as a silently-preferred number."""
+    batch = _batch()
+    split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
+    assert split.ratio_source == "derived"
+    assert split.approximate is False
+    assert not any("disagrees" in w.lower() for w in batch.warnings)

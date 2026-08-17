@@ -169,6 +169,26 @@ class CorporateActionProposal:
     description: str                # the venue's own text, for a human to identify it
     quantities: tuple[Decimal, ...]  # the evidence the ratio was derived from
     ratio: tuple[Decimal, Decimal] | None = None   # filled by Task 3; None until then
+    # Where `ratio` came from -- 'derived' (the paired rows' quantities,
+    # reduced, spec §6), 'constant' (name_change's fixed 1:1, no row data
+    # involved), or None (spinoff, or a shape too ambiguous to derive from at
+    # all -- e.g. a merger with more than one resulting entity, where summing
+    # quantities across two different securities would be a meaningless
+    # number dressed up as a ratio). Recorded per spec §6a's "use what there
+    # is and record which source the ratio came from" -- so a consumer never
+    # has to re-derive provenance from `kind` alone.
+    ratio_source: str | None = None
+    # True when the derived ratio DISAGREES with the ratio stated in the
+    # venue's own description text (spec §6a's cross-check) -- e.g. a
+    # fractional share paid out as cash-in-lieu instead of converting, or a
+    # misparse of either source. Reducing raw quantities by their own gcd
+    # always "succeeds" trivially (a/gcd and b/gcd reconstruct a and b
+    # exactly by construction), so this can only be set by comparing against
+    # the independent, second source -- never by inspecting the derived pair
+    # alone. `quantities` above still carries the raw evidence either way, so
+    # a human can see the distortion even when `ratio` and `approximate`
+    # disagree about what happened.
+    approximate: bool = False
     group_ref: str | None = None    # the #REOR reference, or None when the fallback keyed it
 
 
