@@ -5,9 +5,25 @@ column instead. Every existing fixture before this file was Activity & Orders
 See tests/fixtures/fidelity/real_shape_history.csv for the fixture's shape:
 a BOM, two blank preamble lines, the header on line 3, a trailing legal
 disclaimer block -- and, unique to this file, the corporate-action row
-shapes: a reverse split and a name change as FROM/TO pairs sharing a #REOR
-reference, a three-row merger, a single-row spinoff distribution, and a
-cash-in-lieu-of-fractional-shares row. All values are fabricated.
+shapes: a reverse split and a name change as FROM/TO pairs, a three-row
+merger, a single-row spinoff distribution, and a cash-in-lieu-of-fractional-
+shares row. All values are fabricated.
+
+The `#REOR` reorganisation reference scheme, verified against the real
+exports (not invented -- spec §5 forbids guessing at a format): a
+reorganisation reference is a shared BASE plus a per-leg trailing digit, e.g.
+`M9990000010001` and `M9990000010000` are two legs of ONE event because they
+share the base `M999000001`, not because the two full references are equal.
+Rows belonging to one event share the base; they do NOT carry one identical
+reference. Checked directly against the real exports: 15 referenced rows, 13
+distinct full references, but only 7 distinct bases once the trailing digit
+is dropped. Observed leg digits are 0, 1, 2, and 4 -- NOT a contiguous run
+from zero, and no guarantee one exists for every event, so a grouping parser
+(Task 2) must not assume a leg digit predicts its position within the event
+or that all of 0..n are present. This fixture's own rows follow that same
+base+leg scheme (e.g. the reverse split's `M9990000010001`/`M9990000010000`
+share base `M999000001`; the merger's three legs share base `M999000003`),
+so Task 2 can be built and tested against it directly.
 """
 
 import pathlib

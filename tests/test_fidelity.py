@@ -576,19 +576,21 @@ RULE_COVERAGE_SAMPLES = [
     ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
     ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
     ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option
-    # Corporate-action rows -- History dialect only. See
-    # tests/fixtures/fidelity/real_shape_history.csv for the row shapes these
-    # samples are drawn from (all values fabricated).
-    ("REVERSE SPLIT R/S FROM ZXC000001#REOR M9990000010001 ZEPHYR EXPLORATION "
-     "CO COM (POST REV SPLIT) (ZXC000002) (Cash)", ""),  # reverse_split
-    ("NAME CHANGED N/C FROM ZXC000002#REOR M9990000020001 FIFTH FABRICATED "
-     "HOLDINGS CO COM (ZXC000003) (Cash)", ""),  # name_change
-    ("MERGER MER FROM ZXC000001#REOR M9990000030002 SIXTH FABRICATED "
-     "RESOURCES CORP COM (ZXC000004) (Cash)", ""),  # merger
-    ("DISTRIBUTION SPINOFF FROM:(ZXCO ) SEVENTH FABRICATED METALS INC NEW "
-     "WTS EXP 12/31/2026 (Cash)", "ZXCWS"),  # spinoff_distribution
-    ("IN LIEU OF FRX SHARE LEU PAYOUT ZXC000001 ZEPHYR EXPLORATION CO COM "
-     "(Cash)", "ZXCO"),  # cash_in_lieu
+    # Corporate-action rows -- History dialect only. Hand-crafted independent
+    # of tests/fixtures/fidelity/real_shape_history.csv (different fabricated
+    # company, CUSIP scheme, and #REOR base) rather than copied from it, same
+    # convention as every other sample above -- a copy would move in lockstep
+    # with the fixture and stop cross-checking it. All values fabricated.
+    ("REVERSE SPLIT R/S TO ACME000009#REOR B1234567890002 ACME HOLDINGS "
+     "CORP COM (ACME000010) (Cash)", ""),  # reverse_split
+    ("NAME CHANGED N/C TO ACME000011#REOR B1234567890102 ACME RENAMED "
+     "INDUSTRIES INC COM (ACME000012) (Cash)", ""),  # name_change
+    ("MERGER MER PAYOUT #REOR B1234567890200 ACME LEGACY HOLDINGS CORP "
+     "COM (ACME000013) (Cash)", ""),  # merger
+    ("DISTRIBUTION SPINOFF FROM:(AAA ) ACME SPINCO NEW WTS EXP "
+     "06/30/2027 (Cash)", "AAAWS"),  # spinoff_distribution
+    ("IN LIEU OF FRX SHARE FRACTIONAL PAYOUT ACME000009 ACME HOLDINGS "
+     "CORP COM (Cash)", "AAA"),  # cash_in_lieu
 ]
 
 
