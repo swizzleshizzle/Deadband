@@ -152,6 +152,29 @@ The spinoff's ratio is filled by `cli.py`, which has a connection; `importers/` 
 proposal with that ratio absent. This is the one place the proposal is completed outside the
 pure layer, and it is why the field is optional rather than required.
 
+### 6a. The ratio is also stated in the text — parse it, and cross-check
+
+Found after this spec was first written, by checking the real exports rather than assuming:
+**the description states the ratio explicitly.** Patterns of the form `N FOR N` occur 21 times
+across the exports and `N:N` 10 times, alongside `R/S` and `REV SPLIT` markers.
+
+So there are **two independent sources** for the same number: the stated ratio in the text, and
+the ratio derived from the paired quantities. Use both.
+
+- Parse the stated ratio where present.
+- Derive the ratio from the quantities as §6 describes.
+- **Cross-check them.** Agreement is strong evidence the parse is right. **Disagreement is the
+  signal that matters** — it means either a fractional remainder paid out as cash in lieu, or a
+  misparse — and the proposal must say so rather than silently preferring one source.
+
+This is materially stronger than either source alone, and it directly serves D5: the whole
+reason proposals carry evidence is that an inverted or distorted ratio is wrong by the square
+of the ratio and looks plausible at every step. Two sources that agree is the best evidence
+available; two that disagree is the loudest possible warning.
+
+Where only one source is available — a name change states no ratio, and a spinoff has neither —
+use what there is and record which source the ratio came from.
+
 **Every proposal prints the quantities it derived from** (D5). The ratio is an inference; the
 quantities are evidence. A reverse split whose quantities do not reduce cleanly — the
 cash-in-lieu case — is exactly when a human needs to see both.
