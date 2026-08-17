@@ -32,6 +32,32 @@ The following was established by reading the files directly, not assumed:
 | A merger is three rows | **True.** |
 | The `Symbol` column is empty on these rows | **True** for the paired rows. |
 
+### The export comes in two dialects, and only one carries an account
+
+Verified by running the importer against a real history export:
+
+- **Activity & Orders** — the dialect every existing fixture uses. Carries `Account` and
+  `Account Number` columns, so rows route themselves.
+- **History for Account** — the dialect the multi-year exports use, and **the only one that
+  contains corporate actions**. It has no account columns at all (the account is in the
+  filename); it carries `Cash Balance ($)` instead.
+
+A history export therefore parses cleanly but yields fills and cash whose `external_ref` is
+`None`, and `db/importing.py` is explicit that "a row whose external_ref is None is never
+routed at all". Those rows route only via `import --account <uuid>`, which already exists and
+already refuses with a clear message when it is needed and absent.
+
+Two consequences for this design:
+
+1. **Recognition closes gap #33 only in combination with `--account`.** Removing the block is
+   necessary and is the part that is missing; `--account` is the part that already works. Any
+   claim that recognition alone makes the accounts importable is wrong.
+2. **`--account`'s help text is wrong for this dialect.** It says a venue carrying its own
+   per-row account number — naming Fidelity — "routes automatically and does not need this."
+   True of Activity & Orders, false of History for Account, and misleading exactly when a user
+   is trying to import the files that contain corporate actions. Fixing that sentence is in
+   scope.
+
 Two things no prior document records, both found here:
 
 - **Cash in lieu of fractional shares.** Rows exist for the cash paid out for the fractional
@@ -61,7 +87,7 @@ Two things no prior document records, both found here:
 |---|---|
 | `importers/fidelity.py` | modify: `Outcome.CORPORATE_ACTION`, five new `Rule`s, row collection, grouping and derivation |
 | `importers/base.py` | modify: `ImportBatch.corporate_actions` and `ImportBatch.cash_in_lieu` |
-| `cli.py` | modify: `cmd_import` renders the proposals; fills the spinoff ratio from the ledger |
+| `cli.py` | modify: `cmd_import` renders the proposals; fills the spinoff ratio from the ledger; corrects `--account`'s help text for the History dialect |
 | `docs/known-gaps.md`, `README.md` | modify |
 
 `ledger/` is **not** touched. `importers/` remains pure — no I/O, no clock, no `db` import;
@@ -83,9 +109,17 @@ distribution, and cash-in-lieu. `RULES` is first-match-wins and `test_every_rule
 fails if one rule shadows another; that test is what proves all five are live, so it must be
 seen to fail if a rule is ordered wrongly.
 
-**Recognition alone closes gap #33.** It is the first task and is independently shippable: at
-that point both accounts import, with the corporate-action rows reported as recognised and
-unhandled. Everything after it improves the report.
+**Recognition is the missing half of gap #33**, and it is the first task and independently
+shippable. At that point a history export imports — given `--account`, which already works —
+with the corporate-action rows reported as recognised and unhandled. Everything after it
+improves the report rather than unblocking anything.
+
+The precedent is `investment_gain_loss`, added for exactly this shape: a money-carrying row
+that no rule matched, which blocked the commit, and which a real export "could not be imported
+at all until this rule existed." Its comment says `INTERNAL` was chosen over leaving it
+unmapped for that reason. This design makes the same move for a different reason — those rows
+produce nothing *and* have a follow-up action, which is why they get their own outcome rather
+than reusing `INTERNAL`.
 
 ---
 
