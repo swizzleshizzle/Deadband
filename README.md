@@ -111,22 +111,25 @@ usable reference is present — derives a ratio from the paired quantities where
 action's shape allows it, and prints one ready-to-run `corporate add` command per action
 under a `Corporate actions detected` banner, on both preview and `--commit`. For a
 reverse split whose ratio is both derivable from the paired quantities and confirmed by
-the venue's own `N FOR N` text, the section reads (fabricated instrument, `ZXCO`):
+the venue's own `N FOR N` text, the section reads (fabricated instrument, the same
+`ZXCO` this file's fixtures use; captured verbatim from a real `import fidelity` preview
+run, not hand-written):
 
 ```
 === Corporate actions detected -- nothing above was written; review before running any command below ===
 
-reverse_split ex 2026-03-02 -- ZXCO CORP COM 1 FOR 6 R/S INTO ZXCO CORP
+reverse_split ex 2026-03-02 -- ZEPHYR EXPLORATION CO COM (POST REV SPLIT) ISIN #ZX0000000021 SEDOL #BZX0001 | ZEPHYR EXPLORATION CO COM ISIN #ZX0000000013 SEDOL #BZX0002 1 FOR 6 R/S INTO ZEPHYR EXPLORATION CO
   cusip: ZXC000001 -> ZXC000002
-  evidence (quantities): 1800, -300
+  evidence (quantities): 300, -1800
   ratio: 1:6 (derived from the paired quantities AND matches the ratio the venue's own text states -- two independent sources agree, the strongest evidence available (spec Sec6a))
   corporate add --type reverse_split --symbol <SYMBOL> --ex-date 2026-03-02 --ratio 1:6
 ```
 
 `--symbol` prints as the literal `<SYMBOL>` placeholder, never a resolved ticker — D7
 keeps CUSIP resolution advisory, so nothing in `import` can fill it in automatically. A
-human reads the `cusip:` line and the description above it and fills it in by hand, e.g.
-`--symbol ZXCO --commit`, before running the command.
+human reads the `cusip:` line and the description above it, recognises the position as
+`ZXCO` from their own records, and fills it in by hand: `--symbol ZXCO --commit`, before
+running the command.
 
 **Nothing here is stored.** `import` never calls `corporate add` itself: a corporate
 action silently restates history across every account holding the instrument, and
