@@ -101,6 +101,39 @@ it was never going to be part of the import. See
 expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
 `REVERSE SPLIT`, and others), and backdated `as of` correction rows.
 
+### Corporate actions found during import
+
+A Fidelity multi-year **History** export can contain `MERGER`, `REVERSE SPLIT`, `NAME
+CHANGED`, `DISTRIBUTION SPINOFF` and `IN LIEU OF` (cash for a fractional share) rows.
+`import` recognises all five, groups the rows belonging to one event using the venue's
+own `#REOR` reorganisation reference — falling back to `(ex-date, CUSIP pair)` when no
+usable reference is present — derives a ratio from the paired quantities where the
+action's shape allows it, and prints one ready-to-run `corporate add` command per action
+under a `Corporate actions detected` banner, on both preview and `--commit`.
+
+**Nothing here is stored.** `import` never calls `corporate add` itself: a corporate
+action silently restates history across every account holding the instrument, and
+`corporate add` previews by default and refuses a duplicate precisely to force a human
+to look before that restatement happens — an importer that wrote proposals straight to
+the database would bypass those guards for the one input most likely to need them.
+Committing an import that contains a corporate action still writes its fills and cash
+correctly; positions in the affected instrument stay wrong until the printed `corporate
+add` command is reviewed and run by hand. A merger's group is always three rows and can
+never yield a derived ratio — deriving needs exactly one negative and one positive row,
+which a three-leg merger structurally never has — so its command prints `INCOMPLETE` and
+needs `--ratio` filled in from the venue's own statement. Cash-in-lieu rows are reported
+under their own heading and never turned into a command at all: see
+[`docs/known-gaps.md`](docs/known-gaps.md) gap #43.
+
+The **History** export is also the only Fidelity dialect that contains corporate
+actions, and it carries no `Account`/`Account Number` columns at all — the account lives
+only in the filename. Its rows therefore route exclusively through `import --account
+<uuid>`, the same flag Coinbase always needs; without it, `import --commit` refuses with
+a clear message rather than guessing. (The **Activity & Orders** dialect, which every
+existing test fixture uses, carries its own per-row account number and routes
+automatically — `--account`'s help text used to say a venue carrying its own account
+number never needs the flag, true of Activity & Orders but false of History; corrected.)
+
 ### Corporate actions
 
 `corporate add`, `corporate list` and `corporate remove` manage all five `ActionType`
@@ -169,14 +202,15 @@ looking plausible.
 `corporate list` optionally filters with `--symbol` and prints, per action, the id
 `remove` needs, its ex-date, symbol, type, ratio, resulting symbol (if any), and basis
 allocation (if any) — but nothing about a derived position it produced; see the gaps
-below. See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #33–41) for what this branch
-leaves open: corporate actions still can't be *imported* from a venue export, manual
-trades aren't split-adjusted, merger cash isn't modelled (and is now reachable in
-practice, since `merger` is no longer refused), there's no audit trail on a restatement,
-no database-level duplicate guard, an action recorded against the result of an earlier one
-still regroups nothing, `derived_fill` has no CLI visibility, and the invariants that let
-spinoffs identify their own synthetic fills are conventions the schema cannot enforce, not
-constraints.
+below. See [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #34–41) for what this branch
+leaves open: manual trades aren't split-adjusted, merger cash isn't modelled (and is now
+reachable in practice, since `merger` is no longer refused), there's no audit trail on a
+restatement, no database-level duplicate guard, an action recorded against the result of
+an earlier one still regroups nothing, `derived_fill` has no CLI visibility, and the
+invariants that let spinoffs identify their own synthetic fills are conventions the
+schema cannot enforce, not constraints. `import` now recognises and proposes actions
+found in a Fidelity History export — see "Corporate actions found during import" above —
+but see gaps #42–47 there for what proposing, never storing, still leaves open.
 
 ### Reconciliation
 
