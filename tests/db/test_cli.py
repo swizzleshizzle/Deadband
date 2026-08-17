@@ -2843,6 +2843,355 @@ async def test_reconcile_refuses_an_unparseable_as_of(conn, monkeypatch, capsys)
     assert "not-a-date" in err
 
 
+# --- Task 4: the proposal surface (spec 2026-08-17, §7-§8) -----------------
+# `cmd_import` never stores a corporate action -- `importers/` only proposes
+# (Tasks 1-3), and `cli.py`'s job here is to render those proposals as a
+# `corporate add` command a human reads, edits and runs themselves (D2/D3).
+# All CSV text below is fabricated (fictional tickers, CUSIPs and
+# reorganisation references), following the exact History-dialect row shapes
+# verified against the real exports in
+# tests/fixtures/fidelity/real_shape_history.csv and its module docstring
+# (tests/test_fidelity_history.py) -- this file's own fixture, not reused
+# here, since these tests want a reverse split whose quantities are 1800 and
+# 300 (ratio 1:6) to match cli.py's own --ratio docstring example, not that
+# fixture's 51/17 (ratio 1:3).
+
+_HISTORY_HEADER = (
+    "Run Date,Action,Symbol,Description,Type,Price ($),Quantity,Commission ($),"
+    "Fees ($),Accrued Interest ($),Amount ($),Cash Balance ($),Settlement Date"
+)
+
+
+def _write_history_csv(tmp_path: pathlib.Path, *rows: str) -> str:
+    """Same tmp_path-backed idiom as `_write_routing_csv` above, but with the
+    History dialect's header (no Account/Account Number columns) -- the only
+    dialect that carries a corporate-action row at all."""
+    path = tmp_path / "history.csv"
+    path.write_text("\n".join([_HISTORY_HEADER, *rows]) + "\n")
+    return str(path)
+
+
+# A reverse split as a #REOR FROM/TO pair (spec §5), 1800 old shares into 300
+# new -- reduces to 1:6, matching cli.py's own --ratio docstring example
+# ("a 1-for-6 reverse split ... takes 1,800 shares to 300"). The TO row's
+# Description states "1 FOR 6" too, so the derived and stated ratios agree
+# and ratio_source comes out 'derived+confirmed' (spec §6a).
+_REVERSE_SPLIT_ROWS = (
+    '03/10/2024,REVERSE SPLIT R/S FROM ZXQ000001#REOR N9990000010001 '
+    'NINTH FABRICATED WIDGETS CORP COM (POST REV SPLIT) (ZXQ000002) (Cash),"",'
+    'NINTH FABRICATED WIDGETS CORP COM (POST REV SPLIT) ISIN #ZX0000000099 '
+    'SEDOL #BZQ0001,Cash,"",300,"","","",0.00,1006.25,""',
+    '03/10/2024,REVERSE SPLIT R/S TO ZXQ000002#REOR N9990000010000 '
+    'NINTH FABRICATED WIDGETS CORP COM ISIN #ZX0000000088 1 FOR 6 R/S INTO '
+    'NINTH FABRICATED WIDGETS CORP (ZXQ000001) (Cash),"",'
+    'NINTH FABRICATED WIDGETS CORP COM ISIN #ZX0000000088 SEDOL #BZQ0002 '
+    '1 FOR 6 R/S INTO NINTH FABRICATED WIDGETS CORP,Cash,"","-1800","","","",'
+    '0.00,1006.25,""',
+)
+
+# A single-row spinoff (spec §5: no negative leg) distributing 60 child
+# shares. No #REOR token -- same shape real_shape_history.csv's own spinoff
+# row has -- so it groups on the (ex-date, symbol) fallback key.
+_SPINOFF_ROW_TEMPLATE = (
+    '{run_date},DISTRIBUTION SPINOFF FROM:(ZXCO ) TENTH FABRICATED VENTURES '
+    'INC NEW WTS EXP 12/31/2030 (Cash),ZXQWS,TENTH FABRICATED VENTURES INC '
+    'NEW WTS EXP 12/31/2030,Cash,"",60,"","","",0.00,992.03,""'
+)
+
+# A cash-in-lieu-of-fractional-shares row (spec §7, D6): recognised, reported
+# separately, never applied.
+_CASH_IN_LIEU_ROW = (
+    '07/10/2024,IN LIEU OF FRX SHARE LEU PAYOUT ZXQ000001 NINTH FABRICATED '
+    'WIDGETS CORP COM (Cash),ZXQO,NINTH FABRICATED WIDGETS CORP COM,Cash,"",'
+    '0,"","","",0.11,1006.36,""'
+)
+
+# An ordinary BUY of 500 ZXQ shares, same row shape as
+# real_shape_history.csv's own "YOU BOUGHT" row -- for the regression test
+# below, which imports this in the SAME file as a spinoff on the same
+# symbol, exactly like a real multi-year History export (original purchase
+# and a later corporate action together).
+_BUY_ROW = (
+    '01/15/2024,YOU BOUGHT NINTH FABRICATED WIDGETS CORP (ZXQ) (Cash),ZXQ,'
+    'NINTH FABRICATED WIDGETS CORP,Cash,12.50,500,"",0.03,"","-6250.03",'
+    '10000.00,01/17/2024'
+)
+_SPINOFF_ROW_FOR_ZXQ_TEMPLATE = (
+    '{run_date},DISTRIBUTION SPINOFF FROM:(ZXQ ) TENTH FABRICATED VENTURES '
+    'INC NEW WTS EXP 12/31/2030 (Cash),ZXQWS,TENTH FABRICATED VENTURES INC '
+    'NEW WTS EXP 12/31/2030,Cash,"",60,"","","",0.00,992.03,""'
+)
+
+
+async def test_import_proposes_a_corporate_add_command(conn, monkeypatch, capsys, tmp_path):
+    """The importer proposes and never stores: a corporate action silently
+    restates history across every account holding the instrument, which is why
+    `corporate add` previews by default and refuses duplicates."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_REVERSE_SPLIT_ROWS),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "corporate add" in out
+    assert "--ratio 1:6" in out
+
+
+async def test_the_proposal_prints_the_evidence_it_derived_from(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A ratio is an inference. Printing the quantities beside it is the one
+    moment a human can catch an inverted or distorted one before it is stored."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_REVERSE_SPLIT_ROWS),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+    assert "1800" in capsys.readouterr().out
+
+
+async def test_nothing_is_written_by_a_proposal(
+    conn, account_with_1800, monkeypatch, capsys, tmp_path
+):
+    """Not even with --commit. The import commits fills and cash; corporate
+    actions are proposed only.
+
+    Ruling D: list_actions(conn) with no instrument_id returns every action
+    in the (shared, persistent) test database, so this scopes the check to
+    the instrument account_with_1800 itself created."""
+    account_id, instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_REVERSE_SPLIT_ROWS),
+        account=str(account_id),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+    assert await list_actions(conn, instrument_id) == []
+
+
+async def test_the_spinoff_ratio_is_completed_from_the_ledger(
+    conn, account_with_1800, monkeypatch, capsys, tmp_path
+):
+    """Not derivable from the file -- the row carries only the child shares.
+    account_with_1800 holds 1800 ZXCO shares (its only instrument), executed
+    before this test's 2026-03-15 ex-date, so it is unambiguously the
+    spinoff's parent: 60 child shares over 1800 parent shares reduces to
+    1:30."""
+    account_id, _instrument_id = account_with_1800
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(
+            tmp_path, _SPINOFF_ROW_TEMPLATE.format(run_date="03/15/2026")
+        ),
+        account=str(account_id),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "corporate add" in out
+    assert "--ratio 1:30" in out
+    assert "1800" in out
+    assert "UNAVAILABLE" not in out
+
+
+async def test_the_spinoff_ratio_is_completed_from_this_same_imports_own_fill(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A real multi-year History export commonly carries the original
+    purchase and a later spinoff in the SAME file (see
+    tests/fixtures/fidelity/real_shape_history.csv) -- not split across a
+    pre-existing ledger fixture and a separate import, the way
+    test_the_spinoff_ratio_is_completed_from_the_ledger sets it up. The
+    parent holding must be read AFTER this import's own BUY is committed
+    (read-your-own-writes inside the same transaction), not before -- 500
+    ZXQ shares bought, 60 child shares distributed, reduces to 3:25."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(
+            tmp_path, _BUY_ROW, _SPINOFF_ROW_FOR_ZXQ_TEMPLATE.format(run_date="06/20/2024")
+        ),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "corporate add" in out
+    assert "--ratio 3:25" in out
+    assert "UNAVAILABLE" not in out
+
+
+async def test_the_spinoff_ratio_is_left_blank_when_the_parent_is_undeterminable(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The account importing this file has no prior fills at all, so there is
+    no ledger holding to divide by -- spec §7's "ratio blank, with a note
+    saying why", not a guess and not a crash."""
+    acc = await create_account(conn, name="NoHoldings", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(
+            tmp_path, _SPINOFF_ROW_TEMPLATE.format(run_date="03/15/2026")
+        ),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "INCOMPLETE" in out
+    assert "--ratio 1:30" not in out
+    assert "holds no instrument" in out
+
+
+async def test_the_spinoff_ratio_is_left_blank_when_the_account_holds_more_than_one_instrument(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Ambiguous, not guessed at: an account holding two instruments as of
+    the ex-date has no single candidate for the spinoff's parent (spec §7),
+    so the ratio stays blank and the reason names both symbols rather than
+    picking one."""
+    acc = await create_account(conn, name="TwoHoldings", venue="fidelity", account_type="cash")
+    inst_a = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXQ", quote_currency="USD"),
+    )
+    inst_b = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXR", quote_currency="USD"),
+    )
+    before_ex_date = datetime(2026, 1, 1, tzinfo=UTC)
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst_a,
+                executed_at=before_ex_date,
+                side=Side.BUY,
+                quantity=Decimal("100"),
+                price=Decimal("1"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="ambiguous-a",
+                is_estimated=False,
+            ),
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst_b,
+                executed_at=before_ex_date,
+                side=Side.BUY,
+                quantity=Decimal("200"),
+                price=Decimal("1"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="ambiguous-b",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(
+            tmp_path, _SPINOFF_ROW_FOR_ZXQ_TEMPLATE.format(run_date="03/15/2026")
+        ),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "ambiguous" in out.lower()
+    assert "ZXQ" in out
+    assert "ZXR" in out
+
+
+async def test_cash_in_lieu_is_reported_as_unapplied(conn, monkeypatch, capsys, tmp_path):
+    """It moves real cash and the ledger does not reflect it. Saying so is the
+    whole mitigation."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _CASH_IN_LIEU_ROW),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+    assert "not applied" in capsys.readouterr().out.lower()
+
+
 # --- `deadband corporate` (spec 2026-08-15, §5-§6) -------------------------
 # The engine (ledger/corporate.py's adjust_fills) and the storage layer
 # (db/corporate.py) are both already tested. What is new here is the WIRING:
