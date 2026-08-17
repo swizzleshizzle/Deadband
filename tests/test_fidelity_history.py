@@ -96,15 +96,16 @@ def test_corporate_action_rows_produce_exactly_the_ordinary_rows_worth_of_output
 
 
 def test_reor_base_matches_the_verified_docstring_examples():
-    """Pins the #REOR base extraction against the exact values this file's
-    own module docstring (above) states were checked directly against the
-    real exports -- the literal verified strings, not a re-derived guess."""
-    assert _reor_base("M9990000010001") == _reor_base("M9990000010000") == "M999000001"
+    """Pins the #REOR base extraction against what this file's own module
+    docstring (above) states was checked directly against the real exports:
+    a reference's suffix is three constant zeros plus one varying digit, so
+    two legs of one event share every character except the last."""
+    assert _reor_base("M9990000010001") == _reor_base("M9990000010000") == "M999000001000"
     assert (
         _reor_base("M9990000030002")
         == _reor_base("M9990000030001")
         == _reor_base("M9990000030000")
-        == "M999000003"
+        == "M999000003000"
     )
 
 
@@ -128,6 +129,54 @@ def test_the_single_row_spinoff_is_one_proposal():
     is true of the other three types and false of this one."""
     spinoff = next(p for p in _batch().corporate_actions if p.kind == "spinoff")
     assert len(spinoff.quantities) == 1
+
+
+def test_reverse_split_cusip_pair_is_old_to_new_not_inverted():
+    """ZXC000001 is the pre-split entity and ZXC000002 the post-split one --
+    verified by cross-referencing each row's own ISIN in its Description
+    against its paren-adjacent CUSIP in the fixture text. An earlier version
+    of this code read the token before #REOR (the FROM/TO verb's
+    COUNTERPARTY, not the row's own entity) and reported this pair
+    backwards."""
+    rs = next(p for p in _batch().corporate_actions if p.kind == "reverse_split")
+    assert rs.source_cusip == "ZXC000001"
+    assert rs.resulting_cusip == "ZXC000002"
+
+
+def test_name_change_cusip_pair_is_old_to_new_not_inverted():
+    """Same defect, same fix, the other two-row shape."""
+    nc = next(p for p in _batch().corporate_actions if p.kind == "name_change")
+    assert nc.source_cusip == "ZXC000002"
+    assert nc.resulting_cusip == "ZXC000003"
+
+
+def test_merger_source_resolves_but_resulting_stays_blank():
+    """The PAYOUT row is the merger's single negative leg, so its
+    paren-adjacent CUSIP resolves source_cusip unambiguously -- the earlier
+    (before-#REOR-token) reading had this as None because PAYOUT rows never
+    carry a token in that position. resulting_cusip stays None: the two FROM
+    legs go to two DIFFERENT resulting companies, so there is no single
+    value to report -- spec §7 wants that blank, never a guess."""
+    merger = next(p for p in _batch().corporate_actions if p.kind == "merger")
+    assert merger.source_cusip == "ZXC000001"
+    assert merger.resulting_cusip is None
+
+
+def test_reverse_split_description_is_captured_verbatim():
+    """Task 3 parses the stated ratio out of this text (spec §6a) -- if
+    grouping normalised, truncated, or re-cased it, that parse would lose
+    its input. Pinned against the fixture's own text, including its
+    original casing and punctuation ("#", "/"), so a regression that
+    upper-cases or strips characters cannot pass silently."""
+    fixture_text = FIXTURE.read_text(encoding="utf-8")
+    row7_description = (
+        "ZEPHYR EXPLORATION CO COM ISIN #ZX0000000013 SEDOL #BZX0002 "
+        "1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO"
+    )
+    assert row7_description in fixture_text, "fixture text this test anchors on has changed"
+
+    rs = next(p for p in _batch().corporate_actions if p.kind == "reverse_split")
+    assert row7_description in rs.description
 
 
 def _fixture_with_a_stray_reorganisation_leg() -> str:

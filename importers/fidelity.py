@@ -232,48 +232,70 @@ def classify(action: str, symbol: str) -> Rule | None:
 # The `#REOR` reorganisation reference. Verified against the real exports,
 # not invented -- see tests/test_fidelity_history.py's module docstring,
 # which spec §5 requires this to be derived from rather than guessed at. A
-# reference is a shared BASE plus a trailing per-leg suffix: e.g.
+# reference is a shared BASE plus a trailing per-leg suffix. What is
+# actually verified (against both this fixture and the real exports): that
+# suffix is three constant zeros plus one varying digit -- e.g.
 # `M9990000010001` and `M9990000010000` are two legs of ONE event because
-# they share the base `M999000001` (drop the last 4 characters), NOT because
-# the two full references are equal, and NOT because the trailing suffix's
-# last digit (observed values 0, 1, 2, 4 -- not a contiguous run from zero)
-# predicts anything about the row's role in the event -- see
-# _derive_cusip_pair below for why role is read from quantity sign instead.
+# only their LAST CHARACTER differs, not because the two full references are
+# equal. The data does not distinguish a wider suffix -- the leading zeros
+# are constant in every observed case, so stripping 1 character or 4
+# produces the identical grouping partition here -- so this strips only the
+# one character that is verified to vary. See _reor_base's docstring for why
+# that choice (not "4 happens to also work") is deliberate. NOT because the
+# trailing character predicts anything about the row's role in the event --
+# see _derive_cusip_pair below for why role is read from quantity sign and
+# the paren-adjacent cusip instead.
 _REOR_RE = re.compile(r"#REOR\s+(\S+)")
-_REOR_LEG_SUFFIX_LEN = 4
+_REOR_LEG_SUFFIX_LEN = 1
 
 
 def _reor_base(token: str) -> str:
     """The shared portion of a #REOR reference that ties one event's rows
-    together -- see _REOR_RE's comment just above for the verified example
-    this is pinned against. Do not change the suffix length without
-    re-reading tests/test_fidelity_history.py's module docstring; it is not
-    a guess."""
+    together -- see _REOR_RE's comment just above for what is actually
+    verified.
+
+    Stripping only the last character (rather than the full observed
+    "three zeros plus a digit" suffix) is deliberate, not merely sufficient:
+    the two failure modes are asymmetric. A base string that is too SHORT
+    (over-stripping) can silently merge two distinct events that happen to
+    share a longer common prefix into one confidently wrong proposal, which
+    spec §7 forbids outright. A base string that is too LONG (under-
+    stripping, this function's direction) can only ever split legs of the
+    same event across two keys, which the leg-count check in
+    _group_corporate_actions turns into a loud "unrecognised" warning
+    instead of silent data loss. Spec §7's whole posture is report rather
+    than guess, so the fail-loud direction is the one this code takes. Do
+    not widen this without re-reading tests/test_fidelity_history.py's
+    module docstring first."""
     if len(token) <= _REOR_LEG_SUFFIX_LEN:
         return token
     return token[:-_REOR_LEG_SUFFIX_LEN]
 
 
-# A cusip-shaped token immediately before "#REOR" -- present on FROM/TO rows,
-# absent on PAYOUT rows (nothing sits directly against "#REOR" there but the
-# literal word "PAYOUT", which this pattern's digit requirement excludes).
-_OWN_CUSIP_RE = re.compile(r"([A-Z0-9]{6,12})#REOR")
-# A cusip-shaped token inside parentheses elsewhere in the row. Money
-# notation like "(Cash)" and a bare symbol like "(ZXCO )" never match --
-# both lack digits, which this pattern requires.
+# A cusip-shaped token inside parentheses in the row's action text. This is
+# the row's OWN entity -- the security the description text right before the
+# parenthetical names -- not a counterparty. Confirmed by cross-referencing
+# each row's own ISIN/SEDOL against its paren-adjacent token: on the
+# reverse-split pair, the TO row's paren token matches the ISIN that row's
+# own Description also carries, and likewise for the FROM row -- so the
+# paren token is self-describing, not a reference to the other leg. (An
+# earlier version of this code read the token immediately before "#REOR"
+# instead, which is actually the FROM/TO verb's COUNTERPARTY argument, and
+# produced an inverted source/resulting pair as a result -- see
+# _derive_cusip_pair.) Money notation like "(Cash)" and a bare symbol like
+# "(ZXCO )" never match -- both lack digits, which this pattern requires.
 _PAREN_CUSIP_RE = re.compile(r"\(([A-Z]{1,6}\d{5,9})\)")
 
 
-def _parse_reor(action: str) -> tuple[str | None, str | None, tuple[str, ...]]:
-    """Extract the row's own #REOR reference (or None), the cusip-shaped
-    token immediately preceding it (or None), and any cusip-shaped tokens
-    found in parentheses elsewhere in the row's action text."""
+def _parse_reor(action: str) -> tuple[str | None, tuple[str, ...]]:
+    """Extract the row's own #REOR reference (or None) and any cusip-shaped
+    tokens found in parentheses in the row's action text -- see
+    _PAREN_CUSIP_RE's comment for why the paren token, not the token
+    adjacent to "#REOR", is the row's own entity."""
     ref_match = _REOR_RE.search(action)
     reor_ref = ref_match.group(1) if ref_match else None
-    own_match = _OWN_CUSIP_RE.search(action)
-    own_cusip = own_match.group(1) if own_match else None
     paren_cusips = tuple(_PAREN_CUSIP_RE.findall(action))
-    return reor_ref, own_cusip, paren_cusips
+    return reor_ref, paren_cusips
 
 
 # rule.name -> CorporateActionProposal.kind. cash_in_lieu is deliberately
@@ -309,7 +331,7 @@ class _CorporateActionRow:
     quantity: Decimal
     description: str
     symbol: str | None
-    own_cusip: str | None
+    row_cusip: str | None  # this row's own entity -- see _PAREN_CUSIP_RE
     group_key: tuple
 
 
@@ -381,30 +403,23 @@ def _group_corporate_actions(
 def _derive_cusip_pair(
     group_rows: list["_CorporateActionRow"],
 ) -> tuple[str | None, str | None]:
-    """Best-effort only -- neither field is asserted by any test, and this
-    deliberately does not try to be more confident than the data supports.
+    """source_cusip (the entity given up) and resulting_cusip (the entity
+    received), read from each row's OWN paren-adjacent cusip token (see
+    _PAREN_CUSIP_RE) rather than guessed from FROM/TO English, which this
+    fixture's own rows do not use consistently enough to trust on its own.
 
-    The cusip-shaped token immediately before #REOR ('own_cusip') is the
-    only position present across FROM/TO rows (PAYOUT rows never carry one),
-    but it is NOT a reliable 'old vs new' signal for every shape: a merger's
-    two FROM legs (going to two different resulting companies) share the
-    SAME own_cusip, because that position names the company being given up,
-    not the one each leg individually receives -- confirmed by inspecting
-    this fixture's own merger rows, not assumed. Reporting that shared value
-    as a single resulting_cusip would be exactly the false-confidence this
-    task's brief warns against (a wrong CUSIP is a smaller error than a wrong
-    ratio, but the shape of the mistake is the same).
-
-    So a side is only resolved when exactly ONE row sits on it: quantity
-    strictly negative (shares given up) is source_cusip, strictly positive
-    (shares received) is resulting_cusip. A merger's two-row positive side
-    (or its own_cusip-less PAYOUT row) therefore yields None on that side --
-    an honest "not derivable from this row shape", not a guess.
+    Role comes from quantity sign, which is unambiguous regardless of
+    wording: strictly negative (shares given up) is source_cusip, strictly
+    positive (shares received) is resulting_cusip. A side is only resolved
+    when exactly ONE row sits on it -- a merger's two-row positive side (two
+    different resulting companies) has no single value to report, so it is
+    left None rather than picking one arbitrarily. spec §7: an unresolvable
+    identifier is blank, never a guess -- and never backwards.
     """
     negative = [r for r in group_rows if r.quantity < 0]
     positive = [r for r in group_rows if r.quantity > 0]
-    source_cusip = negative[0].own_cusip if len(negative) == 1 else None
-    resulting_cusip = positive[0].own_cusip if len(positive) == 1 else None
+    source_cusip = negative[0].row_cusip if len(negative) == 1 else None
+    resulting_cusip = positive[0].row_cusip if len(positive) == 1 else None
     return source_cusip, resulting_cusip
 
 
@@ -888,7 +903,7 @@ class FidelityImporter:
                     )
                     continue
 
-                reor_ref, own_cusip, paren_cusips = _parse_reor(action)
+                reor_ref, paren_cusips = _parse_reor(action)
                 if reor_ref:
                     group_key = ("reor", _reor_base(reor_ref))
                 else:
@@ -899,10 +914,15 @@ class FidelityImporter:
                     # resort to keep such rows from all colliding onto one
                     # (ex_date, ()) key if more than one ever appears on the
                     # same date.
-                    cusip_tuple = tuple(
-                        sorted(set(paren_cusips) | ({own_cusip} if own_cusip else set()))
-                    )
+                    cusip_tuple = tuple(sorted(set(paren_cusips)))
                     group_key = ("fallback", when.date(), cusip_tuple or (symbol or "",))
+
+                # This row's own entity -- see _PAREN_CUSIP_RE's comment for
+                # why it is the paren token and not the token before #REOR.
+                # None when the row carries zero or more than one
+                # cusip-shaped paren token (ambiguous either way; honest
+                # absence rather than picking one).
+                row_cusip = paren_cusips[0] if len(paren_cusips) == 1 else None
 
                 corporate_action_rows.append(
                     _CorporateActionRow(
@@ -912,7 +932,7 @@ class FidelityImporter:
                         quantity=quantity,
                         description=description,
                         symbol=symbol or None,
-                        own_cusip=own_cusip,
+                        row_cusip=row_cusip,
                         group_key=group_key,
                     )
                 )
