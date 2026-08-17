@@ -245,10 +245,11 @@ async def _complete_spinoff_ratio(
     never captured by the pure layer). So the parent is found here by
     elimination instead: the account's own net holding, as of the ex-date,
     across every instrument it has ever traded. If exactly one instrument
-    has a nonzero net quantity, that is unambiguously the parent -- an
-    account that holds only one thing cannot have received THIS spinoff from
-    anything else. Zero or more than one is reported as undeterminable (spec
-    Sec7) rather than guessed at.
+    has a positive net quantity (LONG, never zero or short -- a spinoff is
+    only received on shares you are long), that is unambiguously the parent
+    -- an account long only one thing cannot have received THIS spinoff from
+    anything else. Zero long holdings, or more than one, is reported as
+    undeterminable (spec Sec7) rather than guessed at.
 
     Returns (ratio, note): `ratio` is None when it could not be completed,
     and `note` always explains -- either what the ratio was derived from, or
@@ -281,15 +282,17 @@ async def _complete_spinoff_ratio(
          WHERE f.account_id = $1
            AND f.executed_at < $2
          GROUP BY i.id, i.symbol
-        HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) <> 0
+        HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
         """,
         account_id,
         cutoff,
     )
     if len(rows) == 0:
         return None, (
-            f"not completed: account {account_id} holds no instrument as of "
-            f"{p.ex_date.isoformat()} to use as the parent"
+            f"not completed: account {account_id} holds no LONG position in any "
+            f"instrument as of {p.ex_date.isoformat()} to use as the parent -- a "
+            "spinoff is only received on shares you are long; a net-short or "
+            "flat holding does not qualify, so this excludes both"
         )
     if len(rows) > 1:
         symbols = ", ".join(sorted(r["symbol"] for r in rows))
@@ -323,9 +326,32 @@ async def _spinoff_notes_for(
     return notes
 
 
+_ALL_CORPORATE_ACTION_KINDS = frozenset({"reverse_split", "name_change", "merger", "spinoff"})
+
+# The three kinds whose ratio never needs a ledger read: reverse_split and
+# name_change always carry their ratio out of importers/ already (spec §6),
+# and a merger's is structurally absent regardless of ledger state (spec
+# §6a). Only spinoff depends on this import's own committed fills (see
+# _complete_spinoff_ratio) -- which is exactly why the commit path below
+# splits its printing into an EARLY pass (this set, safe even on a refused
+# commit, since none of it reads anything the refusal left uncommitted) and
+# a LATE pass (spinoff alone, after the commit that might supply its parent
+# holding).
+_NON_LEDGER_KINDS = frozenset({"reverse_split", "name_change", "merger"})
+
+_CORPORATE_ACTION_HEADER = (
+    "\n=== Corporate actions detected -- nothing above was written; "
+    "review before running any command below ==="
+)
+
+
 def _print_corporate_action_section(
     batch: ImportBatch,
     spinoff_notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]],
+    *,
+    kinds: frozenset[str] = _ALL_CORPORATE_ACTION_KINDS,
+    include_cash_in_lieu: bool = True,
+    header: str = _CORPORATE_ACTION_HEADER,
 ) -> None:
     """Spec Sec8: after the trade summary, a clearly separated, hard-to-miss
     section -- one `corporate add` command per detected action, preceded by
@@ -335,17 +361,26 @@ def _print_corporate_action_section(
     record). Prints nothing at all when there is nothing to report, so an
     ordinary import (no corporate-action rows) is unaffected.
 
+    `kinds` restricts which proposals this call renders. Preview (which
+    never reaches a post-commit point at all -- see _preview_or_commit)
+    always passes every kind. The commit path calls this twice: once EARLY,
+    before routing/blocking can refuse the commit, with `kinds=
+    _NON_LEDGER_KINDS` (reverse_split, name_change, merger -- none of which
+    need this import's fills to have been committed, so they can still be
+    reported on a refusal); and once LATE, after commit_batch runs, with
+    `kinds={"spinoff"}` and `include_cash_in_lieu=False` (already shown
+    early) -- see _preview_or_commit for why spinoff alone must wait.
+
     D2/D3: never writes anything. Every command printed below is text for a
     human to read, edit and run; nothing here calls add_action.
     """
-    if not batch.corporate_actions and not batch.cash_in_lieu:
+    matching = [(i, p) for i, p in enumerate(batch.corporate_actions) if p.kind in kinds]
+    cash_in_lieu = batch.cash_in_lieu if include_cash_in_lieu else ()
+    if not matching and not cash_in_lieu:
         return
 
-    print(
-        "\n=== Corporate actions detected -- nothing above was written; "
-        "review before running any command below ==="
-    )
-    for i, p in enumerate(batch.corporate_actions):
+    print(header)
+    for i, p in matching:
         ratio = p.ratio
         note: str | None = None
         if p.kind == "spinoff":
@@ -384,12 +419,12 @@ def _print_corporate_action_section(
             print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
             print(f"  {_render_corporate_add_command(p, None)}")
 
-    if batch.cash_in_lieu:
+    if cash_in_lieu:
         print(
             "\n-- Cash in lieu of fractional shares: recognised, NOT applied "
             "(gap #35) --"
         )
-        for desc in batch.cash_in_lieu:
+        for desc in cash_in_lieu:
             print(f"  {desc}")
 
 
@@ -582,6 +617,20 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
+            # EARLY: reverse_split, name_change and merger never need this
+            # import's own fills to have been committed (their ratio is
+            # either already on the proposal from importers/, or -- merger
+            # -- structurally absent regardless of ledger state), so they
+            # are printed here, before route_batch and every refusal below
+            # can return 2. A refused commit writes nothing, but these three
+            # kinds' proposals do not depend on anything having been
+            # written, so there is no reason to withhold them from a user
+            # who has to fix the refusal and re-run anyway -- see
+            # _print_corporate_action_section's docstring for the split.
+            # spinoff_notes={}: no spinoff kind is in _NON_LEDGER_KINDS, so
+            # _print_corporate_action_section never looks one up here.
+            _print_corporate_action_section(batch, {}, kinds=_NON_LEDGER_KINDS)
+
             plan = await route_batch(conn, venue, batch)
 
             # Same "refuse the whole batch, write nothing" shape as the
@@ -757,13 +806,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     cash_inserted += result.cash_inserted
                     trades_regrouped += await regroup_account(conn, account_id)
 
-                # Printed here, inside the same transaction as the commit
-                # above and after it -- spec Sec8's "after the trade
-                # summary" placement, and the one point in this function
-                # where a spinoff's ratio can be completed against BOTH
-                # pre-existing fills and this import's own. A real
-                # multi-year History export commonly carries the original
-                # purchase and a later spinoff in the SAME file (see
+                # LATE: spinoff alone, printed here inside the same
+                # transaction as the commit above and after it -- the one
+                # point in this function where a spinoff's ratio can be
+                # completed against BOTH pre-existing fills and this
+                # import's own. A real multi-year History export commonly
+                # carries the original purchase and a later spinoff in the
+                # SAME file (see
                 # tests/fixtures/fidelity/real_shape_history.csv); reading
                 # the ledger before commit_batch runs would miss that
                 # purchase entirely and report "no holding" for a ratio
@@ -777,12 +826,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                 # A refused commit (any of the early `return 2`s above, all
                 # of which run before this transaction even opens) never
                 # reaches this section -- nothing has been written in that
-                # case, so an earlier placement's only advantage would have
-                # been reporting on the non-spinoff proposals during a
-                # refusal, which this trades away for spinoff correctness in
-                # the far more common successful-commit case. On refusal the
-                # user sees the refusal's own error and re-runs; the
-                # proposal section reaches them on that next, successful
+                # case, so a spinoff's ledger read would be no more complete
+                # here than it was at the EARLY point above. reverse_split,
+                # name_change and merger do not have this problem (see the
+                # EARLY call above, before route_batch) -- only spinoff's
+                # correctness trades away reporting on a refusal, and on
+                # refusal the user sees the refusal's own error and re-runs;
+                # the spinoff proposal reaches them on that next, successful
                 # attempt.
                 #
                 # History-dialect rows (the only dialect with corporate
@@ -797,7 +847,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     UUID(args.account) if getattr(args, "account", None) else None
                 )
                 spinoff_notes = await _spinoff_notes_for(conn, account_id_for_corporate, batch)
-                _print_corporate_action_section(batch, spinoff_notes)
+                _print_corporate_action_section(
+                    batch,
+                    spinoff_notes,
+                    kinds=frozenset({"spinoff"}),
+                    include_cash_in_lieu=False,
+                    header="\n=== Spinoff ratio(s) completed against the committed ledger ===",
+                )
     finally:
         # pool.close() waits for every checked-out connection to be released.
         # It must run after the `async with pool.acquire()` block has exited

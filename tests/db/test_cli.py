@@ -2922,6 +2922,54 @@ _SPINOFF_ROW_FOR_ZXQ_TEMPLATE = (
     'NEW WTS EXP 12/31/2030,Cash,"",60,"","","",0.00,992.03,""'
 )
 
+# Same 1800-old/300-new quantities as _REVERSE_SPLIT_ROWS (still reduces to
+# 1:6), but the TO row's Description states "1 FOR 5" instead of "1 FOR 6" --
+# a stated ratio that DISAGREES with the derived one (spec §6a's
+# cash-in-lieu-remainder / misparse case). ratio_source must come out
+# 'derived', never 'derived+confirmed', and approximate must be True.
+_REVERSE_SPLIT_ROWS_MISMATCHED = (
+    '03/10/2024,REVERSE SPLIT R/S FROM ZXP000001#REOR N9990000020001 '
+    'NINTH FABRICATED WIDGETS CORP COM (POST REV SPLIT) (ZXP000002) (Cash),"",'
+    'NINTH FABRICATED WIDGETS CORP COM (POST REV SPLIT) ISIN #ZX0000000199 '
+    'SEDOL #BZP0001,Cash,"",300,"","","",0.00,1006.25,""',
+    '03/10/2024,REVERSE SPLIT R/S TO ZXP000002#REOR N9990000020000 '
+    'NINTH FABRICATED WIDGETS CORP COM ISIN #ZX0000000188 1 FOR 5 R/S INTO '
+    'NINTH FABRICATED WIDGETS CORP (ZXP000001) (Cash),"",'
+    'NINTH FABRICATED WIDGETS CORP COM ISIN #ZX0000000188 SEDOL #BZP0002 '
+    '1 FOR 5 R/S INTO NINTH FABRICATED WIDGETS CORP,Cash,"","-1800","","","",'
+    '0.00,1006.25,""',
+)
+
+# A three-row merger (spec §5: always exactly three legs -- one PAYOUT
+# negative leg, two positive resulting legs), same shape as
+# real_shape_history.csv's own merger. Two positive rows means
+# _derive_quantity_ratio (importers/fidelity.py) can never resolve a ratio
+# for it -- structural, not a parsing gap (spec §6a).
+_MERGER_ROWS = (
+    '05/12/2024,MERGER MER FROM ZXP000001#REOR N9990000030002 ELEVENTH '
+    'FABRICATED RESOURCES CORP COM ISIN #ZX0000000299 SEDOL #BZP0004 '
+    '(ZXP000004) (Cash),"",ELEVENTH FABRICATED RESOURCES CORP COM ISIN '
+    '#ZX0000000299 SEDOL #BZP0004,Cash,"",9,"","","",0.00,1006.25,""',
+    '05/12/2024,MERGER MER FROM ZXP000001#REOR N9990000030001 TWELFTH '
+    'FABRICATED METALS INC COM ISIN #ZX0000000300 SEDOL #BZP0005 '
+    '(ZXP000005) (Cash),"",TWELFTH FABRICATED METALS INC COM ISIN '
+    '#ZX0000000300 SEDOL #BZP0005,Cash,"",4,"","","",0.00,1006.25,""',
+    '05/12/2024,MERGER MER PAYOUT #REOR N9990000030000 NINTH FABRICATED '
+    'WIDGETS CORP COM (ZXP000001) (Cash),"",NINTH FABRICATED WIDGETS CORP '
+    'COM ISIN #ZX0000000188 SEDOL #BZP0002 *REORGANIZATION*,Cash,"","-26",'
+    '"","","","-14.22",992.03,""',
+)
+
+# A row whose Action verb matches no rule and whose Amount is non-zero --
+# money-carrying and unmapped, so it lands in ImportBatch.blocking (spec §7)
+# and refuses the whole commit. Used to prove the EARLY, non-ledger
+# proposals (reverse_split/name_change/merger) still reach the user even
+# when an unrelated row in the SAME file refuses the commit.
+_BLOCKING_ROW = (
+    '08/01/2024,MYSTERIOUS NEW ACTION NOT A KNOWN VERB,ZXP,MYSTERIOUS '
+    'DISBURSEMENT,Cash,"",0,"","","","500.00",1006.75,""'
+)
+
 
 async def test_import_proposes_a_corporate_add_command(conn, monkeypatch, capsys, tmp_path):
     """The importer proposes and never stores: a corporate action silently
@@ -2942,6 +2990,103 @@ async def test_import_proposes_a_corporate_add_command(conn, monkeypatch, capsys
     )
     rc = await cli.cmd_import(args)
     assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "corporate add" in out
+    assert "--ratio 1:6" in out
+    # _REVERSE_SPLIT_ROWS is crafted so the derived ratio (from the paired
+    # quantities) and the stated ratio ("1 FOR 6" in the TO row's
+    # Description) agree -- spec §6a's strongest evidence, ratio_source
+    # 'derived+confirmed'. Collapsing that distinction into plain 'derived'
+    # (the wording for "only one source existed") must redden this.
+    assert "two independent sources agree" in out
+
+
+async def test_import_flags_an_approximate_ratio_end_to_end(conn, monkeypatch, capsys, tmp_path):
+    """A reverse split whose stated ratio disagrees with the derived one --
+    the cash-in-lieu-remainder / misparse case spec §6a exists to catch --
+    must reach the user as a loud, separate flag next to the (still
+    quantity-derived, still correct) ratio, never silently presented as
+    confirmed."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_REVERSE_SPLIT_ROWS_MISMATCHED),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "APPROXIMATE" in out
+    assert "--ratio 1:6" in out
+    assert "no independent confirmation" in out
+    assert "two independent sources agree" not in out
+
+
+async def test_import_renders_a_merger_as_incomplete(conn, monkeypatch, capsys, tmp_path):
+    """A merger's ratio is structurally absent (spec §6a) -- one of the two
+    kinds `--ratio required=True` cannot be satisfied for. This must render
+    as visibly incomplete, with the structural reason stated, never as a
+    false ready-to-run command."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_MERGER_ROWS),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "\nmerger ex" in out
+    assert "ratio: UNAVAILABLE" in out
+    assert "INCOMPLETE" in out
+    assert "--ratio <FILL IN>" in out
+    assert "structural" in out.lower()
+    assert "not a parsing gap" in out.lower()
+
+
+async def test_a_refused_commit_still_shows_the_non_ledger_proposals(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """History-dialect rows route the whole file to one account, so an
+    unrelated, unmapped, money-carrying row in the SAME file refuses the
+    whole commit (spec §7's blocking policy) and writes nothing -- but
+    reverse_split, name_change and merger proposals need no ledger read
+    (only a spinoff's does), so they must still reach the user even though
+    the commit was refused. The user has to fix the refusal and re-run
+    regardless; there is no reason to withhold proposals that never
+    depended on anything having been written."""
+    acc = await create_account(conn, name="Hist", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, *_REVERSE_SPLIT_ROWS, _BLOCKING_ROW),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc != 0
 
     out = capsys.readouterr().out
     assert "corporate add" in out
@@ -3094,7 +3239,7 @@ async def test_the_spinoff_ratio_is_left_blank_when_the_parent_is_undeterminable
     assert "ratio: UNAVAILABLE" in out
     assert "INCOMPLETE" in out
     assert "--ratio 1:30" not in out
-    assert "holds no instrument" in out
+    assert "holds no LONG position" in out
 
 
 async def test_the_spinoff_ratio_is_left_blank_when_the_account_holds_more_than_one_instrument(
@@ -3169,6 +3314,64 @@ async def test_the_spinoff_ratio_is_left_blank_when_the_account_holds_more_than_
     assert "ambiguous" in out.lower()
     assert "ZXQ" in out
     assert "ZXR" in out
+
+
+async def test_the_spinoff_ratio_is_left_blank_when_the_account_is_short(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A spinoff is received on shares you are LONG. A net-short holding
+    (here: a SELL with no offsetting BUY) must not qualify as the parent --
+    `HAVING SUM(...) > 0`, not `<> 0` -- or a negative "holding" would
+    produce a nonsensical ratio like 60:-100 that only cmd_corporate_add's
+    own positivity check would catch, far downstream of where the mistake
+    actually happened."""
+    acc = await create_account(conn, name="Short", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXQ", quote_currency="USD"),
+    )
+    before_ex_date = datetime(2026, 1, 1, tzinfo=UTC)
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=before_ex_date,
+                side=Side.SELL,
+                quantity=Decimal("100"),
+                price=Decimal("1"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="short-only",
+                is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(
+            tmp_path, _SPINOFF_ROW_FOR_ZXQ_TEMPLATE.format(run_date="03/15/2026")
+        ),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "holds no LONG position" in out
+    assert "-100" not in out
+    assert "--ratio <FILL IN>" in out
 
 
 async def test_cash_in_lieu_is_reported_as_unapplied(conn, monkeypatch, capsys, tmp_path):
