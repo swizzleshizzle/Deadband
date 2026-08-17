@@ -431,22 +431,30 @@ def _derive_cusip_pair(
 
 
 # Spec §6a: the ratio is also stated in the description text itself, not just
-# implied by the paired quantities. Verified against the real exports (not
-# invented, not just this fixture): "N FOR N" occurs 21 times and "N:N" 10
-# times, alongside R/S and REV SPLIT markers that carry no number of their
-# own and so are not parsed here. FOR is tried first -- it is the more
-# distinctive idiom; a bare colon is more likely to collide with unrelated
-# punctuation in free-form venue text, so it is the fallback, not co-equal.
+# implied by the paired quantities. "N FOR N" occurs 21 times across the real
+# exports. §6a originally also claimed "N:N" occurs 10 times -- that was a
+# miscount, corrected after the reviewer checked every match: all 11
+# digit:digit occurrences in the real exports are the "Date downloaded
+# MM/DD/YYYY HH:MM pm" footer timestamp, not a ratio. Zero are ratios. There
+# is therefore no colon form to parse, and a bare digit:digit pattern is
+# actively dangerous rather than merely redundant -- it collides with that
+# footer and with any time-like text a description happens to contain (e.g.
+# "SETTLED AT 02:31 PM" would parse as ratio (2, 31)). A spurious stated
+# ratio is worse than none, per spec §6a: agreeing with it certifies a ratio
+# nobody stated, disagreeing with it raises a false alarm in the exact
+# mechanism this cross-check exists to make trustworthy. So this parses ONLY
+# "N FOR N" -- see test_stated_ratio_does_not_mistake_a_clock_time_for_a_ratio
+# in tests/test_fidelity_history.py, which pins that a colon never parses.
 _STATED_RATIO_FOR_RE = re.compile(r"(\d+)\s*FOR\s*(\d+)", re.IGNORECASE)
-_STATED_RATIO_COLON_RE = re.compile(r"(?<!\d)(\d{1,4}):(\d{1,4})(?!\d)")
 
 
 def _parse_stated_ratio(text: str) -> tuple[Decimal, Decimal] | None:
     """The ratio as Fidelity's own text states it, new:old -- the same
     direction _derive_quantity_ratio computes from the paired quantities.
-    None when neither pattern matches (this fixture's name change and
-    merger rows state no ratio at all)."""
-    match = _STATED_RATIO_FOR_RE.search(text) or _STATED_RATIO_COLON_RE.search(text)
+    None when the pattern doesn't match (this fixture's name change and
+    merger rows state no ratio at all, and -- deliberately -- neither does
+    any bare "N:N"; see the comment above _STATED_RATIO_FOR_RE)."""
+    match = _STATED_RATIO_FOR_RE.search(text)
     if not match:
         return None
     return Decimal(match.group(1)), Decimal(match.group(2))
@@ -481,17 +489,37 @@ def _derive_quantity_ratio(
 ) -> tuple[Decimal, Decimal] | None:
     """(new, old), reduced -- the direction adjust_fills consumes, and the
     direction the "1 FOR 3" idiom itself uses (1 new FOR 3 old). Only
-    derived when exactly one row sits on each side, the same rule
-    _derive_cusip_pair uses to resolve a single entity: a merger with two
-    DIFFERENT resulting companies (this fixture's merger) has no single "new"
-    quantity to report, and summing across them would silently manufacture a
-    ratio out of shares of two unrelated securities. Ambiguous stays None
-    rather than a guess (spec §7)."""
+    derived when exactly one row sits on each side (2 rows total), the same
+    rule _derive_cusip_pair uses to resolve a single entity. Ambiguous stays
+    None rather than a guess (spec §7).
+
+    This is why a merger NEVER derives a ratio, structurally rather than
+    incidentally (spec §6, corrected): _EXPECTED_LEG_COUNT fixes a merger's
+    group at exactly 3 rows, while deriving a ratio here requires exactly 1
+    negative row and exactly 1 positive row -- 2 rows total. 3 != 2, so
+    those two rules can never both hold for a merger; this branch always
+    returns None for one, not only for this fixture's particular two-issuer
+    shape (9 shares of one resulting company, 4 of another) where summing
+    across issuers would otherwise silently manufacture a ratio out of
+    shares of two unrelated securities."""
     negative = [r.quantity for r in group_rows if r.quantity < 0]
     positive = [r.quantity for r in group_rows if r.quantity > 0]
     if len(negative) != 1 or len(positive) != 1:
         return None
     return _reduce_ratio(positive[0], abs(negative[0]))
+
+
+# ratio_source values, spec §6a: 'constant' (name_change's fixed 1:1),
+# 'derived' (quantities only -- either no stated text was found to check
+# against, or the stated text disagreed and `approximate` carries that
+# signal instead), 'derived+confirmed' (quantities AND the stated text
+# agree -- spec §6a's "strongest evidence available"), or None (spinoff, or
+# a merger, which is structurally never derivable -- see
+# _derive_quantity_ratio's docstring). 'derived' and 'derived+confirmed' are
+# deliberately distinct: collapsing them would let a consumer mistake "never
+# checked" for "two sources agreed", which is exactly what the reviewer
+# demonstrated by pointing out that deleting the cross-check entirely still
+# produced 'derived' either way.
 
 
 def _derive_ratio(
@@ -511,24 +539,30 @@ def _derive_ratio(
         # cli.py fills this from the ledger.
         return None, None, False, None
 
-    # reverse_split, merger: derive from the paired quantities, then
-    # cross-check against the stated text.
+    # reverse_split: derive from the paired quantities, then cross-check
+    # against the stated text. merger always returns None here -- see
+    # _derive_quantity_ratio's docstring for why that is structural, not a
+    # gap in this dispatch.
     derived = _derive_quantity_ratio(group_rows)
     if derived is None:
-        # Ambiguous shape (see _derive_quantity_ratio's docstring) -- blank,
-        # never a guess, the same silent-blank precedent _derive_cusip_pair
-        # sets for resulting_cusip in this exact merger.
+        # Ambiguous shape, or a merger (always -- see
+        # _derive_quantity_ratio's docstring) -- blank, never a guess, the
+        # same silent-blank precedent _derive_cusip_pair sets for
+        # resulting_cusip in this exact merger.
         return None, None, False, None
 
     stated = _parse_stated_ratio(description)
     if stated is None:
+        # Only one source available -- record it as such (spec §6a), not as
+        # a confirmed match.
         return derived, "derived", False, None
 
     stated_reduced = _reduce_ratio(*stated)
     if stated_reduced == derived:
         # Two independent sources agreeing is the strongest evidence
-        # available that this is right (spec §6a).
-        return derived, "derived", False, None
+        # available that this is right (spec §6a) -- recorded distinctly
+        # from the "only one source existed" case above.
+        return derived, "derived+confirmed", False, None
 
     # Disagreement is the signal that matters (spec §6a): a fractional
     # remainder paid out as cash in lieu, or a misparse of one side. Never

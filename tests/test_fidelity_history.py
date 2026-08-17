@@ -248,6 +248,26 @@ def test_a_reverse_split_ratio_is_derived_and_reduced():
     assert split.approximate is False
 
 
+def test_stated_ratio_does_not_mistake_a_clock_time_for_a_ratio():
+    """Spec §6a (corrected): every digit:digit match across the real exports
+    -- all 11 of them -- turned out to be the "Date downloaded ... HH:MM pm"
+    footer timestamp, not a ratio; the form "N:N" does not occur at all. A
+    colon-form parser would therefore have no real occurrence to justify it,
+    and would actively misfire on ordinary time-like text. Calls
+    _parse_stated_ratio directly (not through a fixture row) so this holds
+    regardless of whether such text ever reaches a real corporate-action
+    description -- the exposing input the reviewer named."""
+    from importers.fidelity import _parse_stated_ratio
+
+    assert _parse_stated_ratio("PAYOUT SETTLED AT 02:31 PM (Cash)") is None
+    assert _parse_stated_ratio("Date downloaded 09/12/2026 02:31 pm") is None
+    # The one form that IS real still parses, so this isn't just "always None".
+    assert _parse_stated_ratio("1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO") == (
+        Decimal(1),
+        Decimal(3),
+    )
+
+
 def test_a_name_change_ratio_is_one_to_one():
     change = next(p for p in _batch().corporate_actions if p.kind == "name_change")
     assert change.ratio == (Decimal(1), Decimal(1))
@@ -271,9 +291,17 @@ def test_a_merger_with_two_different_resulting_entities_carries_no_ratio():
     resulting_stays_blank already established resulting_cusip is None for the
     identical reason (no single resulting entity); ratio must follow the same
     "ambiguous -> blank, never a guess" rule, not silently pick one leg or
-    sum across entities."""
+    sum across entities.
+
+    Beyond this fixture's particular shape, it is structural (spec §6,
+    corrected): a merger's group is always exactly 3 rows
+    (_EXPECTED_LEG_COUNT), while deriving a ratio requires exactly 1
+    negative and 1 positive row -- 2 rows total. 3 != 2, so no merger this
+    importer recognises can ever produce a derived ratio. ratio_source
+    reflects that too -- None, not 'derived', since nothing was derived."""
     merger = next(p for p in _batch().corporate_actions if p.kind == "merger")
     assert merger.ratio is None
+    assert merger.ratio_source is None
 
 
 def test_every_proposal_keeps_the_quantities_it_derived_from():
@@ -332,9 +360,17 @@ def test_stated_and_derived_ratios_agree_for_every_paired_action_in_the_fixture(
     and its quantities (17, 51) reduce to the same 1:3 -- the two independent
     sources spec §6a wants cross-checked. Pinning the agreement here means a
     future change to either the parser or the fixture that breaks the
-    cross-check shows up as a red test, not as a silently-preferred number."""
+    cross-check shows up as a red test, not as a silently-preferred number.
+
+    ratio_source == 'derived+confirmed', NOT the bare 'derived' a
+    single-source (no stated text found) case also produces -- that
+    distinction is the whole point of this test. Deleting the
+    _parse_stated_ratio call entirely would still leave ratio == (1, 3) and
+    approximate == False (nothing to disagree with), so THIS assertion, not
+    those, is what proves the cross-check actually ran rather than merely
+    never having found anything to disagree with."""
     batch = _batch()
     split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
-    assert split.ratio_source == "derived"
+    assert split.ratio_source == "derived+confirmed"
     assert split.approximate is False
     assert not any("disagrees" in w.lower() for w in batch.warnings)

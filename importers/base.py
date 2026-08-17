@@ -169,14 +169,31 @@ class CorporateActionProposal:
     description: str                # the venue's own text, for a human to identify it
     quantities: tuple[Decimal, ...]  # the evidence the ratio was derived from
     ratio: tuple[Decimal, Decimal] | None = None   # filled by Task 3; None until then
-    # Where `ratio` came from -- 'derived' (the paired rows' quantities,
-    # reduced, spec §6), 'constant' (name_change's fixed 1:1, no row data
-    # involved), or None (spinoff, or a shape too ambiguous to derive from at
-    # all -- e.g. a merger with more than one resulting entity, where summing
-    # quantities across two different securities would be a meaningless
-    # number dressed up as a ratio). Recorded per spec §6a's "use what there
-    # is and record which source the ratio came from" -- so a consumer never
-    # has to re-derive provenance from `kind` alone.
+    # Where `ratio` came from -- spec §6a's "use what there is and record
+    # which source the ratio came from", so a consumer never has to
+    # re-derive provenance from `kind` alone. One of:
+    #   'constant'         -- name_change's fixed 1:1, no row data involved.
+    #   'derived'          -- from the paired rows' quantities (spec §6),
+    #                         with EITHER no stated ratio in the text to
+    #                         check it against, OR a stated ratio that
+    #                         disagreed (see `approximate` below for that
+    #                         case). Deliberately NOT used for a confirmed
+    #                         two-source match -- see 'derived+confirmed'.
+    #   'derived+confirmed' -- from the paired rows' quantities AND matching
+    #                         the ratio stated in the text (spec §6a's
+    #                         "strongest evidence available"). Kept distinct
+    #                         from plain 'derived' so a consumer can tell
+    #                         "two sources agreed" from "only one source
+    #                         existed" -- collapsing them would make it
+    #                         impossible to tell a confirmed cross-check from
+    #                         one that never ran at all.
+    #   None               -- spinoff (spec §6, last row: not derivable from
+    #                         the file), or a merger (structurally never
+    #                         derivable -- spec §6, corrected: a merger's
+    #                         group is always 3 rows, but deriving a ratio
+    #                         needs exactly 2, so the two rules can never
+    #                         both hold; see importers/fidelity.py's
+    #                         _derive_quantity_ratio).
     ratio_source: str | None = None
     # True when the derived ratio DISAGREES with the ratio stated in the
     # venue's own description text (spec §6a's cross-check) -- e.g. a
