@@ -129,6 +129,16 @@ class Outcome(enum.Enum):
     # exists so the refusal names the verb, and blocks unconditionally
     # rather than depending on what the row's money columns happen to hold.
     UNSUPPORTED = "unsupported"
+    # Recognised, produces nothing, and does NOT block -- the row's follow-up
+    # is a `corporate add` proposal, not a fill or a cash movement.
+    #
+    # Distinct from INTERNAL, which also produces nothing but has no follow-up,
+    # and from UNSUPPORTED, which is recognised and deliberately REFUSED. These
+    # rows carry a nonzero quantity, so before this existed they hit the
+    # money-carrying-unmapped policy and refused the entire import -- the same
+    # shape investment_gain_loss was added for, and the reason two accounts
+    # could not be imported at all.
+    CORPORATE_ACTION = "corporate_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +176,21 @@ RULES: tuple[Rule, ...] = (
     # this to a symbol predicate without re-reading the plan dialect's shape
     # in tests/fixtures/fidelity/real_shape_activity.csv.
     Rule("investment_gain_loss", "INVESTMENT GAIN/LOSS", Outcome.INTERNAL),
+    # Corporate actions -- History dialect only (the Activity & Orders
+    # fixtures never carry one; see tests/test_fidelity_history.py). Verbs
+    # observed on real export rows: "REVERSE SPLIT R/S FROM/TO ...", "NAME
+    # CHANGED N/C FROM/TO ...", "MERGER MER FROM/PAYOUT ...", "DISTRIBUTION
+    # SPINOFF FROM:(...) ...", and "IN LIEU OF FRX SHARE ... PAYOUT ..." for
+    # the cash paid out on the fractional remainder a reverse split leaves.
+    # None of these five prefixes overlaps any other rule's verb in either
+    # direction, so their position in RULES is not load-bearing today -- the
+    # mutation gate (moving them to the end of RULES, after expired_option)
+    # left every test green. See the task report for the full record.
+    Rule("reverse_split", "REVERSE SPLIT", Outcome.CORPORATE_ACTION),
+    Rule("name_change", "NAME CHANGED", Outcome.CORPORATE_ACTION),
+    Rule("merger", "MERGER", Outcome.CORPORATE_ACTION),
+    Rule("spinoff_distribution", "DISTRIBUTION SPINOFF", Outcome.CORPORATE_ACTION),
+    Rule("cash_in_lieu", "IN LIEU OF", Outcome.CORPORATE_ACTION),
     Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
     Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
     Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),
@@ -640,6 +665,16 @@ class FidelityImporter:
                 warnings.append(message)
                 unmapped.append(str(raw_row))
                 blocking.append((account, message))
+                continue
+
+            if rule.outcome is Outcome.CORPORATE_ACTION:
+                # Recognised and DEFERRED, not recorded and not refused. This
+                # row's follow-up is a `corporate add` proposal a later task
+                # emits -- see Outcome.CORPORATE_ACTION's docstring for why
+                # this is neither INTERNAL (no follow-up) nor UNSUPPORTED
+                # (blocks unconditionally). Nothing is appended to `fills`,
+                # `cash`, `unmapped`, or `blocking`: the row is fully
+                # accounted for by being recognised, not by being reported.
                 continue
 
             if rule.outcome is not Outcome.CASH:

@@ -178,13 +178,27 @@ def test_every_rule_is_exercised_by_a_fixture_row():
     invent (real assignments/exercises: zero, across three accounts and five
     years). That is not a gap in this test's coverage; it is a different
     source of coverage, asserted below in
-    test_unsupported_rules_are_exercised_by_the_hand_written_sample_table."""
+    test_unsupported_rules_are_exercised_by_the_hand_written_sample_table.
+
+    `Outcome.CORPORATE_ACTION` rules are excluded for the same shape of
+    reason, verified rather than assumed (see the design spec's §1): a
+    corporate action appears ONLY in the History dialect (no Account/Account
+    Number columns, a Cash Balance column instead) -- the multi-year exports
+    this fixture is not one of. Requiring these five rules to appear here
+    would force inventing rows this dialect structurally cannot emit. Their
+    coverage lives in tests/test_fidelity_history.py's
+    real_shape_history.csv instead, asserted below in
+    test_corporate_action_rules_are_exercised_by_the_history_fixture."""
     matched = set()
     for row in _data_rows():
         rule = classify(row["Action"], row["Symbol"])
         if rule is not None:
             matched.add(rule.name)
-    required = {r.name for r in RULES if r.outcome is not Outcome.UNSUPPORTED}
+    required = {
+        r.name
+        for r in RULES
+        if r.outcome not in (Outcome.UNSUPPORTED, Outcome.CORPORATE_ACTION)
+    }
     assert required - matched == set()
 
 
@@ -201,6 +215,32 @@ def test_unsupported_rules_are_exercised_by_the_hand_written_sample_table():
 
     matched = {classify(action, symbol).name for action, symbol in RULE_COVERAGE_SAMPLES}
     required = {r.name for r in RULES if r.outcome is Outcome.UNSUPPORTED}
+    assert required - matched == set()
+
+
+def test_corporate_action_rules_are_exercised_by_the_history_fixture():
+    """The three-way split's third leg. `Outcome.CORPORATE_ACTION` rules are
+    exempted above because THIS fixture is the wrong dialect for them, not
+    because no real-shape coverage exists at all -- they have their own
+    real-shape fixture, tests/fixtures/fidelity/real_shape_history.csv, which
+    is the dialect that actually carries them. Net effect, extending the
+    docstring above: every rule in RULES is covered by exactly one of three
+    sources, split by which dialect (or absence of any real occurrence) the
+    row it needs belongs to."""
+    from tests.test_fidelity_history import FIXTURE as HISTORY_FIXTURE
+
+    text = HISTORY_FIXTURE.read_text(encoding="utf-8")
+    lines = text.lstrip("﻿").splitlines()
+    header_idx = next(i for i, line in enumerate(lines) if line.startswith("Run Date,"))
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
+    matched = set()
+    for row in reader:
+        if not _RUN_DATE_RE.match((row.get("Run Date") or "").strip()):
+            continue
+        rule = classify(row.get("Action") or "", row.get("Symbol") or "")
+        if rule is not None:
+            matched.add(rule.name)
+    required = {r.name for r in RULES if r.outcome is Outcome.CORPORATE_ACTION}
     assert required - matched == set()
 
 
