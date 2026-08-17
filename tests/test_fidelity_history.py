@@ -15,15 +15,41 @@ reorganisation reference is a shared BASE plus a per-leg trailing digit, e.g.
 `M9990000010001` and `M9990000010000` are two legs of ONE event because they
 share the base `M999000001`, not because the two full references are equal.
 Rows belonging to one event share the base; they do NOT carry one identical
-reference. Checked directly against the real exports: 15 referenced rows, 13
-distinct full references, but only 7 distinct bases once the trailing digit
-is dropped. Observed leg digits are 0, 1, 2, and 4 -- NOT a contiguous run
-from zero, and no guarantee one exists for every event, so a grouping parser
-(Task 2) must not assume a leg digit predicts its position within the event
-or that all of 0..n are present. This fixture's own rows follow that same
-base+leg scheme (e.g. the reverse split's `M9990000010001`/`M9990000010000`
-share base `M999000001`; the merger's three legs share base `M999000003`),
-so Task 2 can be built and tested against it directly.
+reference.
+
+Re-derived (final fix wave) with the SHIPPED regex, `importers/fidelity.py`'s
+`_REOR_RE` = `#REOR\\s+(\\S+)`, applied to every line of every real export --
+naming the regex because the figures previously recorded here came from
+ad-hoc patterns that were never reconciled against the code's own, and were
+all four wrong:
+
+* **11** rows carry a reference this regex matches. (13 lines contain the
+  string `#REOR` at all; the other two are the `#REORL...` cash-in-lieu
+  spelling, which has no whitespace after `#REOR` and so does not match --
+  harmless, since cash-in-lieu rows are never grouped.)
+* **11** distinct full references -- i.e. every matched row has its own,
+  never two rows sharing one string. That is the finding this whole scheme
+  rests on, and it is what makes equality-on-the-full-token unusable.
+* **5** distinct bases once the trailing character is dropped, i.e. five real
+  reorganisation events across five years.
+* Observed leg digits are **0, 1 and 2**, and within each event they ARE a
+  contiguous run from zero (four events of `0,1`, one of `0,1,2`). An
+  earlier version of this docstring claimed a digit `4` and "NOT contiguous";
+  no `4` occurs. The caution still stands as a caution -- five events is far
+  too small a sample to promise contiguity, and nothing in the grouping code
+  relies on it -- but it is stated here as unverified, not as observed.
+
+This fixture's own rows follow that same base+leg scheme (e.g. the reverse
+split's `M9990000010001`/`M9990000010000` share base `M999000001`; the
+merger's three legs share base `M999000003`), so Task 2 can be built and
+tested against it directly.
+
+The fixture's CUSIP tokens (`99900Z101` and friends) are fabricated, but
+carry the real SHAPE: nine alphanumerics. An earlier fixture used
+`ZXC000001`, letters-then-digits, and the parser's pattern was fitted to it
+-- matching zero of the 15 corporate-action rows in the real exports, so the
+CUSIP-orientation tests below were green against a token form the parser
+never actually met.
 """
 
 import pathlib
@@ -132,22 +158,52 @@ def test_the_single_row_spinoff_is_one_proposal():
 
 
 def test_reverse_split_cusip_pair_is_old_to_new_not_inverted():
-    """ZXC000001 is the pre-split entity and ZXC000002 the post-split one --
+    """99900Z101 is the pre-split entity and 99900Z209 the post-split one --
     verified by cross-referencing each row's own ISIN in its Description
     against its paren-adjacent CUSIP in the fixture text. An earlier version
     of this code read the token before #REOR (the FROM/TO verb's
     COUNTERPARTY, not the row's own entity) and reported this pair
     backwards."""
     rs = next(p for p in _batch().corporate_actions if p.kind == "reverse_split")
-    assert rs.source_cusip == "ZXC000001"
-    assert rs.resulting_cusip == "ZXC000002"
+    assert rs.source_cusip == "99900Z101"
+    assert rs.resulting_cusip == "99900Z209"
 
 
 def test_name_change_cusip_pair_is_old_to_new_not_inverted():
     """Same defect, same fix, the other two-row shape."""
     nc = next(p for p in _batch().corporate_actions if p.kind == "name_change")
-    assert nc.source_cusip == "ZXC000002"
-    assert nc.resulting_cusip == "ZXC000003"
+    assert nc.source_cusip == "99900Z209"
+    assert nc.resulting_cusip == "99900Z307"
+
+
+def test_the_cusip_pattern_matches_the_shape_the_real_exports_actually_use():
+    """The token shape, pinned directly on the pattern rather than only
+    through the fixture -- this is the assertion that would have caught the
+    defect the fixture could not.
+
+    A CUSIP is nine alphanumerics. The pattern shipped before the final fix
+    wave required letters-then-digits, fitted to a fabricated `ZXC000001`,
+    and matched ZERO of the 15 corporate-action rows in the real exports:
+    `source_cusip`/`resulting_cusip` were therefore always None in
+    production while three orientation tests certified them. Both real
+    orderings are asserted here -- digits-first (every real row) and
+    letters-first (a CINS, a foreign issuer's CUSIP) -- so re-narrowing to
+    either one reddens this.
+
+    The negative cases are what the paren anchor buys: "(Cash)" appears on
+    EVERY row of this dialect, and a parenthesised bare ticker appears on
+    real spinoff, name-change and cash-in-lieu rows. Neither is nine
+    characters, so neither can be mistaken for an identifier.
+    """
+    from importers.fidelity import _PAREN_CUSIP_RE
+
+    assert _PAREN_CUSIP_RE.findall("COM (POST REV SPLIT) (99900Z209) (Cash)") == ["99900Z209"]
+    assert _PAREN_CUSIP_RE.findall("SOME FOREIGN CO (G9900Z101) (Cash)") == ["G9900Z101"]
+    assert _PAREN_CUSIP_RE.findall("MERGER MER PAYOUT (Cash)") == []
+    assert _PAREN_CUSIP_RE.findall("DISTRIBUTION SPINOFF FROM:(ZXCO ) (Cash)") == []
+    # Eight and ten characters are not CUSIPs and must not match either --
+    # "nine" is the rule, not "long enough".
+    assert _PAREN_CUSIP_RE.findall("(99900Z10) (99900Z1010) (Cash)") == []
 
 
 def test_merger_source_resolves_but_resulting_stays_blank():
@@ -158,7 +214,7 @@ def test_merger_source_resolves_but_resulting_stays_blank():
     legs go to two DIFFERENT resulting companies, so there is no single
     value to report -- spec §7 wants that blank, never a guess."""
     merger = next(p for p in _batch().corporate_actions if p.kind == "merger")
-    assert merger.source_cusip == "ZXC000001"
+    assert merger.source_cusip == "99900Z101"
     assert merger.resulting_cusip is None
 
 
@@ -188,19 +244,19 @@ def _fixture_with_a_stray_reorganisation_leg() -> str:
     Built by string manipulation on the fixture text, not a fourth fixture
     file. The base `M999000004` (see the module docstring's #REOR scheme) is
     new -- 004, where the real rows use 001-003 -- so it cannot collide with
-    an existing group. All values fabricated, same ZXCO/ZXC00000N family the
+    an existing group. All values fabricated, same ZXCO/999xxZnnn CUSIP family the
     rest of this fixture uses.
     """
     text = FIXTURE.read_text(encoding="utf-8")
     stray_row = (
-        '05/20/2024,REVERSE SPLIT R/S FROM ZXC000006#REOR M9990000040000 '
-        'ZEPHYR EXPLORATION CO COM (ZXC000007) (Cash),"",ZEPHYR EXPLORATION '
+        '05/20/2024,REVERSE SPLIT R/S FROM 99900Z600#REOR M9990000040000 '
+        'ZEPHYR EXPLORATION CO COM (99900Z708) (Cash),"",ZEPHYR EXPLORATION '
         'CO COM ISIN #ZX0000000099 SEDOL #BZX0099,Cash,"",3,"","","",0.00,'
         '992.03,""\n'
     )
     marker = (
         '05/12/2024,MERGER MER PAYOUT #REOR M9990000030000 ZEPHYR '
-        'EXPLORATION CO COM (ZXC000001) (Cash),"",ZEPHYR EXPLORATION CO COM '
+        'EXPLORATION CO COM (99900Z101) (Cash),"",ZEPHYR EXPLORATION CO COM '
         'ISIN #ZX0000000013 SEDOL #BZX0002 *REORGANIZATION*,Cash,"","-26",'
         '"","","","-14.22",992.03,""\n'
     )
@@ -216,11 +272,39 @@ def test_a_group_of_an_unexpected_shape_is_reported_not_coerced():
 
 
 def test_cash_in_lieu_is_reported_separately_from_the_proposals():
-    """It moves real cash and needs gap #35's arithmetic. Listing it beside the
+    """It moves real cash that nothing applies (gap #43, the same arithmetic
+    gap #35 tracks one layer up for merger cash). Listing it beside the
     proposals would imply an action the user can record."""
     batch = _batch()
     assert batch.cash_in_lieu
     assert not any(p.kind == "cash_in_lieu" for p in batch.corporate_actions)
+
+
+def test_a_spinoff_carries_the_parent_ticker_its_own_row_states():
+    """"DISTRIBUTION SPINOFF FROM:(ZXCO )" -- the parent is a fact the row
+    supplies, with the CHILD (ZXCWS) in the Symbol column. Before the final
+    fix wave nothing captured it, and cli.py had to identify the parent by
+    elimination instead: "the account's sole LONG holding at the ex-date",
+    which is ambiguous on every real account checked (gap #47 as corrected).
+
+    Asserted as the PARENT, not merely as "some symbol": the row's own
+    Symbol column holds the child, so a change that read that column instead
+    would still produce a plausible-looking ticker and a ratio computed
+    against the wrong instrument."""
+    spinoff = next(p for p in _batch().corporate_actions if p.kind == "spinoff")
+    assert spinoff.parent_symbol == "ZXCO"
+    assert spinoff.parent_symbol != "ZXCWS"
+
+
+def test_only_a_spinoff_carries_a_parent_ticker():
+    """Every other kind identifies its sides by CUSIP and quantity sign. A
+    name change's resulting leg and a cash-in-lieu row both carry a
+    parenthesised ticker of their own in the real exports, and neither is a
+    spinoff parent -- reading one as such would hand cli.py a parent for an
+    action that has none."""
+    for proposal in _batch().corporate_actions:
+        if proposal.kind != "spinoff":
+            assert proposal.parent_symbol is None
 
 
 # --- Task 3: derivation --------------------------------------------------
@@ -321,14 +405,14 @@ def _fixture_with_a_fractional_split() -> str:
     disagreement spec §6a says the proposal must surface.
 
     Built by string manipulation on the fixture text, not a fourth fixture
-    file. All values fabricated, same ZXCO/ZXC00000N family the rest of this
+    file. All values fabricated, same ZXCO/999xxZnnn CUSIP family the rest of this
     fixture uses.
     """
     text = FIXTURE.read_text(encoding="utf-8")
     original_line = (
-        '03/10/2024,REVERSE SPLIT R/S TO ZXC000002#REOR M9990000010000 ZEPHYR '
+        '03/10/2024,REVERSE SPLIT R/S TO 99900Z209#REOR M9990000010000 ZEPHYR '
         'EXPLORATION CO COM ISIN #ZX0000000013 1 FOR 3 R/S INTO ZEPHYR '
-        'EXPLORATION CO (ZXC000001) (Cash),"",ZEPHYR EXPLORATION CO COM ISIN '
+        'EXPLORATION CO (99900Z101) (Cash),"",ZEPHYR EXPLORATION CO COM ISIN '
         '#ZX0000000013 SEDOL #BZX0002 1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO,'
         'Cash,"","-51","","","",0.00,1006.25,""\n'
     )
@@ -374,3 +458,94 @@ def test_stated_and_derived_ratios_agree_for_every_paired_action_in_the_fixture(
     assert split.ratio_source == "derived+confirmed"
     assert split.approximate is False
     assert not any("disagrees" in w.lower() for w in batch.warnings)
+    assert split.stated_ratio == (Decimal(1), Decimal(3))
+
+
+def test_a_disputed_ratio_carries_both_candidates_not_just_the_derived_one():
+    """The disagreement case, pinned on the PROPOSAL rather than only on a
+    warning string. Two things were wrong before the final fix wave, and both
+    were invisible from this fixture until someone ran the real exports:
+
+    * ratio_source was the bare 'derived', whose consumer-facing sentence
+      says "no independent confirmation was found in the venue's own text".
+      Confirmation WAS found here -- the description states "1 FOR 3" -- and
+      it disagreed. 'derived+disputed' is a distinct value precisely so that
+      sentence can stop being false on every real reverse split.
+    * The stated ratio existed only inside a warning string bound for
+      stderr, so the one number needed to adjudicate the disagreement never
+      reached the stdout section a user acts on (D5).
+
+    Asserting both members of the pair, not just their inequality: a
+    regression that carried the DERIVED ratio into `stated_ratio` would keep
+    "two candidates present" true while making them the same number twice.
+    """
+    batch = FidelityImporter().parse(_fixture_with_a_fractional_split())
+    split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
+    assert split.ratio_source == "derived+disputed"
+    assert split.ratio == (Decimal(17), Decimal(50))
+    assert split.stated_ratio == (Decimal(1), Decimal(3))
+    assert split.approximate is True
+
+
+def test_a_single_source_ratio_is_plain_derived_with_no_stated_candidate():
+    """The other side of the distinction above: a reverse split whose
+    description states no ratio at all. 'derived' must mean exactly this --
+    one source existed -- and `stated_ratio` must be None rather than a
+    copy of the derived pair, or the consumer would print two "independent"
+    candidates that are one number wearing two hats."""
+    text = _fixture_with_a_fractional_split()
+    # Strip the stated ratio out of the TO leg's Description only. The
+    # quantities are untouched, so the derived pair is still (17, 50).
+    text = text.replace("1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO", "R/S INTO ZEPHYR EXPLORATION CO")
+    batch = FidelityImporter().parse(text)
+    split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
+    assert split.ratio == (Decimal(17), Decimal(50))
+    assert split.ratio_source == "derived"
+    assert split.stated_ratio is None
+    assert split.approximate is False
+
+
+def test_a_zero_over_zero_stated_ratio_does_not_crash_the_parse():
+    """`_reduce_ratio`'s `divisor == 0` guard is load-bearing, not dead
+    code. `_reduce_ratio(*stated)` is called on text-parsed values, so a
+    description containing "0 FOR 0" reaches it directly from the venue's own
+    text -- gcd(0, 0) is 0, and without the guard the reduction divides by
+    zero and raises out of parse(), which spec §7 forbids (degrade, never
+    fail). Exercised both at the unit and through a whole file, since the
+    guard only matters because the end-to-end path can reach it."""
+    from importers.fidelity import _reduce_ratio
+
+    assert _reduce_ratio(Decimal(0), Decimal(0)) == (Decimal(0), Decimal(0))
+
+    text = FIXTURE.read_text(encoding="utf-8").replace(
+        "1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO", "0 FOR 0 R/S INTO ZEPHYR EXPLORATION CO"
+    )
+    batch = FidelityImporter().parse(text)
+    split = next(p for p in batch.corporate_actions if p.kind == "reverse_split")
+    # The quantities still say 1:3; the venue's own text now says nothing
+    # usable, so the two disagree -- reported, not crashed, and not rounded.
+    assert split.ratio == (Decimal(1), Decimal(3))
+    assert split.ratio_source == "derived+disputed"
+
+
+def test_a_non_finite_corporate_action_quantity_warns_instead_of_crashing():
+    """Decimal("NaN") CONSTRUCTS fine, so it slips past the branch's
+    `except InvalidOperation` and only detonates later, on the `< 0` / `> 0`
+    comparisons in _derive_cusip_pair and _derive_quantity_ratio -- raising
+    out of parse() itself. This was the only numeric branch in the importer
+    without the `is_finite()` guard its fill and cash twins both have (and
+    which migration 002_reject_non_finite_numerics.sql exists for).
+
+    The whole import must still succeed (spec §7: degrade, never fail), the
+    row must be named in a warning rather than silently dropped, and the
+    group it belonged to must NOT be proposed off its surviving leg alone --
+    a one-legged "reverse split" is exactly the confidently-wrong proposal
+    _EXPECTED_LEG_COUNT exists to refuse."""
+    text = FIXTURE.read_text(encoding="utf-8").replace('"-51"', '"NaN"')
+    batch = FidelityImporter().parse(text)
+
+    assert any("non-finite" in w.lower() for w in batch.warnings)
+    assert not any(p.kind == "reverse_split" for p in batch.corporate_actions)
+    # The rest of the file is unaffected -- one bad row, not one bad import.
+    assert any(p.kind == "merger" for p in batch.corporate_actions)
+    assert batch.blocking == ()

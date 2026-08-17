@@ -124,7 +124,10 @@ async def cmd_accounts_add(args) -> int:
 
 
 # --- corporate-action proposals (spec 2026-08-17 Sec8) --------------------
-# `_preview_or_commit` prints these after the trade summary. NOTHING here
+# `_preview_or_commit` prints these in a section of their own -- after the
+# parsed-row line on a preview, and before the inserted-rows line on a
+# --commit, where both passes run while the transaction is still open. NOTHING
+# here
 # ever calls add_action: D2/D3 -- a corporate action silently restates
 # history across every account holding the instrument, so `corporate add`
 # is the only path that stores one, and it is a human who runs it. Every
@@ -168,10 +171,12 @@ def _render_corporate_add_command(
     are what let a human supply the symbol themselves.
 
     `--ratio` is the one placeholder this module can sometimes complete:
-    always for reverse_split and name_change, and for spinoff when
-    _complete_spinoff_ratio's ledger read succeeds. When it can't -- always
-    for merger, sometimes for spinoff -- `ratio` here is None and the
-    command prints `<FILL IN>` instead, same shape as the symbol
+    always for name_change, for reverse_split when its two sources do not
+    contradict each other, and for spinoff when _complete_spinoff_ratio's
+    ledger read succeeds. When it can't -- always for merger, sometimes for
+    spinoff, and for a reverse split whose stated and derived ratios DISPUTE
+    each other (see _print_corporate_action_section) -- `ratio` here is None
+    and the command prints `<FILL IN>` instead, same shape as the symbol
     placeholder, so this command is never rendered as though it were
     ready to run when it is not.
     """
@@ -198,15 +203,30 @@ def _render_corporate_add_command(
 _RATIO_SOURCE_STRENGTH: dict[str, str] = {
     "constant": "fixed -- a name/symbol change always converts 1:1, no share data involved",
     "derived": (
-        "derived from the paired quantities only -- no independent confirmation "
-        "was found in the venue's own text"
+        "derived from the paired quantities only -- the venue's own text states no "
+        "ratio at all, so there was nothing to cross-check it against"
     ),
     "derived+confirmed": (
         "derived from the paired quantities AND matches the ratio the venue's own "
         "text states -- two independent sources agree, the strongest evidence "
         "available (spec Sec6a)"
     ),
+    "derived+disputed": (
+        "derived from the paired quantities, and CONTRADICTED by the ratio the "
+        "venue's own text states -- two independent sources disagree, so neither "
+        "is offered as the answer (spec Sec6a)"
+    ),
 }
+
+# What to print when a proposal carries a ratio_source this table has no
+# sentence for -- a kind added to importers/ without a matching entry here.
+# A missing default made `.get()` return None and print the literal "None"
+# in the strength parenthesis, which reads as an assertion about the
+# evidence rather than as the gap in this table that it is.
+_UNKNOWN_RATIO_SOURCE_STRENGTH = (
+    "provenance unrecorded -- this build has no description for that ratio source; "
+    "treat the ratio as unverified"
+)
 
 
 def _reduce_decimal_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, Decimal]:
@@ -236,20 +256,35 @@ async def _complete_spinoff_ratio(
     `ratio` None for a spinoff (see CorporateActionProposal's docstring).
     This is the one place a proposal is completed outside the pure layer.
 
-    Nothing on `p` identifies WHICH instrument is the parent: a spinoff's
-    group is always a single row (the child received), so
-    _derive_cusip_pair (importers/fidelity.py) can only ever leave
-    source_cusip None for it -- resolving one needs a negative leg, and a
-    spinoff has none -- and CorporateActionProposal carries no symbol field
-    at all (D7: CUSIP resolution stays advisory; the parent's own ticker is
-    never captured by the pure layer). So the parent is found here by
-    elimination instead: the account's own net holding, as of the ex-date,
-    across every instrument it has ever traded. If exactly one instrument
-    has a positive net quantity (LONG, never zero or short -- a spinoff is
-    only received on shares you are long), that is unambiguously the parent
-    -- an account long only one thing cannot have received THIS spinoff from
-    anything else. Zero long holdings, or more than one, is reported as
-    undeterminable (spec Sec7) rather than guessed at.
+    WHICH instrument is the parent is answered in one of two ways, in this
+    order:
+
+    1. The row STATES it. Fidelity's spinoff rows read "DISTRIBUTION SPINOFF
+       FROM:(TICKER )" with the child in the Symbol column, so the parent's
+       own ticker is a fact the export supplies -- captured by the pure layer
+       as CorporateActionProposal.parent_symbol. When it is present, this
+       reads that instrument's holding and nothing else.
+    2. Otherwise, by elimination: the account's own net holding, as of the
+       ex-date, across every instrument it has ever traded. If exactly one
+       instrument has a positive net quantity (LONG, never zero or short --
+       a spinoff is only received on shares you are long), that is
+       unambiguously the parent. Zero long holdings, or more than one, is
+       reported as undeterminable (spec Sec7) rather than guessed at.
+
+    Path 2 was the ONLY path until the final fix wave, and gap #47 recorded
+    it as holding "for the two real accounts checked". Measured against the
+    real exports, it does not: the account is long many instruments at the
+    only real spinoff's ex-date, so the elimination rule reports "ambiguous"
+    on 100% of the real data and the completion never fired at all. Path 1
+    answers the same question exactly on that data (see gap #47 as
+    corrected).
+
+    A stated parent the account does not hold is NOT quietly demoted to path
+    2: eliminating down to some other instrument would contradict the row's
+    own statement and produce a confidently wrong ratio against a security
+    the spinoff has nothing to do with. That case reports what happened and
+    stops -- usually it means the parent's purchase is in a file that has
+    not been imported yet, which the note says.
 
     Returns (ratio, note): `ratio` is None when it could not be completed,
     and `note` always explains -- either what the ratio was derived from, or
@@ -273,6 +308,11 @@ async def _complete_spinoff_ratio(
     # very reorganisation being priced) is excluded rather than counted
     # toward the parent it is arguably already part of.
     cutoff = datetime.combine(p.ex_date, time.min, tzinfo=UTC)
+    # One query, parameterised on whether the row named a parent: $3 is the
+    # stated ticker or NULL, and a NULL means "every instrument", which is
+    # the elimination rule's own candidate set. Written this way rather than
+    # as two near-identical queries so the LONG-only, before-the-ex-date
+    # rules can never drift between the two paths.
     rows = await conn.fetch(
         """
         SELECT i.symbol,
@@ -281,12 +321,25 @@ async def _complete_spinoff_ratio(
           JOIN instrument i ON i.id = f.instrument_id
          WHERE f.account_id = $1
            AND f.executed_at < $2
+           AND ($3::text IS NULL OR i.symbol = $3::text)
          GROUP BY i.id, i.symbol
         HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
         """,
         account_id,
         cutoff,
+        p.parent_symbol,
     )
+    if p.parent_symbol is not None and len(rows) == 0:
+        # The row named a parent and the account is not long it. Falling back
+        # to elimination here would answer a question the venue already
+        # answered, differently -- see this function's docstring.
+        return None, (
+            f"not completed: this row names {p.parent_symbol} as the parent it was "
+            f"distributed on, but account {account_id} holds no LONG position in "
+            f"{p.parent_symbol} as of {p.ex_date.isoformat()} -- import the file "
+            "containing that purchase and re-run, rather than dividing by some "
+            "other instrument the row does not name"
+        )
     if len(rows) == 0:
         return None, (
             f"not completed: account {account_id} holds no LONG position in any "
@@ -305,9 +358,15 @@ async def _complete_spinoff_ratio(
     parent_symbol = rows[0]["symbol"]
     parent_qty = rows[0]["net_qty"]
     ratio = _reduce_decimal_ratio(child_qty, parent_qty)
+    how = (
+        "named by the venue's own row"
+        if p.parent_symbol is not None
+        else "the account's only LONG holding at that date"
+    )
     note = (
         f"derived from the ledger: {child_qty} child share(s) against "
-        f"{parent_qty} {parent_symbol} share(s) held at {p.ex_date.isoformat()}"
+        f"{parent_qty} {parent_symbol} share(s) held at {p.ex_date.isoformat()} "
+        f"-- parent {how}"
     )
     return ratio, note
 
@@ -353,8 +412,8 @@ def _print_corporate_action_section(
     include_cash_in_lieu: bool = True,
     header: str = _CORPORATE_ACTION_HEADER,
 ) -> None:
-    """Spec Sec8: after the trade summary, a clearly separated, hard-to-miss
-    section -- one `corporate add` command per detected action, preceded by
+    """Spec Sec8: a clearly separated, hard-to-miss section -- one
+    `corporate add` command per detected action, preceded by
     the evidence it was derived from and the venue's own description text,
     plus cash-in-lieu reported separately (D6: it is recognised, never
     applied, and must never be mistaken for something `corporate add` can
@@ -392,6 +451,47 @@ def _print_corporate_action_section(
         # D5: the ratio is an inference, the quantities are evidence -- print
         # both, always, not just when the ratio is missing.
         print(f"  evidence (quantities): {', '.join(str(q) for q in p.quantities)}")
+
+        # A ratio whose two sources CONTRADICT each other is not a ratio this
+        # tool may offer. Every reverse split in five years of real exports
+        # lands here: the venue's text states a whole "N FOR N" while the
+        # paired quantities -- one lot, with its fractional remainder cashed
+        # out -- reduce to something that is right for that lot and wrong for
+        # every other lot and holder. Printing either number in `--ratio`
+        # would put a figure
+        # nobody declared one paste away from being stored across every
+        # account holding the instrument, so this renders the same visibly
+        # incomplete `<FILL IN>` the merger gets, with BOTH candidates listed
+        # (spec Sec6a: say so rather than silently preferring one source --
+        # in the artefact the user acts on, not only in a stderr warning).
+        disputed = p.ratio_source == "derived+disputed" and ratio is not None
+        if disputed:
+            stated = p.stated_ratio
+            print(
+                "  ** DISPUTED ** -- this ratio's two independent sources disagree, "
+                "so neither is offered below"
+            )
+            print(
+                f"    derived from the paired quantities: {ratio[0]}:{ratio[1]} "
+                "(** APPROXIMATE **: reproduces THIS lot's share count and need not "
+                "hold for any other lot or holder -- a cash-in-lieu remainder does "
+                "exactly this)"
+            )
+            print(
+                "    stated in the venue's own text: "
+                + (f"{stated[0]}:{stated[1]}" if stated is not None else "(unparsed)")
+            )
+            print(f"  ratio: DISPUTED -- {_RATIO_SOURCE_STRENGTH['derived+disputed']}")
+            print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
+            print(f"  {_render_corporate_add_command(p, None)}")
+            continue
+
+        # The catch-all for a proposal flagged approximate by some route
+        # OTHER than a stated/derived disagreement. importers/fidelity.py
+        # sets `approximate` only together with 'derived+disputed' today, so
+        # nothing reaches this on the Fidelity path -- it is kept so a future
+        # importer that flags a ratio without that source still prints a
+        # warning rather than silently presenting it as sound.
         if p.approximate:
             print(
                 "  ** APPROXIMATE ** -- the derived ratio disagrees with the ratio "
@@ -400,7 +500,11 @@ def _print_corporate_action_section(
 
         if ratio is not None:
             strength = (
-                note if p.kind == "spinoff" else _RATIO_SOURCE_STRENGTH.get(p.ratio_source or "")
+                note
+                if p.kind == "spinoff"
+                else _RATIO_SOURCE_STRENGTH.get(
+                    p.ratio_source or "", _UNKNOWN_RATIO_SOURCE_STRENGTH
+                )
             )
             print(f"  ratio: {ratio[0]}:{ratio[1]} ({strength})")
             print(f"  {_render_corporate_add_command(p, ratio)}")
@@ -422,7 +526,7 @@ def _print_corporate_action_section(
     if cash_in_lieu:
         print(
             "\n-- Cash in lieu of fractional shares: recognised, NOT applied "
-            "(gap #35) --"
+            "(gap #43) --"
         )
         for desc in cash_in_lieu:
             print(f"  {desc}")

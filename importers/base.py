@@ -174,11 +174,29 @@ class CorporateActionProposal:
     # re-derive provenance from `kind` alone. One of:
     #   'constant'         -- name_change's fixed 1:1, no row data involved.
     #   'derived'          -- from the paired rows' quantities (spec §6),
-    #                         with EITHER no stated ratio in the text to
-    #                         check it against, OR a stated ratio that
-    #                         disagreed (see `approximate` below for that
-    #                         case). Deliberately NOT used for a confirmed
-    #                         two-source match -- see 'derived+confirmed'.
+    #                         with NO stated ratio in the text to check it
+    #                         against. Exactly one source existed.
+    #                         Deliberately NOT used for a confirmed
+    #                         two-source match -- see 'derived+confirmed' --
+    #                         and, since the final fix wave, no longer used
+    #                         for a two-source DISAGREEMENT either: that is
+    #                         'derived+disputed' below. Collapsing those two
+    #                         made the consumer's own sentence ("no
+    #                         independent confirmation was found in the
+    #                         venue's own text") false on every real reverse
+    #                         split in the exports, where confirmation WAS
+    #                         found and disagreed.
+    #   'derived+disputed' -- from the paired rows' quantities, AND a ratio
+    #                         WAS stated in the text, and the two disagree
+    #                         (spec §6a's cross-check firing). `approximate`
+    #                         is True and `stated_ratio` carries the other
+    #                         candidate, so a consumer can show both numbers
+    #                         rather than presenting one as unopposed. Every
+    #                         reverse split in the real exports lands here:
+    #                         the text states a whole "N FOR N" while the
+    #                         paired quantities -- one lot, its fractional
+    #                         remainder cashed out rather than converted --
+    #                         reduce to something else entirely.
     #   'derived+confirmed' -- from the paired rows' quantities AND matching
     #                         the ratio stated in the text (spec §6a's
     #                         "strongest evidence available"). Kept distinct
@@ -206,6 +224,33 @@ class CorporateActionProposal:
     # a human can see the distortion even when `ratio` and `approximate`
     # disagree about what happened.
     approximate: bool = False
+    # The ratio the venue's OWN description text states, reduced -- the
+    # second, independent source `ratio_source` and `approximate` are decided
+    # by. None when the text states no ratio at all (spec §6a's single-source
+    # case), and None for every kind whose ratio never comes from a text
+    # cross-check (name_change's constant, spinoff, merger).
+    #
+    # Carried on the proposal rather than left in a warning string: a
+    # disagreement is only adjudicable with BOTH numbers in front of you, and
+    # warnings go to stderr while the proposal section goes to stdout (D5 --
+    # the section is meant to be the self-contained decision surface). Before
+    # this field existed, the one number needed to settle the disagreement
+    # was never in the artefact the user acts on.
+    stated_ratio: tuple[Decimal, Decimal] | None = None
+    # The parent instrument's own ticker, when the venue's row STATES it --
+    # Fidelity's spinoff rows read "DISTRIBUTION SPINOFF FROM:(TICKER )" with
+    # the CHILD in the Symbol column, so the parent is stated, not merely
+    # inferrable. None for every other kind (whose parent side is identified
+    # by CUSIP and quantity sign instead) and for any spinoff row that
+    # carries no such token.
+    #
+    # This is the only identifier on the proposal that is a SYMBOL rather
+    # than a CUSIP, and it exists because the consumer that needs it
+    # (cli.py's _complete_spinoff_ratio) matches against ledger instruments,
+    # which are keyed by symbol. Without it that consumer had to identify the
+    # parent by elimination -- "the account's sole LONG holding" -- which is
+    # ambiguous on 100% of the real accounts (see gap #47).
+    parent_symbol: str | None = None
     group_ref: str | None = None    # the #REOR reference, or None when the fallback keyed it
 
 
@@ -251,7 +296,8 @@ class ImportBatch:
     # (see `warnings`) -- never "recognised but silently dropped."
     corporate_actions: tuple[CorporateActionProposal, ...] = ()
     # Cash-in-lieu-of-fractional-shares rows, kept OUT of `corporate_actions`
-    # deliberately: it moves real cash (gap #35's arithmetic) and is never
+    # deliberately: it moves real cash (gap #43, which is the same arithmetic
+    # gap #35 tracks one layer up for merger cash) and is never
     # applied, so listing it beside the proposals would imply an action
     # `corporate add` can record, which it cannot (spec §7, D6). Each entry
     # is the row's own description text, verbatim, so a human can still see

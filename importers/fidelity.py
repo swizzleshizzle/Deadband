@@ -282,9 +282,48 @@ def _reor_base(token: str) -> str:
 # earlier version of this code read the token immediately before "#REOR"
 # instead, which is actually the FROM/TO verb's COUNTERPARTY argument, and
 # produced an inverted source/resulting pair as a result -- see
-# _derive_cusip_pair.) Money notation like "(Cash)" and a bare symbol like
-# "(ZXCO )" never match -- both lack digits, which this pattern requires.
-_PAREN_CUSIP_RE = re.compile(r"\(([A-Z]{1,6}\d{5,9})\)")
+# _derive_cusip_pair.)
+#
+# The SHAPE is a plain CUSIP: exactly nine alphanumerics. An earlier version
+# of this pattern required letters-then-digits (`[A-Z]{1,6}\d{5,9}`), fitted
+# to a fabricated fixture token rather than to the real exports, and matched
+# ZERO of the corporate-action rows in five years of them -- so source_cusip
+# and resulting_cusip were always None in production and the whole
+# CUSIP-reporting path was dead on real data while four tests certified it.
+# Nine alphanumerics is deliberately not narrowed to "digits first": the
+# real rows do all begin with digits, but a CINS (a foreign issuer's CUSIP)
+# begins with a LETTER by construction, and refusing to match one would
+# reintroduce exactly the same blind spot for the next export.
+#
+# The parenthesis anchor is what keeps this from over-matching, and it is
+# load-bearing: "(Cash)" is 4 characters and a bare ticker like "(ZXCO )"
+# or "(ZXCB )" is at most 5, so neither can be nine. Measured across every
+# real export, every 9-character uppercase-alphanumeric parenthesised token
+# present is a CUSIP -- there are no other tokens of that shape to collide
+# with.
+_PAREN_CUSIP_RE = re.compile(r"\(([0-9A-Z]{9})\)")
+
+# The parent a spinoff distributes FROM, stated by the venue's own row:
+# "DISTRIBUTION SPINOFF FROM:(TICKER ) <child description>", with the CHILD
+# in the row's Symbol column. The parent is therefore a fact the row
+# supplies, not an inference -- which is what lets cli.py stop identifying
+# it by elimination (see CorporateActionProposal.parent_symbol and gap #47).
+#
+# Anchored to "FROM:" rather than reusing the paren scan: several other row
+# kinds carry a parenthesised ticker too (a name change's resulting leg, a
+# cash-in-lieu row), and none of those is a spinoff parent. Trailing
+# whitespace inside the parenthesis is the venue's own padding and is
+# dropped. "(Cash)" cannot match -- it is neither preceded by "FROM:" nor
+# upper-case.
+_SPINOFF_PARENT_RE = re.compile(r"FROM:\s*\(\s*([A-Z][A-Z0-9.\-]{0,9})\s*\)")
+
+
+def _parse_spinoff_parent(action: str) -> str | None:
+    """The ticker of the instrument a spinoff was distributed on, as the row
+    itself states it -- see _SPINOFF_PARENT_RE. None when the row states
+    none, in which case the consumer falls back to its own inference."""
+    match = _SPINOFF_PARENT_RE.search(action or "")
+    return match.group(1) if match else None
 
 
 def _parse_reor(action: str) -> tuple[str | None, tuple[str, ...]]:
@@ -333,6 +372,9 @@ class _CorporateActionRow:
     symbol: str | None
     row_cusip: str | None  # this row's own entity -- see _PAREN_CUSIP_RE
     group_key: tuple
+    # The parent ticker a spinoff row states -- see _SPINOFF_PARENT_RE. None
+    # for every other kind, and for a spinoff row that states none.
+    parent_symbol: str | None = None
 
 
 def _group_corporate_actions(
@@ -384,11 +426,14 @@ def _group_corporate_actions(
 
         source_cusip, resulting_cusip = _derive_cusip_pair(group_rows)
         description = " | ".join(r.description for r in group_rows if r.description)
-        ratio, ratio_source, approximate, ratio_warning = _derive_ratio(
+        ratio, ratio_source, approximate, stated_ratio, ratio_warning = _derive_ratio(
             kind, group_rows, description, lines
         )
         if ratio_warning:
             warnings.append(ratio_warning)
+        # A spinoff's group is a single row, so "the group's parent" is that
+        # row's own stated parent; the other kinds never carry one.
+        parent_symbol = next((r.parent_symbol for r in group_rows if r.parent_symbol), None)
         proposals.append(
             CorporateActionProposal(
                 kind=kind,
@@ -400,6 +445,8 @@ def _group_corporate_actions(
                 ratio=ratio,
                 ratio_source=ratio_source,
                 approximate=approximate,
+                stated_ratio=stated_ratio,
+                parent_symbol=parent_symbol,
                 group_ref=key[1] if key[0] == "reor" else None,
             )
         )
@@ -510,16 +557,21 @@ def _derive_quantity_ratio(
 
 
 # ratio_source values, spec §6a: 'constant' (name_change's fixed 1:1),
-# 'derived' (quantities only -- either no stated text was found to check
-# against, or the stated text disagreed and `approximate` carries that
-# signal instead), 'derived+confirmed' (quantities AND the stated text
-# agree -- spec §6a's "strongest evidence available"), or None (spinoff, or
-# a merger, which is structurally never derivable -- see
-# _derive_quantity_ratio's docstring). 'derived' and 'derived+confirmed' are
-# deliberately distinct: collapsing them would let a consumer mistake "never
-# checked" for "two sources agreed", which is exactly what the reviewer
-# demonstrated by pointing out that deleting the cross-check entirely still
-# produced 'derived' either way.
+# 'derived' (quantities only, with NO stated text found to check against),
+# 'derived+confirmed' (quantities AND the stated text agree -- spec §6a's
+# "strongest evidence available"), 'derived+disputed' (quantities AND a
+# stated text that DISAGREES -- the cross-check firing, `approximate` True
+# and `stated_ratio` carrying the other candidate), or None (spinoff, or a
+# merger, which is structurally never derivable -- see
+# _derive_quantity_ratio's docstring). All three 'derived*' values are
+# deliberately distinct: collapsing 'derived' and 'derived+confirmed' would
+# let a consumer mistake "never checked" for "two sources agreed" (which is
+# what the reviewer demonstrated by pointing out that deleting the
+# cross-check entirely still produced 'derived' either way), and collapsing
+# 'derived' and 'derived+disputed' -- which this code did until the final
+# fix wave -- made the consumer print "no independent confirmation was found
+# in the venue's own text" on the exact rows where confirmation was found and
+# CONTRADICTED the number printed beside that sentence.
 
 
 def _derive_ratio(
@@ -527,17 +579,26 @@ def _derive_ratio(
     group_rows: list["_CorporateActionRow"],
     description: str,
     lines: str,
-) -> tuple[tuple[Decimal, Decimal] | None, str | None, bool, str | None]:
-    """Ratio, its source, whether it's flagged approximate, and an optional
-    warning to surface a stated/derived disagreement -- spec §6 and §6a.
-    Returns (ratio, ratio_source, approximate, warning)."""
+) -> tuple[
+    tuple[Decimal, Decimal] | None, str | None, bool, tuple[Decimal, Decimal] | None, str | None
+]:
+    """Ratio, its source, whether it's flagged approximate, the ratio the
+    venue's own text states (reduced, or None when it states none), and an
+    optional warning to surface a stated/derived disagreement -- spec §6 and
+    §6a. Returns (ratio, ratio_source, approximate, stated_ratio, warning).
+
+    `stated_ratio` is returned alongside rather than folded into `ratio`
+    precisely because the two can disagree: which one is right is not this
+    layer's call to make (spec §6a forbids silently preferring a source), and
+    a consumer cannot present the choice to a human without both numbers.
+    """
     if kind == "name_change":
-        return (Decimal(1), Decimal(1)), "constant", False, None
+        return (Decimal(1), Decimal(1)), "constant", False, None, None
     if kind == "spinoff":
         # Not derivable from the file at all -- spec §6, last row: the
         # child shares are here, the parent holding at the ex-date is not.
         # cli.py fills this from the ledger.
-        return None, None, False, None
+        return None, None, False, None, None
 
     # reverse_split: derive from the paired quantities, then cross-check
     # against the stated text. merger always returns None here -- see
@@ -549,33 +610,36 @@ def _derive_ratio(
         # _derive_quantity_ratio's docstring) -- blank, never a guess, the
         # same silent-blank precedent _derive_cusip_pair sets for
         # resulting_cusip in this exact merger.
-        return None, None, False, None
+        return None, None, False, None, None
 
     stated = _parse_stated_ratio(description)
     if stated is None:
         # Only one source available -- record it as such (spec §6a), not as
         # a confirmed match.
-        return derived, "derived", False, None
+        return derived, "derived", False, None, None
 
     stated_reduced = _reduce_ratio(*stated)
     if stated_reduced == derived:
         # Two independent sources agreeing is the strongest evidence
         # available that this is right (spec §6a) -- recorded distinctly
         # from the "only one source existed" case above.
-        return derived, "derived+confirmed", False, None
+        return derived, "derived+confirmed", False, stated_reduced, None
 
     # Disagreement is the signal that matters (spec §6a): a fractional
     # remainder paid out as cash in lieu, or a misparse of one side. Never
-    # silently prefer one source -- keep the quantities-derived ratio (§6's
-    # authoritative source for this kind), flag it, and say so where a human
-    # will see it.
+    # silently prefer one source -- carry BOTH candidates ('derived+disputed'
+    # plus `stated_ratio`), flag it, and say so where a human will see it.
+    # `ratio` still holds the quantities-derived pair, which is the evidence
+    # this file actually contains; a consumer must not present it as the
+    # action's ratio while the disagreement stands (cli.py renders both and
+    # asks the human to fill one in).
     warning = (
         f"{kind} at lines {lines}: ratio derived from quantities "
         f"({derived[0]}:{derived[1]}) disagrees with the ratio stated in "
         f"the description ({stated_reduced[0]}:{stated_reduced[1]}) -- "
         "possible cash-in-lieu remainder or misparse"
     )
-    return derived, "derived", True, warning
+    return derived, "derived+disputed", True, stated_reduced, warning
 
 
 def parse_option_symbol(symbol: str) -> Instrument | None:
@@ -1057,6 +1121,22 @@ class FidelityImporter:
                         f"quantity ({exc}), excluded from grouping"
                     )
                     continue
+                # Decimal("NaN")/Decimal("Infinity") CONSTRUCT fine and slip
+                # past the `except InvalidOperation` above -- the same hazard
+                # the fill and cash branches each guard (see the non-finite
+                # amount check below, and migration
+                # 002_reject_non_finite_numerics.sql). Without this, a NaN
+                # quantity reaches _derive_cusip_pair/_derive_quantity_ratio,
+                # whose `< 0`/`> 0` comparisons raise InvalidOperation out of
+                # parse() itself -- a crash, where spec §7's posture is
+                # degrade and report. Warn and exclude the row from grouping,
+                # exactly as the unparsable case above does.
+                if not quantity.is_finite():
+                    warnings.append(
+                        f"line {line_no}: corporate action has non-finite "
+                        f"quantity ({quantity}), excluded from grouping"
+                    )
+                    continue
 
                 reor_ref, paren_cusips = _parse_reor(action)
                 if reor_ref:
@@ -1079,16 +1159,23 @@ class FidelityImporter:
                 # absence rather than picking one).
                 row_cusip = paren_cusips[0] if len(paren_cusips) == 1 else None
 
+                kind = _KIND_BY_RULE_NAME[rule.name]
+                # Only a spinoff row states its parent (see
+                # _SPINOFF_PARENT_RE); asking for one anywhere else would
+                # read a "FROM:(...)" that means something different.
+                parent_symbol = _parse_spinoff_parent(action) if kind == "spinoff" else None
+
                 corporate_action_rows.append(
                     _CorporateActionRow(
                         line_no=line_no,
-                        kind=_KIND_BY_RULE_NAME[rule.name],
+                        kind=kind,
                         ex_date=when.date(),
                         quantity=quantity,
                         description=description,
                         symbol=symbol or None,
                         row_cusip=row_cusip,
                         group_key=group_key,
+                        parent_symbol=parent_symbol,
                     )
                 )
                 continue

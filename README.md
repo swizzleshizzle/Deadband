@@ -119,17 +119,47 @@ run, not hand-written):
 === Corporate actions detected -- nothing above was written; review before running any command below ===
 
 reverse_split ex 2026-03-02 -- ZEPHYR EXPLORATION CO COM (POST REV SPLIT) ISIN #ZX0000000021 SEDOL #BZX0001 | ZEPHYR EXPLORATION CO COM ISIN #ZX0000000013 SEDOL #BZX0002 1 FOR 6 R/S INTO ZEPHYR EXPLORATION CO
-  cusip: ZXC000001 -> ZXC000002
+  cusip: 99900Z101 -> 99900Z209
   evidence (quantities): 300, -1800
   ratio: 1:6 (derived from the paired quantities AND matches the ratio the venue's own text states -- two independent sources agree, the strongest evidence available (spec Sec6a))
   corporate add --type reverse_split --symbol <SYMBOL> --ex-date 2026-03-02 --ratio 1:6
+```
+
+When the two sources **disagree** — the common real case, because a reverse split's
+fractional remainder is cashed out rather than converted, so the paired quantities
+reproduce one lot's share count and not the ratio the action actually declared — neither
+number is offered. Both are printed, and `--ratio` renders as `<FILL IN>`, the same
+visibly-incomplete treatment a merger gets (same fabricated instrument, 1,800 shares into
+299 rather than a clean 300; captured verbatim from an `import fidelity` preview run):
+
+```
+reverse_split ex 2026-03-02 -- ZEPHYR EXPLORATION CO COM (POST REV SPLIT) ISIN #ZX0000000021 SEDOL #BZX0001 | ZEPHYR EXPLORATION CO COM ISIN #ZX0000000013 SEDOL #BZX0002 1 FOR 6 R/S INTO ZEPHYR EXPLORATION CO
+  cusip: 99900Z101 -> 99900Z209
+  evidence (quantities): 299, -1800
+  ** DISPUTED ** -- this ratio's two independent sources disagree, so neither is offered below
+    derived from the paired quantities: 299:1800 (** APPROXIMATE **: reproduces THIS lot's share count and need not hold for any other lot or holder -- a cash-in-lieu remainder does exactly this)
+    stated in the venue's own text: 1:6
+  ratio: DISPUTED -- derived from the paired quantities, and CONTRADICTED by the ratio the venue's own text states -- two independent sources disagree, so neither is offered as the answer (spec Sec6a)
+  INCOMPLETE -- fill in --ratio (and --symbol) before running:
+  corporate add --type reverse_split --symbol <SYMBOL> --ex-date 2026-03-02 --ratio <FILL IN>
 ```
 
 `--symbol` prints as the literal `<SYMBOL>` placeholder, never a resolved ticker — D7
 keeps CUSIP resolution advisory, so nothing in `import` can fill it in automatically. A
 human reads the `cusip:` line and the description above it, recognises the position as
 `ZXCO` from their own records, and fills it in by hand: `--symbol ZXCO --commit`, before
-running the command.
+running the command. A CUSIP is nine alphanumerics inside parentheses in the row's own
+action text; some rows carry a parenthesised **ticker** there instead, and a side whose
+identifier is a ticker (or missing) prints as `?` rather than being guessed at — the
+description text is then the identifying information.
+
+A `DISTRIBUTION SPINOFF` row is the one case where the export names an instrument
+outright: it reads `FROM:(TICKER )`, with the *child* in the `Symbol` column. `import`
+uses that stated parent to complete the spinoff's ratio against the parent's holding at
+the ex-date (which is why a spinoff's ratio appears only under `--commit`, after this
+import's own fills are in the transaction). If the row states no parent, the account's
+sole LONG holding at that date is used instead; if that is ambiguous, or the stated
+parent is not held, the ratio is left blank with a note saying which.
 
 **Nothing here is stored.** `import` never calls `corporate add` itself: a corporate
 action silently restates history across every account holding the instrument, and
