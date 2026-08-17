@@ -144,7 +144,7 @@ unrecognised rather than forced into the nearest match — see §7.
 | Type | Ratio | Source |
 |---|---|---|
 | Reverse split | `abs(qty_in) : abs(qty_out)`, reduced to the smallest integer pair | The paired rows |
-| Merger | as above | The paired rows |
+| Merger | **none — always absent** (see below) | — |
 | Name change | `1:1` | Constant |
 | Spinoff | child shares : parent holding at the ex-date | **The ledger** — not derivable from the file, which carries only the child shares received |
 
@@ -155,8 +155,22 @@ pure layer, and it is why the field is optional rather than required.
 ### 6a. The ratio is also stated in the text — parse it, and cross-check
 
 Found after this spec was first written, by checking the real exports rather than assuming:
-**the description states the ratio explicitly.** Patterns of the form `N FOR N` occur 21 times
-across the exports and `N:N` 10 times, alongside `R/S` and `REV SPLIT` markers.
+**the description states the ratio explicitly**, in the form `N FOR N`, alongside `R/S` and
+`REV SPLIT` markers.
+
+> **Correction.** This section originally also claimed `N:N` occurs 10 times. **That was a
+> miscount and the form does not occur at all.** Every `digit:digit` match in the exports —
+> 11 of them, one per file — is the `Date downloaded MM/DD/YYYY HH:MM pm` footer timestamp.
+> The count came from a regex tally that was never inspected, which is the same error as
+> inferring a field's width from the fact that a narrower parse happened to work.
+>
+> Two consequences, both load-bearing: **the stated ratio appears only as `N FOR N`**, and a
+> bare `digit:digit` pattern is actively dangerous — it collides with that footer, and with any
+> time-like text in a description. Any colon-form parser must be anchored to an adjacent
+> ratio keyword (`SPLIT`, `R/S`, `MERGER`) and must be proven, by test, not to match a clock
+> time. A spurious stated ratio is worse than none: if it disagrees with the derived one it
+> raises a false alarm in the very mechanism this section exists to make trustworthy, and if
+> it coincidentally agrees it certifies a ratio nobody stated.
 
 So there are **two independent sources** for the same number: the stated ratio in the text, and
 the ratio derived from the paired quantities. Use both.
@@ -174,6 +188,15 @@ available; two that disagree is the loudest possible warning.
 
 Where only one source is available — a name change states no ratio, and a spinoff has neither —
 use what there is and record which source the ratio came from.
+
+**A merger never yields a ratio, and this is structural rather than incidental.** §5 fixes a
+merger's group at **three** legs, while a ratio can only be derived from exactly one negative
+and one positive row. Those two rules cannot both hold, so no merger this importer recognises
+can ever produce a derived ratio — it is not merely ambiguous for the multi-issuer case
+observed in the data. This table originally said "as above", implying a clean pair that the
+grouping rule guarantees never exists; the code leaving it `None` is right and the table was
+wrong. §6a's inventory of sourceless kinds must therefore read **name change, spinoff and
+merger**, not just the first two.
 
 **Every proposal prints the quantities it derived from** (D5). The ratio is an inference; the
 quantities are evidence. A reverse split whose quantities do not reduce cleanly — the
