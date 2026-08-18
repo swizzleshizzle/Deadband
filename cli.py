@@ -157,6 +157,24 @@ def _placeholder_ratio_str(ratio: tuple[Decimal, Decimal] | None) -> str:
     return f"{ratio[0]}:{ratio[1]}" if ratio is not None else "<FILL IN>"
 
 
+def _incomplete_reminder(p: CorporateActionProposal) -> str:
+    """The line printed above a rendered `corporate add` that still has a
+    placeholder in it, naming ONLY the placeholders that command actually
+    carries.
+
+    "fill in --ratio (and --symbol)" was printed unconditionally. For a share
+    distribution that is worse than noise: _render_corporate_add_command
+    prints the row's own stated ticker for `--symbol`, so the reminder tells
+    a human to overwrite a value that is already correct, on a command they
+    are about to run against a real ledger. The condition tested is the same
+    one that function branches on -- `subject_symbol is not None` -- so the
+    two can never disagree about which placeholders are present.
+    """
+    if p.subject_symbol is not None:
+        return "  INCOMPLETE -- fill in --ratio before running:"
+    return "  INCOMPLETE -- fill in --ratio (and --symbol) before running:"
+
+
 def _render_corporate_add_command(
     p: CorporateActionProposal, ratio: tuple[Decimal, Decimal] | None
 ) -> str:
@@ -164,8 +182,15 @@ def _render_corporate_add_command(
     to read, edit and run; never executed by this code (see the module
     comment above and D2).
 
-    `--resulting-symbol` is always a literal `<SYMBOL>` placeholder, and so
-    is `--symbol` for every kind EXCEPT split. Spec D7 makes CUSIP
+    `--resulting-symbol` is always a literal `<SYMBOL>` placeholder.
+    `--symbol` is a placeholder only when the proposal states no subject
+    symbol: the branch below tests `p.subject_symbol is not None`, NOT
+    `p.kind`. Today that difference is invisible -- share distributions
+    (kind "split") are the only proposals carrying a subject symbol, so
+    "except split" and "when subject_symbol is present" pick out the same
+    rows -- but the code is the kind-agnostic rule, and any future importer
+    that sets subject_symbol on another kind gets that kind's real ticker
+    printed here without this docstring having to change. Spec D7 makes CUSIP
     resolution advisory and says plainly that no CUSIP column is needed for
     this work -- there is no lookup this function could perform that would
     ever fill in a resulting symbol, or a source symbol identified only by
@@ -173,14 +198,14 @@ def _render_corporate_add_command(
     (_print_corporate_action_section) are what let a human supply those
     themselves.
 
-    A share distribution (kind == "split") is the one exception: unlike a
-    reorganisation row, which states its instrument only by CUSIP,
-    a share-distribution row states its own ticker outright
-    (CorporateActionProposal.subject_symbol) -- and _complete_split_ratio's
-    ratio, when present, is derived from THAT ticker's own holding. Printing
-    the `<SYMBOL>` placeholder beside a ratio the ticker already named would
-    be incoherent, so `--symbol` prints `subject_symbol` here whenever it is
-    present.
+    A share distribution (kind == "split") is the one proposal that reaches
+    that branch today: unlike a reorganisation row, which states its
+    instrument only by CUSIP, a share-distribution row states its own ticker
+    outright (CorporateActionProposal.subject_symbol) -- and
+    _complete_split_ratio's ratio, when present, is derived from THAT
+    ticker's own holding. Printing the `<SYMBOL>` placeholder beside a ratio
+    the ticker already named would be incoherent, so `--symbol` prints
+    `subject_symbol` whenever it is present.
 
     `--ratio` is the one other placeholder this module can sometimes
     complete: always for name_change, for reverse_split when its two sources
@@ -252,6 +277,29 @@ def _reduce_decimal_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, 
     task's own constraint ("nothing under importers/ changes") is exactly the
     reason not to reach into it and make cli.py depend on its internals.
     """
+    # A non-finite input does not make this function wrong, it makes it
+    # NEVER RETURN: bool(Decimal("NaN")) is True and NaN % x is NaN, so
+    # `while b:` spins forever -- and it spins inside cmd_import's open
+    # commit transaction, holding every lock it has taken. Decimal("Infinity")
+    # raises InvalidOperation on the modulo instead, which is survivable but
+    # still not something to let escape as an unexplained traceback.
+    #
+    # fill.quantity's CHECK is `quantity > 0` alone (db/schema.sql), and in
+    # Postgres both NaN and Infinity compare > 0 -- migration
+    # 002_reject_non_finite_numerics.sql closed that hole for
+    # contract_multiplier and price but not for fill.quantity, so a
+    # non-finite quantity IS storable today. The real guard is in
+    # _long_holdings_as_of, which excludes non-finite sums in SQL before they
+    # can reach here; this is a tripwire behind it, not the primary defence.
+    # It raises rather than returning something, because there is no ratio a
+    # NaN holding could honestly reduce to and a raise inside the commit
+    # transaction rolls back cleanly, which the hang does not.
+    if not (new_qty.is_finite() and old_qty.is_finite()):
+        raise ValueError(
+            f"cannot reduce a non-finite ratio ({new_qty}:{old_qty}) -- a "
+            "non-finite quantity reached the ratio arithmetic, which "
+            "_long_holdings_as_of is supposed to have filtered out"
+        )
     a, b = abs(new_qty), abs(old_qty)
     while b:
         a, b = b, a % b
@@ -274,6 +322,26 @@ async def _long_holdings_as_of(
     reproduces the elimination path's own behaviour exactly (every
     instrument the account has ever traded is a candidate); a symbol narrows
     the candidate set to that one instrument.
+
+    `< 'Infinity'::numeric` is not redundant with `> 0`, and it is the reason
+    this is the single seam. Postgres NUMERIC accepts the literals 'NaN' and
+    'Infinity', and orders them ABOVE every finite value, so both satisfy
+    `> 0` -- verified against the running database, not reasoned about.
+    `fill.quantity`'s only CHECK is `quantity > 0` (db/schema.sql);
+    migration 002_reject_non_finite_numerics.sql added the `< 'Infinity'`
+    bound to contract_multiplier and price but never to fill.quantity, so a
+    non-finite quantity is storable today and would sum to one here. What it
+    reaches is `_reduce_decimal_ratio`, whose Euclidean loop does not
+    terminate on NaN -- inside cmd_import's open commit transaction, holding
+    its locks. Excluding the row is the honest outcome: an account whose
+    holding is not a number holds no answer to "what shares was this
+    received on?", and it is reported as no holding rather than as a ratio.
+
+    ORDER BY makes `rows[0]` deterministic. Nothing here should be reading
+    rows[0] out of a multi-row result -- both callers check the length first
+    -- but an unordered `LIMIT`-less GROUP BY has no defined row order, and a
+    completion that silently depended on one would be irreproducible rather
+    than merely wrong.
     """
     return await conn.fetch(
         """
@@ -286,6 +354,9 @@ async def _long_holdings_as_of(
            AND ($3::text IS NULL OR i.symbol = $3::text)
          GROUP BY i.id, i.symbol
         HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
+           AND SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END)
+               < 'Infinity'::numeric
+         ORDER BY i.symbol, i.id
         """,
         account_id,
         cutoff,
@@ -443,10 +514,37 @@ async def _complete_split_ratio(
             "from a holding that is not there"
         )
 
+    if len(rows) > 1:
+        # `instrument.symbol` is NOT unique -- only `natural_key` is
+        # (db/schema.sql) -- so filtering _long_holdings_as_of by symbol can
+        # legitimately return several instruments, and GROUP BY i.id keeps
+        # them apart rather than summing them into one. Taking rows[0] would
+        # pick one of them and print a confident ratio derived from a
+        # holding that is only part of the answer. _complete_spinoff_ratio
+        # reports "ambiguous" in exactly this case; this is that parity,
+        # restored. Reported by count and natural key rather than by symbol,
+        # because every row here HAS the same symbol -- printing it N times
+        # would say nothing about what differs.
+        return None, (
+            f"not completed: account {account_id} holds {len(rows)} distinct "
+            f"instruments under the symbol {p.subject_symbol} as of "
+            f"{p.ex_date.isoformat()} -- ambiguous which one this distribution "
+            "was received on; symbol is not a unique instrument identifier"
+        )
+
     held = rows[0]["net_qty"]
+    # BOTH quantities, not just the symbol. D2's whole posture is to force an
+    # informed human decision, and the reader of this note is deciding
+    # whether to run a `corporate add` that restates history across every
+    # account holding the instrument. The sibling spinoff note already prints
+    # its two quantities; printing only the symbol here asked the reader to
+    # trust the arithmetic instead of checking it, and gap #53 is precisely
+    # the case where checking it is the only thing that would catch the
+    # error.
     return _reduce_decimal_ratio(held + received, held), (
-        f"derived from the ledger: {p.subject_symbol} holding at the ex-date "
-        "plus the shares this row delivered"
+        f"derived from the ledger: {received} share(s) delivered by this row "
+        f"against {held} {p.subject_symbol} share(s) held at "
+        f"{p.ex_date.isoformat()}"
     )
 
 
@@ -577,7 +675,7 @@ def _print_corporate_action_section(
                 + (f"{stated[0]}:{stated[1]}" if stated is not None else "(unparsed)")
             )
             print(f"  ratio: DISPUTED -- {_RATIO_SOURCE_STRENGTH['derived+disputed']}")
-            print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
+            print(_incomplete_reminder(p))
             print(f"  {_render_corporate_add_command(p, None)}")
             continue
 
@@ -615,7 +713,7 @@ def _print_corporate_action_section(
             else:
                 reason = note or "could not be determined"
             print(f"  ratio: UNAVAILABLE -- {reason}")
-            print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
+            print(_incomplete_reminder(p))
             print(f"  {_render_corporate_add_command(p, None)}")
 
     if cash_in_lieu:
