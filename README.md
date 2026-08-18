@@ -98,8 +98,9 @@ for any account in the batch — and names itself in the refusal. The one carve-
 blocking row belonging to an account registered `ignore_on_import` refuses nothing, since
 it was never going to be part of the import. See
 [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #30–32) for what this leaves open: an
-expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
-`REVERSE SPLIT`, and others), and backdated `as of` correction rows.
+expiry whose opening fill hasn't been imported yet, a `TRANSFER OF ASSETS ACAT` asset
+transfer (the one verb the importer still refuses), and backdated `as of` correction
+rows.
 
 ### Corporate actions found during import
 
