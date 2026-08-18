@@ -7,12 +7,13 @@ import enum
 import io
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 from importers.base import (
     CanonicalCash,
     CanonicalFill,
+    CorporateActionProposal,
     ImportBatch,
     normalize_field,
     zero_amount_warning,
@@ -129,6 +130,16 @@ class Outcome(enum.Enum):
     # exists so the refusal names the verb, and blocks unconditionally
     # rather than depending on what the row's money columns happen to hold.
     UNSUPPORTED = "unsupported"
+    # Recognised, produces nothing, and does NOT block -- the row's follow-up
+    # is a `corporate add` proposal, not a fill or a cash movement.
+    #
+    # Distinct from INTERNAL, which also produces nothing but has no follow-up,
+    # and from UNSUPPORTED, which is recognised and deliberately REFUSED. These
+    # rows carry a nonzero quantity, so before this existed they hit the
+    # money-carrying-unmapped policy and refused the entire import -- the same
+    # shape investment_gain_loss was added for, and the reason two accounts
+    # could not be imported at all.
+    CORPORATE_ACTION = "corporate_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +177,21 @@ RULES: tuple[Rule, ...] = (
     # this to a symbol predicate without re-reading the plan dialect's shape
     # in tests/fixtures/fidelity/real_shape_activity.csv.
     Rule("investment_gain_loss", "INVESTMENT GAIN/LOSS", Outcome.INTERNAL),
+    # Corporate actions -- History dialect only (the Activity & Orders
+    # fixtures never carry one; see tests/test_fidelity_history.py). Verbs
+    # observed on real export rows: "REVERSE SPLIT R/S FROM/TO ...", "NAME
+    # CHANGED N/C FROM/TO ...", "MERGER MER FROM/PAYOUT ...", "DISTRIBUTION
+    # SPINOFF FROM:(...) ...", and "IN LIEU OF FRX SHARE ... PAYOUT ..." for
+    # the cash paid out on the fractional remainder a reverse split leaves.
+    # None of these five prefixes overlaps any other rule's verb in either
+    # direction, so their position in RULES is not load-bearing today -- the
+    # mutation gate (moving them to the end of RULES, after expired_option)
+    # left every test green. See the task report for the full record.
+    Rule("reverse_split", "REVERSE SPLIT", Outcome.CORPORATE_ACTION),
+    Rule("name_change", "NAME CHANGED", Outcome.CORPORATE_ACTION),
+    Rule("merger", "MERGER", Outcome.CORPORATE_ACTION),
+    Rule("spinoff_distribution", "DISTRIBUTION SPINOFF", Outcome.CORPORATE_ACTION),
+    Rule("cash_in_lieu", "IN LIEU OF", Outcome.CORPORATE_ACTION),
     Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
     Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
     Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),
@@ -201,6 +227,419 @@ def classify(action: str, symbol: str) -> Rule | None:
             continue
         return rule
     return None
+
+
+# The `#REOR` reorganisation reference. Verified against the real exports,
+# not invented -- see tests/test_fidelity_history.py's module docstring,
+# which spec §5 requires this to be derived from rather than guessed at. A
+# reference is a shared BASE plus a trailing per-leg suffix. What is
+# actually verified (against both this fixture and the real exports): that
+# suffix is three constant zeros plus one varying digit -- e.g.
+# `M9990000010001` and `M9990000010000` are two legs of ONE event because
+# only their LAST CHARACTER differs, not because the two full references are
+# equal. The data does not distinguish a wider suffix -- the leading zeros
+# are constant in every observed case, so stripping 1 character or 4
+# produces the identical grouping partition here -- so this strips only the
+# one character that is verified to vary. See _reor_base's docstring for why
+# that choice (not "4 happens to also work") is deliberate. NOT because the
+# trailing character predicts anything about the row's role in the event --
+# see _derive_cusip_pair below for why role is read from quantity sign and
+# the paren-adjacent cusip instead.
+_REOR_RE = re.compile(r"#REOR\s+(\S+)")
+_REOR_LEG_SUFFIX_LEN = 1
+
+
+def _reor_base(token: str) -> str:
+    """The shared portion of a #REOR reference that ties one event's rows
+    together -- see _REOR_RE's comment just above for what is actually
+    verified.
+
+    Stripping only the last character (rather than the full observed
+    "three zeros plus a digit" suffix) is deliberate, not merely sufficient:
+    the two failure modes are asymmetric. A base string that is too SHORT
+    (over-stripping) can silently merge two distinct events that happen to
+    share a longer common prefix into one confidently wrong proposal, which
+    spec §7 forbids outright. A base string that is too LONG (under-
+    stripping, this function's direction) can only ever split legs of the
+    same event across two keys, which the leg-count check in
+    _group_corporate_actions turns into a loud "unrecognised" warning
+    instead of silent data loss. Spec §7's whole posture is report rather
+    than guess, so the fail-loud direction is the one this code takes. Do
+    not widen this without re-reading tests/test_fidelity_history.py's
+    module docstring first."""
+    if len(token) <= _REOR_LEG_SUFFIX_LEN:
+        return token
+    return token[:-_REOR_LEG_SUFFIX_LEN]
+
+
+# A cusip-shaped token inside parentheses in the row's action text. This is
+# the row's OWN entity -- the security the description text right before the
+# parenthetical names -- not a counterparty. Confirmed by cross-referencing
+# each row's own ISIN/SEDOL against its paren-adjacent token: on the
+# reverse-split pair, the TO row's paren token matches the ISIN that row's
+# own Description also carries, and likewise for the FROM row -- so the
+# paren token is self-describing, not a reference to the other leg. (An
+# earlier version of this code read the token immediately before "#REOR"
+# instead, which is actually the FROM/TO verb's COUNTERPARTY argument, and
+# produced an inverted source/resulting pair as a result -- see
+# _derive_cusip_pair.)
+#
+# The SHAPE is a plain CUSIP: exactly nine alphanumerics. An earlier version
+# of this pattern required letters-then-digits (`[A-Z]{1,6}\d{5,9}`), fitted
+# to a fabricated fixture token rather than to the real exports, and matched
+# ZERO of the corporate-action rows in five years of them -- so source_cusip
+# and resulting_cusip were always None in production and the whole
+# CUSIP-reporting path was dead on real data while four tests certified it.
+# Nine alphanumerics is deliberately not narrowed to "digits first": the
+# real rows do all begin with digits, but a CINS (a foreign issuer's CUSIP)
+# begins with a LETTER by construction, and refusing to match one would
+# reintroduce exactly the same blind spot for the next export.
+#
+# The parenthesis anchor is what keeps this from over-matching, and it is
+# load-bearing: "(Cash)" is 4 characters and a bare ticker like "(ZXCO )"
+# or "(ZXCB )" is at most 5, so neither can be nine. Measured across every
+# real export, every 9-character uppercase-alphanumeric parenthesised token
+# present is a CUSIP -- there are no other tokens of that shape to collide
+# with.
+_PAREN_CUSIP_RE = re.compile(r"\(([0-9A-Z]{9})\)")
+
+# The parent a spinoff distributes FROM, stated by the venue's own row:
+# "DISTRIBUTION SPINOFF FROM:(TICKER ) <child description>", with the CHILD
+# in the row's Symbol column. The parent is therefore a fact the row
+# supplies, not an inference -- which is what lets cli.py stop identifying
+# it by elimination (see CorporateActionProposal.parent_symbol and gap #47).
+#
+# Anchored to "FROM:" rather than reusing the paren scan: several other row
+# kinds carry a parenthesised ticker too (a name change's resulting leg, a
+# cash-in-lieu row), and none of those is a spinoff parent. Trailing
+# whitespace inside the parenthesis is the venue's own padding and is
+# dropped. "(Cash)" cannot match -- it is neither preceded by "FROM:" nor
+# upper-case.
+_SPINOFF_PARENT_RE = re.compile(r"FROM:\s*\(\s*([A-Z][A-Z0-9.\-]{0,9})\s*\)")
+
+
+def _parse_spinoff_parent(action: str) -> str | None:
+    """The ticker of the instrument a spinoff was distributed on, as the row
+    itself states it -- see _SPINOFF_PARENT_RE. None when the row states
+    none, in which case the consumer falls back to its own inference."""
+    match = _SPINOFF_PARENT_RE.search(action or "")
+    return match.group(1) if match else None
+
+
+def _parse_reor(action: str) -> tuple[str | None, tuple[str, ...]]:
+    """Extract the row's own #REOR reference (or None) and any cusip-shaped
+    tokens found in parentheses in the row's action text -- see
+    _PAREN_CUSIP_RE's comment for why the paren token, not the token
+    adjacent to "#REOR", is the row's own entity."""
+    ref_match = _REOR_RE.search(action)
+    reor_ref = ref_match.group(1) if ref_match else None
+    paren_cusips = tuple(_PAREN_CUSIP_RE.findall(action))
+    return reor_ref, paren_cusips
+
+
+# rule.name -> CorporateActionProposal.kind. cash_in_lieu is deliberately
+# absent: it never becomes a proposal (see ImportBatch.cash_in_lieu).
+_KIND_BY_RULE_NAME: dict[str, str] = {
+    "reverse_split": "reverse_split",
+    "name_change": "name_change",
+    "merger": "merger",
+    "spinoff_distribution": "spinoff",
+}
+
+# Group shapes from spec §5/§1: two legs for a reverse split and a name
+# change, three for a merger, one for a spinoff. A group whose row count
+# doesn't match its kind's entry here is reported as unrecognised rather
+# than coerced into the nearest match (spec §7).
+_EXPECTED_LEG_COUNT: dict[str, int] = {
+    "reverse_split": 2,
+    "name_change": 2,
+    "merger": 3,
+    "spinoff": 1,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _CorporateActionRow:
+    """One recognised, not-yet-grouped CORPORATE_ACTION row (cash-in-lieu
+    excluded -- see ImportBatch.cash_in_lieu). Internal to this module:
+    importers/base.py only ever sees the grouped CorporateActionProposal that
+    _group_corporate_actions produces from a list of these."""
+    line_no: int
+    kind: str
+    ex_date: date
+    quantity: Decimal
+    description: str
+    symbol: str | None
+    row_cusip: str | None  # this row's own entity -- see _PAREN_CUSIP_RE
+    group_key: tuple
+    # The parent ticker a spinoff row states -- see _SPINOFF_PARENT_RE. None
+    # for every other kind, and for a spinoff row that states none.
+    parent_symbol: str | None = None
+
+
+def _group_corporate_actions(
+    rows: list["_CorporateActionRow"],
+) -> tuple[tuple[CorporateActionProposal, ...], tuple[str, ...]]:
+    """Group recognised corporate-action rows into proposals on the venue's
+    own #REOR reference (spec §5), preserving first-seen order. A row with no
+    usable #REOR token (this fixture's spinoff row has none at all) was
+    already assigned a (ex-date, CUSIP-pair) fallback key when it was built
+    -- see the CORPORATE_ACTION branch in parse().
+
+    A group whose row count doesn't match its kind's expected shape, or
+    whose rows disagree on kind (should not happen given RULES, but is
+    checked rather than assumed), is reported as unrecognised -- spec §7 —
+    and produces no proposal.
+    """
+    groups: dict[tuple, list[_CorporateActionRow]] = {}
+    order: list[tuple] = []
+    for row in rows:
+        bucket = groups.setdefault(row.group_key, [])
+        if not bucket:
+            order.append(row.group_key)
+        bucket.append(row)
+
+    proposals: list[CorporateActionProposal] = []
+    warnings: list[str] = []
+
+    for key in order:
+        group_rows = groups[key]
+        lines = ", ".join(str(r.line_no) for r in group_rows)
+        kinds = {r.kind for r in group_rows}
+
+        if len(kinds) != 1:
+            warnings.append(
+                f"unrecognised corporate action: lines {lines} share a "
+                f"reorganisation reference but disagree on kind "
+                f"({sorted(kinds)!r})"
+            )
+            continue
+
+        kind = next(iter(kinds))
+        expected = _EXPECTED_LEG_COUNT[kind]
+        if len(group_rows) != expected:
+            warnings.append(
+                f"unrecognised corporate action: {kind} at lines {lines} has "
+                f"{len(group_rows)} row(s), expected {expected}"
+            )
+            continue
+
+        source_cusip, resulting_cusip = _derive_cusip_pair(group_rows)
+        description = " | ".join(r.description for r in group_rows if r.description)
+        ratio, ratio_source, approximate, stated_ratio, ratio_warning = _derive_ratio(
+            kind, group_rows, description, lines
+        )
+        if ratio_warning:
+            warnings.append(ratio_warning)
+        # A spinoff's group is a single row, so "the group's parent" is that
+        # row's own stated parent; the other kinds never carry one.
+        parent_symbol = next((r.parent_symbol for r in group_rows if r.parent_symbol), None)
+        proposals.append(
+            CorporateActionProposal(
+                kind=kind,
+                ex_date=group_rows[0].ex_date,
+                source_cusip=source_cusip,
+                resulting_cusip=resulting_cusip,
+                description=description,
+                quantities=tuple(r.quantity for r in group_rows),
+                ratio=ratio,
+                ratio_source=ratio_source,
+                approximate=approximate,
+                stated_ratio=stated_ratio,
+                parent_symbol=parent_symbol,
+                group_ref=key[1] if key[0] == "reor" else None,
+            )
+        )
+
+    return tuple(proposals), tuple(warnings)
+
+
+def _derive_cusip_pair(
+    group_rows: list["_CorporateActionRow"],
+) -> tuple[str | None, str | None]:
+    """source_cusip (the entity given up) and resulting_cusip (the entity
+    received), read from each row's OWN paren-adjacent cusip token (see
+    _PAREN_CUSIP_RE) rather than guessed from FROM/TO English, which this
+    fixture's own rows do not use consistently enough to trust on its own.
+
+    Role comes from quantity sign, which is unambiguous regardless of
+    wording: strictly negative (shares given up) is source_cusip, strictly
+    positive (shares received) is resulting_cusip. A side is only resolved
+    when exactly ONE row sits on it -- a merger's two-row positive side (two
+    different resulting companies) has no single value to report, so it is
+    left None rather than picking one arbitrarily. spec §7: an unresolvable
+    identifier is blank, never a guess -- and never backwards.
+    """
+    negative = [r for r in group_rows if r.quantity < 0]
+    positive = [r for r in group_rows if r.quantity > 0]
+    source_cusip = negative[0].row_cusip if len(negative) == 1 else None
+    resulting_cusip = positive[0].row_cusip if len(positive) == 1 else None
+    return source_cusip, resulting_cusip
+
+
+# Spec §6a: the ratio is also stated in the description text itself, not just
+# implied by the paired quantities. "N FOR N" occurs 21 times across the real
+# exports. §6a originally also claimed "N:N" occurs 10 times -- that was a
+# miscount, corrected after the reviewer checked every match: all 11
+# digit:digit occurrences in the real exports are the "Date downloaded
+# MM/DD/YYYY HH:MM pm" footer timestamp, not a ratio. Zero are ratios. There
+# is therefore no colon form to parse, and a bare digit:digit pattern is
+# actively dangerous rather than merely redundant -- it collides with that
+# footer and with any time-like text a description happens to contain (e.g.
+# "SETTLED AT 02:31 PM" would parse as ratio (2, 31)). A spurious stated
+# ratio is worse than none, per spec §6a: agreeing with it certifies a ratio
+# nobody stated, disagreeing with it raises a false alarm in the exact
+# mechanism this cross-check exists to make trustworthy. So this parses ONLY
+# "N FOR N" -- see test_stated_ratio_does_not_mistake_a_clock_time_for_a_ratio
+# in tests/test_fidelity_history.py, which pins that a colon never parses.
+_STATED_RATIO_FOR_RE = re.compile(r"(\d+)\s*FOR\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_stated_ratio(text: str) -> tuple[Decimal, Decimal] | None:
+    """The ratio as Fidelity's own text states it, new:old -- the same
+    direction _derive_quantity_ratio computes from the paired quantities.
+    None when the pattern doesn't match (this fixture's name change and
+    merger rows state no ratio at all, and -- deliberately -- neither does
+    any bare "N:N"; see the comment above _STATED_RATIO_FOR_RE)."""
+    match = _STATED_RATIO_FOR_RE.search(text)
+    if not match:
+        return None
+    return Decimal(match.group(1)), Decimal(match.group(2))
+
+
+def _gcd_decimal(a: Decimal, b: Decimal) -> Decimal:
+    """Euclidean GCD over Decimal -- Decimal in, Decimal out, never float,
+    and no int() truncation, so this stays exact even for a non-integral
+    quantity (none appear in this fixture, but nothing here assumes whole
+    shares)."""
+    a, b = abs(a), abs(b)
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def _reduce_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, Decimal]:
+    """Reduce a (new, old) pair to the smallest integer pair with the same
+    ratio. This ALWAYS "succeeds" mathematically -- a/gcd and b/gcd
+    reconstruct a and b exactly by construction -- so a clean reduction here
+    is never, by itself, evidence the ratio is right. Only a second,
+    independent source (the stated text, spec §6a) can show that -- see
+    CorporateActionProposal.approximate's docstring."""
+    divisor = _gcd_decimal(new_qty, old_qty)
+    if divisor == 0:
+        return new_qty, old_qty
+    return new_qty / divisor, old_qty / divisor
+
+
+def _derive_quantity_ratio(
+    group_rows: list["_CorporateActionRow"],
+) -> tuple[Decimal, Decimal] | None:
+    """(new, old), reduced -- the direction adjust_fills consumes, and the
+    direction the "1 FOR 3" idiom itself uses (1 new FOR 3 old). Only
+    derived when exactly one row sits on each side (2 rows total), the same
+    rule _derive_cusip_pair uses to resolve a single entity. Ambiguous stays
+    None rather than a guess (spec §7).
+
+    This is why a merger NEVER derives a ratio, structurally rather than
+    incidentally (spec §6, corrected): _EXPECTED_LEG_COUNT fixes a merger's
+    group at exactly 3 rows, while deriving a ratio here requires exactly 1
+    negative row and exactly 1 positive row -- 2 rows total. 3 != 2, so
+    those two rules can never both hold for a merger; this branch always
+    returns None for one, not only for this fixture's particular two-issuer
+    shape (9 shares of one resulting company, 4 of another) where summing
+    across issuers would otherwise silently manufacture a ratio out of
+    shares of two unrelated securities."""
+    negative = [r.quantity for r in group_rows if r.quantity < 0]
+    positive = [r.quantity for r in group_rows if r.quantity > 0]
+    if len(negative) != 1 or len(positive) != 1:
+        return None
+    return _reduce_ratio(positive[0], abs(negative[0]))
+
+
+# ratio_source values, spec §6a: 'constant' (name_change's fixed 1:1),
+# 'derived' (quantities only, with NO stated text found to check against),
+# 'derived+confirmed' (quantities AND the stated text agree -- spec §6a's
+# "strongest evidence available"), 'derived+disputed' (quantities AND a
+# stated text that DISAGREES -- the cross-check firing, `approximate` True
+# and `stated_ratio` carrying the other candidate), or None (spinoff, or a
+# merger, which is structurally never derivable -- see
+# _derive_quantity_ratio's docstring). All three 'derived*' values are
+# deliberately distinct: collapsing 'derived' and 'derived+confirmed' would
+# let a consumer mistake "never checked" for "two sources agreed" (which is
+# what the reviewer demonstrated by pointing out that deleting the
+# cross-check entirely still produced 'derived' either way), and collapsing
+# 'derived' and 'derived+disputed' -- which this code did until the final
+# fix wave -- made the consumer print "no independent confirmation was found
+# in the venue's own text" on the exact rows where confirmation was found and
+# CONTRADICTED the number printed beside that sentence.
+
+
+def _derive_ratio(
+    kind: str,
+    group_rows: list["_CorporateActionRow"],
+    description: str,
+    lines: str,
+) -> tuple[
+    tuple[Decimal, Decimal] | None, str | None, bool, tuple[Decimal, Decimal] | None, str | None
+]:
+    """Ratio, its source, whether it's flagged approximate, the ratio the
+    venue's own text states (reduced, or None when it states none), and an
+    optional warning to surface a stated/derived disagreement -- spec §6 and
+    §6a. Returns (ratio, ratio_source, approximate, stated_ratio, warning).
+
+    `stated_ratio` is returned alongside rather than folded into `ratio`
+    precisely because the two can disagree: which one is right is not this
+    layer's call to make (spec §6a forbids silently preferring a source), and
+    a consumer cannot present the choice to a human without both numbers.
+    """
+    if kind == "name_change":
+        return (Decimal(1), Decimal(1)), "constant", False, None, None
+    if kind == "spinoff":
+        # Not derivable from the file at all -- spec §6, last row: the
+        # child shares are here, the parent holding at the ex-date is not.
+        # cli.py fills this from the ledger.
+        return None, None, False, None, None
+
+    # reverse_split: derive from the paired quantities, then cross-check
+    # against the stated text. merger always returns None here -- see
+    # _derive_quantity_ratio's docstring for why that is structural, not a
+    # gap in this dispatch.
+    derived = _derive_quantity_ratio(group_rows)
+    if derived is None:
+        # Ambiguous shape, or a merger (always -- see
+        # _derive_quantity_ratio's docstring) -- blank, never a guess, the
+        # same silent-blank precedent _derive_cusip_pair sets for
+        # resulting_cusip in this exact merger.
+        return None, None, False, None, None
+
+    stated = _parse_stated_ratio(description)
+    if stated is None:
+        # Only one source available -- record it as such (spec §6a), not as
+        # a confirmed match.
+        return derived, "derived", False, None, None
+
+    stated_reduced = _reduce_ratio(*stated)
+    if stated_reduced == derived:
+        # Two independent sources agreeing is the strongest evidence
+        # available that this is right (spec §6a) -- recorded distinctly
+        # from the "only one source existed" case above.
+        return derived, "derived+confirmed", False, stated_reduced, None
+
+    # Disagreement is the signal that matters (spec §6a): a fractional
+    # remainder paid out as cash in lieu, or a misparse of one side. Never
+    # silently prefer one source -- carry BOTH candidates ('derived+disputed'
+    # plus `stated_ratio`), flag it, and say so where a human will see it.
+    # `ratio` still holds the quantities-derived pair, which is the evidence
+    # this file actually contains; a consumer must not present it as the
+    # action's ratio while the disagreement stands (cli.py renders both and
+    # asks the human to fill one in).
+    warning = (
+        f"{kind} at lines {lines}: ratio derived from quantities "
+        f"({derived[0]}:{derived[1]}) disagrees with the ratio stated in "
+        f"the description ({stated_reduced[0]}:{stated_reduced[1]}) -- "
+        "possible cash-in-lieu remainder or misparse"
+    )
+    return derived, "derived+disputed", True, stated_reduced, warning
 
 
 def parse_option_symbol(symbol: str) -> Instrument | None:
@@ -286,6 +725,15 @@ class FidelityImporter:
         cash: list[CanonicalCash] = []
         warnings: list[str] = []
         unmapped: list[str] = []
+        # CORPORATE_ACTION rows (cash-in-lieu excluded), collected here and
+        # grouped into CorporateActionProposals AFTER the row loop -- a
+        # reorganisation's legs can arrive on non-adjacent lines (see the
+        # merger's three rows in tests/fixtures/fidelity/real_shape_history.csv),
+        # so grouping cannot happen row-by-row the way fills/cash do.
+        corporate_action_rows: list[_CorporateActionRow] = []
+        # Cash-in-lieu-of-fractional-shares rows -- see ImportBatch.cash_in_lieu
+        # for why these are kept out of corporate_action_rows entirely.
+        cash_in_lieu: list[str] = []
         # Reasons the whole batch must refuse to commit -- see
         # ImportBatch.blocking's docstring for why this is narrower than
         # "every unmapped row" and wider than "none of them". Each entry is
@@ -642,6 +1090,96 @@ class FidelityImporter:
                 blocking.append((account, message))
                 continue
 
+            if rule.outcome is Outcome.CORPORATE_ACTION:
+                # Recognised and DEFERRED, not recorded and not refused --
+                # see Outcome.CORPORATE_ACTION's docstring for why this is
+                # neither INTERNAL (no follow-up) nor UNSUPPORTED (blocks
+                # unconditionally). Nothing is appended to `fills`, `cash`,
+                # `unmapped`, or `blocking`: the row is fully accounted for
+                # by being recognised, not by being reported -- except that
+                # it is collected here for grouping (or, for cash-in-lieu,
+                # for its own separate report) after the row loop.
+                description = (row.get("description") or "").strip()
+
+                if rule.name == "cash_in_lieu":
+                    # Recognised, reported separately, never applied (spec
+                    # §7, D6) -- see ImportBatch.cash_in_lieu's docstring.
+                    cash_in_lieu.append(description or action)
+                    continue
+
+                try:
+                    quantity = _decimal(row.get("quantity"))
+                except InvalidOperation as exc:
+                    # Does not block (Outcome.CORPORATE_ACTION never does),
+                    # but silently dropping the row would leave a merger or
+                    # split one leg short with nothing saying why -- warn and
+                    # exclude it from grouping, same "warn rather than fail
+                    # open OR closed" shape as every other guard in this
+                    # file.
+                    warnings.append(
+                        f"line {line_no}: corporate action has unparsable "
+                        f"quantity ({exc}), excluded from grouping"
+                    )
+                    continue
+                # Decimal("NaN")/Decimal("Infinity") CONSTRUCT fine and slip
+                # past the `except InvalidOperation` above -- the same hazard
+                # the fill and cash branches each guard (see the non-finite
+                # amount check below, and migration
+                # 002_reject_non_finite_numerics.sql). Without this, a NaN
+                # quantity reaches _derive_cusip_pair/_derive_quantity_ratio,
+                # whose `< 0`/`> 0` comparisons raise InvalidOperation out of
+                # parse() itself -- a crash, where spec §7's posture is
+                # degrade and report. Warn and exclude the row from grouping,
+                # exactly as the unparsable case above does.
+                if not quantity.is_finite():
+                    warnings.append(
+                        f"line {line_no}: corporate action has non-finite "
+                        f"quantity ({quantity}), excluded from grouping"
+                    )
+                    continue
+
+                reor_ref, paren_cusips = _parse_reor(action)
+                if reor_ref:
+                    group_key = ("reor", _reor_base(reor_ref))
+                else:
+                    # Fallback per spec §5: (ex-date, CUSIP pair). No row in
+                    # this fixture's real_shape_history.csv without a #REOR
+                    # token has a cusip-shaped token either (the spinoff row
+                    # has neither), so the symbol is included as a last
+                    # resort to keep such rows from all colliding onto one
+                    # (ex_date, ()) key if more than one ever appears on the
+                    # same date.
+                    cusip_tuple = tuple(sorted(set(paren_cusips)))
+                    group_key = ("fallback", when.date(), cusip_tuple or (symbol or "",))
+
+                # This row's own entity -- see _PAREN_CUSIP_RE's comment for
+                # why it is the paren token and not the token before #REOR.
+                # None when the row carries zero or more than one
+                # cusip-shaped paren token (ambiguous either way; honest
+                # absence rather than picking one).
+                row_cusip = paren_cusips[0] if len(paren_cusips) == 1 else None
+
+                kind = _KIND_BY_RULE_NAME[rule.name]
+                # Only a spinoff row states its parent (see
+                # _SPINOFF_PARENT_RE); asking for one anywhere else would
+                # read a "FROM:(...)" that means something different.
+                parent_symbol = _parse_spinoff_parent(action) if kind == "spinoff" else None
+
+                corporate_action_rows.append(
+                    _CorporateActionRow(
+                        line_no=line_no,
+                        kind=kind,
+                        ex_date=when.date(),
+                        quantity=quantity,
+                        description=description,
+                        symbol=symbol or None,
+                        row_cusip=row_cusip,
+                        group_key=group_key,
+                        parent_symbol=parent_symbol,
+                    )
+                )
+                continue
+
             if rule.outcome is not Outcome.CASH:
                 raise AssertionError(f"unhandled rule outcome {rule.outcome!r}")
             try:
@@ -686,6 +1224,9 @@ class FidelityImporter:
                 )
             )
 
+        corporate_actions, group_warnings = _group_corporate_actions(corporate_action_rows)
+        warnings.extend(group_warnings)
+
         return ImportBatch(
             fills=tuple(fills),
             cash=tuple(cash),
@@ -693,4 +1234,6 @@ class FidelityImporter:
             unmapped_rows=tuple(unmapped),
             refs_seen=tuple(sorted(refs_seen)),
             blocking=tuple(blocking),
+            corporate_actions=corporate_actions,
+            cash_in_lieu=tuple(cash_in_lieu),
         )

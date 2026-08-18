@@ -27,7 +27,7 @@ from db.pool import create_pool
 from db.positions import open_positions
 from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
-from importers.base import ImportBatch
+from importers.base import CorporateActionProposal, ImportBatch
 from importers.registry import get_importer, list_importers
 from ledger.corporate import ActionType, CorporateAction
 from ledger.pnl import unrealized_pnl
@@ -123,6 +123,415 @@ async def cmd_accounts_add(args) -> int:
     return 0
 
 
+# --- corporate-action proposals (spec 2026-08-17 Sec8) --------------------
+# `_preview_or_commit` prints these in a section of their own -- after the
+# parsed-row line on a preview, and before the inserted-rows line on a
+# --commit, where both passes run while the transaction is still open. NOTHING
+# here
+# ever calls add_action: D2/D3 -- a corporate action silently restates
+# history across every account holding the instrument, so `corporate add`
+# is the only path that stores one, and it is a human who runs it. Every
+# function below only ever formats text.
+
+# CorporateActionProposal.kind (importers/fidelity.py) -> the ActionType
+# value cmd_corporate_add's --type expects. 'name_change' -> 'symbol_change'
+# because ledger/corporate.py's ActionType has no NAME_CHANGE member -- only
+# SYMBOL_CHANGE, the same mechanism (rewrite the instrument identity, ratio
+# always 1:1) under the ledger's own name.
+_KIND_TO_ACTION_TYPE: dict[str, str] = {
+    "reverse_split": "reverse_split",
+    "name_change": "symbol_change",
+    "merger": "merger",
+    "spinoff": "spinoff",
+}
+
+# kinds (see _KIND_TO_ACTION_TYPE) whose ActionType needs --resulting-symbol
+# -- mirrors _RESULTING_INSTRUMENT_TYPES above, but keyed on the importer's
+# kind strings rather than ActionType members, since that's what a
+# CorporateActionProposal carries.
+_KINDS_NEEDING_RESULTING_SYMBOL = {"name_change", "merger", "spinoff"}
+
+
+def _placeholder_ratio_str(ratio: tuple[Decimal, Decimal] | None) -> str:
+    return f"{ratio[0]}:{ratio[1]}" if ratio is not None else "<FILL IN>"
+
+
+def _render_corporate_add_command(
+    p: CorporateActionProposal, ratio: tuple[Decimal, Decimal] | None
+) -> str:
+    """A `corporate add` invocation for one proposal -- printed for a human
+    to read, edit and run; never executed by this code (see the module
+    comment above and D2).
+
+    `--symbol` and `--resulting-symbol` are always a literal `<SYMBOL>`
+    placeholder. Spec D7 makes CUSIP resolution advisory and says plainly
+    that no CUSIP column is needed for this work -- there is no lookup this
+    function could perform that would ever fill them in. The description and
+    CUSIP printed alongside this command (_print_corporate_action_section)
+    are what let a human supply the symbol themselves.
+
+    `--ratio` is the one placeholder this module can sometimes complete:
+    always for name_change, for reverse_split when its two sources do not
+    contradict each other, and for spinoff when _complete_spinoff_ratio's
+    ledger read succeeds. When it can't -- always for merger, sometimes for
+    spinoff, and for a reverse split whose stated and derived ratios DISPUTE
+    each other (see _print_corporate_action_section) -- `ratio` here is None
+    and the command prints `<FILL IN>` instead, same shape as the symbol
+    placeholder, so this command is never rendered as though it were
+    ready to run when it is not.
+    """
+    action_type = _KIND_TO_ACTION_TYPE[p.kind]
+    parts = [
+        "corporate add",
+        f"--type {action_type}",
+        "--symbol <SYMBOL>",
+        f"--ex-date {p.ex_date.isoformat()}",
+        f"--ratio {_placeholder_ratio_str(ratio)}",
+    ]
+    if p.kind in _KINDS_NEEDING_RESULTING_SYMBOL:
+        parts.append("--resulting-symbol <SYMBOL>")
+    if p.kind == "spinoff":
+        parts.append("--basis-allocation <FILL IN>")
+    return " ".join(parts)
+
+
+# ratio_source (importers/base.py's CorporateActionProposal) -> a sentence
+# telling a human how strong the evidence behind the printed ratio is.
+# Spec Sec6a: "two independent sources agreed" and "only one source existed"
+# must never read the same, because collapsing them is exactly what would
+# let a human mistake a confirmed cross-check for one that never ran.
+_RATIO_SOURCE_STRENGTH: dict[str, str] = {
+    "constant": "fixed -- a name/symbol change always converts 1:1, no share data involved",
+    "derived": (
+        "derived from the paired quantities only -- the venue's own text states no "
+        "ratio at all, so there was nothing to cross-check it against"
+    ),
+    "derived+confirmed": (
+        "derived from the paired quantities AND matches the ratio the venue's own "
+        "text states -- two independent sources agree, the strongest evidence "
+        "available (spec Sec6a)"
+    ),
+    "derived+disputed": (
+        "derived from the paired quantities, and CONTRADICTED by the ratio the "
+        "venue's own text states -- two independent sources disagree, so neither "
+        "is offered as the answer (spec Sec6a)"
+    ),
+}
+
+# What to print when a proposal carries a ratio_source this table has no
+# sentence for -- a kind added to importers/ without a matching entry here.
+# A missing default made `.get()` return None and print the literal "None"
+# in the strength parenthesis, which reads as an assertion about the
+# evidence rather than as the gap in this table that it is.
+_UNKNOWN_RATIO_SOURCE_STRENGTH = (
+    "provenance unrecorded -- this build has no description for that ratio source; "
+    "treat the ratio as unverified"
+)
+
+
+def _reduce_decimal_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, Decimal]:
+    """Reduce a (new, old) pair to the smallest integer pair with the same
+    ratio, via a Decimal-only Euclidean GCD -- never float, so this stays
+    exact. The same reduction importers/fidelity.py's private `_reduce_ratio`
+    does for a reverse split's quantities, reimplemented rather than
+    imported: that function is private to importers/fidelity.py, and this
+    task's own constraint ("nothing under importers/ changes") is exactly the
+    reason not to reach into it and make cli.py depend on its internals.
+    """
+    a, b = abs(new_qty), abs(old_qty)
+    while b:
+        a, b = b, a % b
+    divisor = a
+    if divisor == 0:
+        return new_qty, old_qty
+    return new_qty / divisor, old_qty / divisor
+
+
+async def _complete_spinoff_ratio(
+    conn, account_id: UUID | None, p: CorporateActionProposal
+) -> tuple[tuple[Decimal, Decimal] | None, str]:
+    """Spec Sec6, last row: a spinoff's ratio is child shares (already on the
+    proposal, from the file) over the parent's holding at the ex-date -- not
+    derivable from the file at all, which is why importers/ always leaves
+    `ratio` None for a spinoff (see CorporateActionProposal's docstring).
+    This is the one place a proposal is completed outside the pure layer.
+
+    WHICH instrument is the parent is answered in one of two ways, in this
+    order:
+
+    1. The row STATES it. Fidelity's spinoff rows read "DISTRIBUTION SPINOFF
+       FROM:(TICKER )" with the child in the Symbol column, so the parent's
+       own ticker is a fact the export supplies -- captured by the pure layer
+       as CorporateActionProposal.parent_symbol. When it is present, this
+       reads that instrument's holding and nothing else.
+    2. Otherwise, by elimination: the account's own net holding, as of the
+       ex-date, across every instrument it has ever traded. If exactly one
+       instrument has a positive net quantity (LONG, never zero or short --
+       a spinoff is only received on shares you are long), that is
+       unambiguously the parent. Zero long holdings, or more than one, is
+       reported as undeterminable (spec Sec7) rather than guessed at.
+
+    Path 2 was the ONLY path until the final fix wave, and gap #47 recorded
+    it as holding "for the two real accounts checked". Measured against the
+    real exports, it does not: the account is long many instruments at the
+    only real spinoff's ex-date, so the elimination rule reports "ambiguous"
+    on 100% of the real data and the completion never fired at all. Path 1
+    answers the same question exactly on that data (see gap #47 as
+    corrected).
+
+    A stated parent the account does not hold is NOT quietly demoted to path
+    2: eliminating down to some other instrument would contradict the row's
+    own statement and produce a confidently wrong ratio against a security
+    the spinoff has nothing to do with. That case reports what happened and
+    stops -- usually it means the parent's purchase is in a file that has
+    not been imported yet, which the note says.
+
+    Returns (ratio, note): `ratio` is None when it could not be completed,
+    and `note` always explains -- either what the ratio was derived from, or
+    why it wasn't.
+    """
+    if conn is None:
+        return None, (
+            "not completed: preview opens no database connection -- rerun "
+            "with --commit to complete it from the ledger"
+        )
+    if account_id is None:
+        return None, "not completed: no --account given, so the parent holding is unknown"
+    if not p.quantities:
+        return None, "not completed: the proposal carries no child-share quantity"
+    child_qty = p.quantities[0]
+
+    # The clock lives here, not in importers/ or ledger/: ex_date is a DATE,
+    # fill.executed_at a TIMESTAMPTZ, and "holding at the ex-date" means the
+    # position going into that day -- every fill strictly before its
+    # midnight UTC. A fill dated ON the ex-date itself (which could be the
+    # very reorganisation being priced) is excluded rather than counted
+    # toward the parent it is arguably already part of.
+    cutoff = datetime.combine(p.ex_date, time.min, tzinfo=UTC)
+    # One query, parameterised on whether the row named a parent: $3 is the
+    # stated ticker or NULL, and a NULL means "every instrument", which is
+    # the elimination rule's own candidate set. Written this way rather than
+    # as two near-identical queries so the LONG-only, before-the-ex-date
+    # rules can never drift between the two paths.
+    rows = await conn.fetch(
+        """
+        SELECT i.symbol,
+               SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) AS net_qty
+          FROM fill f
+          JOIN instrument i ON i.id = f.instrument_id
+         WHERE f.account_id = $1
+           AND f.executed_at < $2
+           AND ($3::text IS NULL OR i.symbol = $3::text)
+         GROUP BY i.id, i.symbol
+        HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
+        """,
+        account_id,
+        cutoff,
+        p.parent_symbol,
+    )
+    if p.parent_symbol is not None and len(rows) == 0:
+        # The row named a parent and the account is not long it. Falling back
+        # to elimination here would answer a question the venue already
+        # answered, differently -- see this function's docstring.
+        return None, (
+            f"not completed: this row names {p.parent_symbol} as the parent it was "
+            f"distributed on, but account {account_id} holds no LONG position in "
+            f"{p.parent_symbol} as of {p.ex_date.isoformat()} -- import the file "
+            "containing that purchase and re-run, rather than dividing by some "
+            "other instrument the row does not name"
+        )
+    if len(rows) == 0:
+        return None, (
+            f"not completed: account {account_id} holds no LONG position in any "
+            f"instrument as of {p.ex_date.isoformat()} to use as the parent -- a "
+            "spinoff is only received on shares you are long; a net-short or "
+            "flat holding does not qualify, so this excludes both"
+        )
+    if len(rows) > 1:
+        symbols = ", ".join(sorted(r["symbol"] for r in rows))
+        return None, (
+            f"not completed: account {account_id} holds {len(rows)} instruments as "
+            f"of {p.ex_date.isoformat()} ({symbols}) -- ambiguous which is the "
+            "spinoff's parent"
+        )
+
+    parent_symbol = rows[0]["symbol"]
+    parent_qty = rows[0]["net_qty"]
+    ratio = _reduce_decimal_ratio(child_qty, parent_qty)
+    how = (
+        "named by the venue's own row"
+        if p.parent_symbol is not None
+        else "the account's only LONG holding at that date"
+    )
+    note = (
+        f"derived from the ledger: {child_qty} child share(s) against "
+        f"{parent_qty} {parent_symbol} share(s) held at {p.ex_date.isoformat()} "
+        f"-- parent {how}"
+    )
+    return ratio, note
+
+
+async def _spinoff_notes_for(
+    conn, account_id: UUID | None, batch: ImportBatch
+) -> dict[int, tuple[tuple[Decimal, Decimal] | None, str]]:
+    """(ratio, note) for every spinoff proposal in `batch.corporate_actions`,
+    keyed by its index -- see _complete_spinoff_ratio. `conn` is None in
+    preview (which opens no connection at all) and a real connection in the
+    commit path; either way _complete_spinoff_ratio degrades honestly."""
+    notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]] = {}
+    for i, p in enumerate(batch.corporate_actions):
+        if p.kind == "spinoff":
+            notes[i] = await _complete_spinoff_ratio(conn, account_id, p)
+    return notes
+
+
+_ALL_CORPORATE_ACTION_KINDS = frozenset({"reverse_split", "name_change", "merger", "spinoff"})
+
+# The three kinds whose ratio never needs a ledger read: reverse_split and
+# name_change always carry their ratio out of importers/ already (spec §6),
+# and a merger's is structurally absent regardless of ledger state (spec
+# §6a). Only spinoff depends on this import's own committed fills (see
+# _complete_spinoff_ratio) -- which is exactly why the commit path below
+# splits its printing into an EARLY pass (this set, safe even on a refused
+# commit, since none of it reads anything the refusal left uncommitted) and
+# a LATE pass (spinoff alone, after the commit that might supply its parent
+# holding).
+_NON_LEDGER_KINDS = frozenset({"reverse_split", "name_change", "merger"})
+
+_CORPORATE_ACTION_HEADER = (
+    "\n=== Corporate actions detected -- nothing above was written; "
+    "review before running any command below ==="
+)
+
+
+def _print_corporate_action_section(
+    batch: ImportBatch,
+    spinoff_notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]],
+    *,
+    kinds: frozenset[str] = _ALL_CORPORATE_ACTION_KINDS,
+    include_cash_in_lieu: bool = True,
+    header: str = _CORPORATE_ACTION_HEADER,
+) -> None:
+    """Spec Sec8: a clearly separated, hard-to-miss section -- one
+    `corporate add` command per detected action, preceded by
+    the evidence it was derived from and the venue's own description text,
+    plus cash-in-lieu reported separately (D6: it is recognised, never
+    applied, and must never be mistaken for something `corporate add` can
+    record). Prints nothing at all when there is nothing to report, so an
+    ordinary import (no corporate-action rows) is unaffected.
+
+    `kinds` restricts which proposals this call renders. Preview (which
+    never reaches a post-commit point at all -- see _preview_or_commit)
+    always passes every kind. The commit path calls this twice: once EARLY,
+    before routing/blocking can refuse the commit, with `kinds=
+    _NON_LEDGER_KINDS` (reverse_split, name_change, merger -- none of which
+    need this import's fills to have been committed, so they can still be
+    reported on a refusal); and once LATE, after commit_batch runs, with
+    `kinds={"spinoff"}` and `include_cash_in_lieu=False` (already shown
+    early) -- see _preview_or_commit for why spinoff alone must wait.
+
+    D2/D3: never writes anything. Every command printed below is text for a
+    human to read, edit and run; nothing here calls add_action.
+    """
+    matching = [(i, p) for i, p in enumerate(batch.corporate_actions) if p.kind in kinds]
+    cash_in_lieu = batch.cash_in_lieu if include_cash_in_lieu else ()
+    if not matching and not cash_in_lieu:
+        return
+
+    print(header)
+    for i, p in matching:
+        ratio = p.ratio
+        note: str | None = None
+        if p.kind == "spinoff":
+            ratio, note = spinoff_notes.get(i, (None, "not completed"))
+
+        print(f"\n{p.kind} ex {p.ex_date.isoformat()} -- {p.description}")
+        if p.source_cusip or p.resulting_cusip:
+            print(f"  cusip: {p.source_cusip or '?'} -> {p.resulting_cusip or '?'}")
+        # D5: the ratio is an inference, the quantities are evidence -- print
+        # both, always, not just when the ratio is missing.
+        print(f"  evidence (quantities): {', '.join(str(q) for q in p.quantities)}")
+
+        # A ratio whose two sources CONTRADICT each other is not a ratio this
+        # tool may offer. Every reverse split in five years of real exports
+        # lands here: the venue's text states a whole "N FOR N" while the
+        # paired quantities -- one lot, with its fractional remainder cashed
+        # out -- reduce to something that is right for that lot and wrong for
+        # every other lot and holder. Printing either number in `--ratio`
+        # would put a figure
+        # nobody declared one paste away from being stored across every
+        # account holding the instrument, so this renders the same visibly
+        # incomplete `<FILL IN>` the merger gets, with BOTH candidates listed
+        # (spec Sec6a: say so rather than silently preferring one source --
+        # in the artefact the user acts on, not only in a stderr warning).
+        disputed = p.ratio_source == "derived+disputed" and ratio is not None
+        if disputed:
+            stated = p.stated_ratio
+            print(
+                "  ** DISPUTED ** -- this ratio's two independent sources disagree, "
+                "so neither is offered below"
+            )
+            print(
+                f"    derived from the paired quantities: {ratio[0]}:{ratio[1]} "
+                "(** APPROXIMATE **: reproduces THIS lot's share count and need not "
+                "hold for any other lot or holder -- a cash-in-lieu remainder does "
+                "exactly this)"
+            )
+            print(
+                "    stated in the venue's own text: "
+                + (f"{stated[0]}:{stated[1]}" if stated is not None else "(unparsed)")
+            )
+            print(f"  ratio: DISPUTED -- {_RATIO_SOURCE_STRENGTH['derived+disputed']}")
+            print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
+            print(f"  {_render_corporate_add_command(p, None)}")
+            continue
+
+        # The catch-all for a proposal flagged approximate by some route
+        # OTHER than a stated/derived disagreement. importers/fidelity.py
+        # sets `approximate` only together with 'derived+disputed' today, so
+        # nothing reaches this on the Fidelity path -- it is kept so a future
+        # importer that flags a ratio without that source still prints a
+        # warning rather than silently presenting it as sound.
+        if p.approximate:
+            print(
+                "  ** APPROXIMATE ** -- the derived ratio disagrees with the ratio "
+                "the venue's own text states; verify manually before running anything"
+            )
+
+        if ratio is not None:
+            strength = (
+                note
+                if p.kind == "spinoff"
+                else _RATIO_SOURCE_STRENGTH.get(
+                    p.ratio_source or "", _UNKNOWN_RATIO_SOURCE_STRENGTH
+                )
+            )
+            print(f"  ratio: {ratio[0]}:{ratio[1]} ({strength})")
+            print(f"  {_render_corporate_add_command(p, ratio)}")
+        else:
+            if p.kind == "merger":
+                reason = (
+                    "a merger's group is always three rows (one payout, two or more "
+                    "resulting legs); a ratio can only be derived from exactly one "
+                    "negative and one positive row, which a merger can never have -- "
+                    "this is structural, not a parsing gap. Determine the ratio from "
+                    "the venue's own statement and fill it in yourself."
+                )
+            else:
+                reason = note or "could not be determined"
+            print(f"  ratio: UNAVAILABLE -- {reason}")
+            print("  INCOMPLETE -- fill in --ratio (and --symbol) before running:")
+            print(f"  {_render_corporate_add_command(p, None)}")
+
+    if cash_in_lieu:
+        print(
+            "\n-- Cash in lieu of fractional shares: recognised, NOT applied "
+            "(gap #43) --"
+        )
+        for desc in cash_in_lieu:
+            print(f"  {desc}")
+
+
 async def cmd_import(args) -> int:
     importer = get_importer(args.venue)
     batch = importer.parse(pathlib.Path(args.file).read_text())
@@ -166,6 +575,18 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
         print(f"  {len(batch.unmapped_rows)} row(s) not mapped", file=sys.stderr)
 
     if not args.commit:
+        # Corporate-action proposals print here, before any other preview
+        # diagnostic: spec Sec8 wants the section hard to miss, and it must
+        # render even on a bare preview (no --commit, no --check-duplicates)
+        # since that is the default way this command is run. conn=None,
+        # account_id=None: preview never opens a database connection (a
+        # tested invariant -- tests/test_cli.py's
+        # test_preview_import_never_opens_a_database_connection), so a
+        # spinoff's ratio degrades to "not completed" here rather than being
+        # read from the ledger; see _complete_spinoff_ratio.
+        spinoff_notes = await _spinoff_notes_for(None, None, batch)
+        _print_corporate_action_section(batch, spinoff_notes)
+
         # A single export can carry rows for more than one venue account
         # (Fidelity's account-number column, for instance). --commit routes
         # each row to its own account automatically (see db.importing.route_batch);
@@ -300,6 +721,20 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
+            # EARLY: reverse_split, name_change and merger never need this
+            # import's own fills to have been committed (their ratio is
+            # either already on the proposal from importers/, or -- merger
+            # -- structurally absent regardless of ledger state), so they
+            # are printed here, before route_batch and every refusal below
+            # can return 2. A refused commit writes nothing, but these three
+            # kinds' proposals do not depend on anything having been
+            # written, so there is no reason to withhold them from a user
+            # who has to fix the refusal and re-run anyway -- see
+            # _print_corporate_action_section's docstring for the split.
+            # spinoff_notes={}: no spinoff kind is in _NON_LEDGER_KINDS, so
+            # _print_corporate_action_section never looks one up here.
+            _print_corporate_action_section(batch, {}, kinds=_NON_LEDGER_KINDS)
+
             plan = await route_batch(conn, venue, batch)
 
             # Same "refuse the whole batch, write nothing" shape as the
@@ -474,6 +909,55 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     fills_skipped += result.fills_skipped
                     cash_inserted += result.cash_inserted
                     trades_regrouped += await regroup_account(conn, account_id)
+
+                # LATE: spinoff alone, printed here inside the same
+                # transaction as the commit above and after it -- the one
+                # point in this function where a spinoff's ratio can be
+                # completed against BOTH pre-existing fills and this
+                # import's own. A real multi-year History export commonly
+                # carries the original purchase and a later spinoff in the
+                # SAME file (see
+                # tests/fixtures/fidelity/real_shape_history.csv); reading
+                # the ledger before commit_batch runs would miss that
+                # purchase entirely and report "no holding" for a ratio
+                # that is, in fact, determinable. Postgres sees a
+                # transaction's own uncommitted writes from within that same
+                # transaction (read-your-own-writes), so this placement --
+                # after the INSERTs, still inside `async with
+                # conn.transaction():` -- picks them up without waiting for
+                # the transaction to actually commit.
+                #
+                # A refused commit (any of the early `return 2`s above, all
+                # of which run before this transaction even opens) never
+                # reaches this section -- nothing has been written in that
+                # case, so a spinoff's ledger read would be no more complete
+                # here than it was at the EARLY point above. reverse_split,
+                # name_change and merger do not have this problem (see the
+                # EARLY call above, before route_batch) -- only spinoff's
+                # correctness trades away reporting on a refusal, and on
+                # refusal the user sees the refusal's own error and re-runs;
+                # the spinoff proposal reaches them on that next, successful
+                # attempt.
+                #
+                # History-dialect rows (the only dialect with corporate
+                # actions) carry no per-row account ref, so the ENTIRE file
+                # routes to one account: args.account, the same one the
+                # unrouted-rows check above already required whenever this
+                # batch has any unrouted fill or cash movement. getattr, not
+                # args.account: several existing tests build a bare
+                # Namespace without this attribute, same reasoning as
+                # cmd_accounts_add's ignore_on_import getattr.
+                account_id_for_corporate = (
+                    UUID(args.account) if getattr(args, "account", None) else None
+                )
+                spinoff_notes = await _spinoff_notes_for(conn, account_id_for_corporate, batch)
+                _print_corporate_action_section(
+                    batch,
+                    spinoff_notes,
+                    kinds=frozenset({"spinoff"}),
+                    include_cash_in_lieu=False,
+                    header="\n=== Spinoff ratio(s) completed against the committed ledger ===",
+                )
     finally:
         # pool.close() waits for every checked-out connection to be released.
         # It must run after the `async with pool.acquire()` block has exited
@@ -1687,9 +2171,13 @@ def main() -> int:
     p_import.add_argument(
         "--account",
         help=(
-            "account UUID for rows with no venue-supplied account ref "
-            "(e.g. Coinbase); a venue that carries its own per-row account "
-            "number (e.g. Fidelity) routes automatically and does not need this"
+            "account UUID for rows with no venue-supplied account ref. "
+            "Coinbase never carries one. Fidelity is dialect-dependent: the "
+            "Activity & Orders export carries its own per-row account "
+            "number and routes automatically, but the multi-year History "
+            "export -- the only dialect that contains corporate actions -- "
+            "has no account column at all and needs this just as much as "
+            "Coinbase does"
         ),
     )
     p_import.add_argument("--commit", action="store_true", help="write to the database")

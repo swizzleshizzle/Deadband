@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
 from typing import Protocol
 from uuid import UUID
@@ -152,6 +152,109 @@ class CanonicalCash:
 
 
 @dataclass(frozen=True, slots=True)
+class CorporateActionProposal:
+    """A logical corporate action, grouped from one or more recognised
+    CORPORATE_ACTION rows (see importers/fidelity.py's Outcome.CORPORATE_ACTION
+    and _group_corporate_actions). Never written anywhere -- `cli.py`'s
+    `corporate add` is the only path that turns one into a stored action, and
+    nothing in this import pipeline calls it. `ratio` is always None coming
+    out of `importers/`; Task 3 fills it (spec §6), and the spinoff case is
+    filled later still, by `cli.py` against a ledger holding (spec §6, last
+    row of the table) -- which is why the field is optional here at all.
+    """
+    kind: str                       # 'reverse_split' | 'name_change' | 'merger' | 'spinoff'
+    ex_date: date
+    source_cusip: str | None
+    resulting_cusip: str | None
+    description: str                # the venue's own text, for a human to identify it
+    quantities: tuple[Decimal, ...]  # the evidence the ratio was derived from
+    ratio: tuple[Decimal, Decimal] | None = None   # filled by Task 3; None until then
+    # Where `ratio` came from -- spec §6a's "use what there is and record
+    # which source the ratio came from", so a consumer never has to
+    # re-derive provenance from `kind` alone. One of:
+    #   'constant'         -- name_change's fixed 1:1, no row data involved.
+    #   'derived'          -- from the paired rows' quantities (spec §6),
+    #                         with NO stated ratio in the text to check it
+    #                         against. Exactly one source existed.
+    #                         Deliberately NOT used for a confirmed
+    #                         two-source match -- see 'derived+confirmed' --
+    #                         and, since the final fix wave, no longer used
+    #                         for a two-source DISAGREEMENT either: that is
+    #                         'derived+disputed' below. Collapsing those two
+    #                         made the consumer's own sentence ("no
+    #                         independent confirmation was found in the
+    #                         venue's own text") false on every real reverse
+    #                         split in the exports, where confirmation WAS
+    #                         found and disagreed.
+    #   'derived+disputed' -- from the paired rows' quantities, AND a ratio
+    #                         WAS stated in the text, and the two disagree
+    #                         (spec §6a's cross-check firing). `approximate`
+    #                         is True and `stated_ratio` carries the other
+    #                         candidate, so a consumer can show both numbers
+    #                         rather than presenting one as unopposed. Every
+    #                         reverse split in the real exports lands here:
+    #                         the text states a whole "N FOR N" while the
+    #                         paired quantities -- one lot, its fractional
+    #                         remainder cashed out rather than converted --
+    #                         reduce to something else entirely.
+    #   'derived+confirmed' -- from the paired rows' quantities AND matching
+    #                         the ratio stated in the text (spec §6a's
+    #                         "strongest evidence available"). Kept distinct
+    #                         from plain 'derived' so a consumer can tell
+    #                         "two sources agreed" from "only one source
+    #                         existed" -- collapsing them would make it
+    #                         impossible to tell a confirmed cross-check from
+    #                         one that never ran at all.
+    #   None               -- spinoff (spec §6, last row: not derivable from
+    #                         the file), or a merger (structurally never
+    #                         derivable -- spec §6, corrected: a merger's
+    #                         group is always 3 rows, but deriving a ratio
+    #                         needs exactly 2, so the two rules can never
+    #                         both hold; see importers/fidelity.py's
+    #                         _derive_quantity_ratio).
+    ratio_source: str | None = None
+    # True when the derived ratio DISAGREES with the ratio stated in the
+    # venue's own description text (spec §6a's cross-check) -- e.g. a
+    # fractional share paid out as cash-in-lieu instead of converting, or a
+    # misparse of either source. Reducing raw quantities by their own gcd
+    # always "succeeds" trivially (a/gcd and b/gcd reconstruct a and b
+    # exactly by construction), so this can only be set by comparing against
+    # the independent, second source -- never by inspecting the derived pair
+    # alone. `quantities` above still carries the raw evidence either way, so
+    # a human can see the distortion even when `ratio` and `approximate`
+    # disagree about what happened.
+    approximate: bool = False
+    # The ratio the venue's OWN description text states, reduced -- the
+    # second, independent source `ratio_source` and `approximate` are decided
+    # by. None when the text states no ratio at all (spec §6a's single-source
+    # case), and None for every kind whose ratio never comes from a text
+    # cross-check (name_change's constant, spinoff, merger).
+    #
+    # Carried on the proposal rather than left in a warning string: a
+    # disagreement is only adjudicable with BOTH numbers in front of you, and
+    # warnings go to stderr while the proposal section goes to stdout (D5 --
+    # the section is meant to be the self-contained decision surface). Before
+    # this field existed, the one number needed to settle the disagreement
+    # was never in the artefact the user acts on.
+    stated_ratio: tuple[Decimal, Decimal] | None = None
+    # The parent instrument's own ticker, when the venue's row STATES it --
+    # Fidelity's spinoff rows read "DISTRIBUTION SPINOFF FROM:(TICKER )" with
+    # the CHILD in the Symbol column, so the parent is stated, not merely
+    # inferrable. None for every other kind (whose parent side is identified
+    # by CUSIP and quantity sign instead) and for any spinoff row that
+    # carries no such token.
+    #
+    # This is the only identifier on the proposal that is a SYMBOL rather
+    # than a CUSIP, and it exists because the consumer that needs it
+    # (cli.py's _complete_spinoff_ratio) matches against ledger instruments,
+    # which are keyed by symbol. Without it that consumer had to identify the
+    # parent by elimination -- "the account's sole LONG holding" -- which is
+    # ambiguous on 100% of the real accounts (see gap #47).
+    parent_symbol: str | None = None
+    group_ref: str | None = None    # the #REOR reference, or None when the fallback keyed it
+
+
+@dataclass(frozen=True, slots=True)
 class ImportBatch:
     fills: tuple[CanonicalFill, ...] = ()
     cash: tuple[CanonicalCash, ...] = ()
@@ -185,6 +288,21 @@ class ImportBatch:
     # route_batch runs, rather than refusing on blocking unconditionally
     # before an account's ignore status is even known.
     blocking: tuple[tuple[str | None, str], ...] = ()
+    # Proposed corporate actions grouped from CORPORATE_ACTION rows (spec
+    # §5) -- never applied here. `cli.py`'s `corporate add` is the only
+    # place one of these is turned into a stored action; nothing in this
+    # pipeline calls it. Empty means either no corporate-action rows were
+    # present, or every group found was reported as unrecognised instead
+    # (see `warnings`) -- never "recognised but silently dropped."
+    corporate_actions: tuple[CorporateActionProposal, ...] = ()
+    # Cash-in-lieu-of-fractional-shares rows, kept OUT of `corporate_actions`
+    # deliberately: it moves real cash (gap #43, which is the same arithmetic
+    # gap #35 tracks one layer up for merger cash) and is never
+    # applied, so listing it beside the proposals would imply an action
+    # `corporate add` can record, which it cannot (spec §7, D6). Each entry
+    # is the row's own description text, verbatim, so a human can still see
+    # it happened even though nothing acts on it.
+    cash_in_lieu: tuple[str, ...] = ()
 
 
 def _locator(where: int | str) -> str:

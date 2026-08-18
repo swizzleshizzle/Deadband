@@ -400,3 +400,75 @@ def test_import_missing_file_prints_a_clean_error_not_a_traceback(monkeypatch, c
     err = capsys.readouterr().err
     assert "error:" in err.lower()
     assert "Traceback" not in err
+
+
+# --- Final fix wave: the corporate-proposal lookup tables ------------------
+# Three tables in cli.py map importer-side kind strings onto CLI/ledger
+# vocabulary. Their entries are almost all identities, which is exactly why
+# a wrong one hides: an identity mapping cannot be wrong, so nothing was
+# ever written to test the one entry that can be. These assertions pin the
+# tables against their real counterparties rather than against a copy of
+# themselves.
+
+
+def test_every_corporate_kind_maps_to_a_real_action_type():
+    """`_KIND_TO_ACTION_TYPE`'s only non-identity entry is
+    name_change -> symbol_change (ledger/corporate.py's ActionType has no
+    NAME_CHANGE member). A typo there renders a `corporate add --type ...`
+    command that `corporate add`'s own `choices=` rejects when the user runs
+    it -- and every existing test stays green, because nothing in the test
+    suite ever executes a rendered command.
+
+    Checked in both directions: every importer kind has a mapping (a kind
+    added without one raises KeyError inside _render_corporate_add_command,
+    mid-print), and every mapped value is a real ActionType member."""
+    from ledger.corporate import ActionType
+
+    assert set(cli._KIND_TO_ACTION_TYPE) == cli._ALL_CORPORATE_ACTION_KINDS
+    assert set(cli._KIND_TO_ACTION_TYPE.values()) <= {t.value for t in ActionType}
+
+
+def test_the_commit_paths_two_printing_passes_cover_every_kind_exactly_once():
+    """The commit path prints proposals in two passes: EARLY with
+    `_NON_LEDGER_KINDS`, LATE with `{"spinoff"}`. Nothing tied those two
+    sets to the full one, so a sixth kind added to importers/ would render
+    in preview (which passes every kind) and be SILENTLY DROPPED from the
+    commit path -- present in one output, absent from the other, with no
+    error anywhere. Disjointness matters too: an overlap would print the
+    same proposal twice in one commit."""
+    assert cli._NON_LEDGER_KINDS | {"spinoff"} == cli._ALL_CORPORATE_ACTION_KINDS
+    assert not cli._NON_LEDGER_KINDS & {"spinoff"}
+
+
+def test_every_ratio_source_the_importer_can_emit_has_a_strength_sentence():
+    """`_RATIO_SOURCE_STRENGTH` is what turns a provenance token into the
+    sentence a human reads beside the ratio. A source with no entry printed
+    the literal "None" before this wave (`.get` with no default), which
+    reads as a claim about the evidence rather than as a missing entry.
+
+    The set of sources is taken from what the importer ACTUALLY EMITS on
+    real-shaped input -- four files run through FidelityImporter -- rather
+    than from a literal copied out of cli.py, which would agree with itself
+    no matter what the importer did. 'derived+disputed' existed on the
+    importer side alone for exactly as long as it took this to redden."""
+    from importers.fidelity import FidelityImporter
+    from tests.test_fidelity_history import FIXTURE, _fixture_with_a_fractional_split
+
+    stated_text = "1 FOR 3 R/S INTO ZEPHYR EXPLORATION CO"
+    variants = [
+        # constant (name change) + derived+confirmed (the reverse split)
+        FIXTURE.read_text(encoding="utf-8"),
+        # derived+disputed: quantities changed, stated text left alone
+        _fixture_with_a_fractional_split(),
+        # derived: the stated text removed, so only one source remains
+        _fixture_with_a_fractional_split().replace(stated_text, "R/S INTO ZEPHYR EXPLORATION CO"),
+    ]
+    emitted = {
+        p.ratio_source
+        for text in variants
+        for p in FidelityImporter().parse(text).corporate_actions
+        if p.ratio_source is not None
+    }
+    assert emitted == {"constant", "derived", "derived+confirmed", "derived+disputed"}
+    assert emitted <= set(cli._RATIO_SOURCE_STRENGTH)
+    assert "None" not in cli._UNKNOWN_RATIO_SOURCE_STRENGTH

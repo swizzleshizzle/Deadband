@@ -576,6 +576,21 @@ RULE_COVERAGE_SAMPLES = [
     ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
     ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
     ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option
+    # Corporate-action rows -- History dialect only. Hand-crafted independent
+    # of tests/fixtures/fidelity/real_shape_history.csv (different fabricated
+    # company, CUSIP scheme, and #REOR base) rather than copied from it, same
+    # convention as every other sample above -- a copy would move in lockstep
+    # with the fixture and stop cross-checking it. All values fabricated.
+    ("REVERSE SPLIT R/S TO ACME000009#REOR B1234567890002 ACME HOLDINGS "
+     "CORP COM (ACME000010) (Cash)", ""),  # reverse_split
+    ("NAME CHANGED N/C TO ACME000011#REOR B1234567890102 ACME RENAMED "
+     "INDUSTRIES INC COM (ACME000012) (Cash)", ""),  # name_change
+    ("MERGER MER PAYOUT #REOR B1234567890200 ACME LEGACY HOLDINGS CORP "
+     "COM (ACME000013) (Cash)", ""),  # merger
+    ("DISTRIBUTION SPINOFF FROM:(AAA ) ACME SPINCO NEW WTS EXP "
+     "06/30/2027 (Cash)", "AAAWS"),  # spinoff_distribution
+    ("IN LIEU OF FRX SHARE FRACTIONAL PAYOUT ACME000009 ACME HOLDINGS "
+     "CORP COM (Cash)", "AAA"),  # cash_in_lieu
 ]
 
 
@@ -1071,4 +1086,5 @@ def test_every_outcome_member_has_a_dispatch_branch():
             Outcome.INTERNAL,
             Outcome.EXPIRY,
             Outcome.UNSUPPORTED,
+            Outcome.CORPORATE_ACTION,
         }
