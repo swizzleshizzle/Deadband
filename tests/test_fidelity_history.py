@@ -765,3 +765,92 @@ def test_a_row_merely_containing_corr_is_not_a_correction():
         "an ordinary trade keeps its own Run Date -- it is not a correction "
         "to be re-dated to the as-of it happens to carry"
     )
+
+
+# --- Fix round 1: two ways the matcher could still fail OPEN ---------------
+#
+# Both were found by review, not by the tests above, and both end in a
+# duplicated or vanished fill rather than a refusal -- which is the one
+# outcome D4 does not allow. The four rows of the cluster fixture are
+# recombined by hand here rather than given fixtures of their own: what is
+# under test is the MATCHER's arithmetic on leg combinations, and a file per
+# combination would put four near-identical CSVs in the tree with the real
+# distinction buried in a money column.
+
+
+def _cluster_rows() -> tuple[str, str, str, str, str]:
+    """(header, correction, cancel, sell, original) from the shipped cluster
+    fixture, in the file's own row order."""
+    lines = _read_fixture("amendment_cluster.csv").splitlines()
+    header, correction, cancel, sell, original = lines
+    assert "CORRECTED CONFIRM" in correction and "CANCELLED TRADE" in cancel
+    return header, correction, cancel, sell, original
+
+
+def test_one_correction_cannot_be_consumed_by_two_cancels():
+    """Cancels are keyed on the FULL (symbol, as-of, |quantity|, price)
+    tuple; corrections on (symbol, as-of) alone. Two cancels differing only
+    in price are therefore two distinct cancel entries that each look up the
+    SAME correction, each see exactly one of it, and each net -- consuming
+    one correction twice and deleting a second, unrelated original outright.
+
+    Uniqueness inside each leg's own bucket is not uniqueness ACROSS the
+    cancels competing for one correction, and the tell that the guard is
+    missing is two netting notes naming the same correction line. Four
+    money-carrying rows collapsed to one fill here, with nothing blocking.
+    """
+    header, correction, cancel, sell, original = _cluster_rows()
+    # A second, independent pair on the same symbol and as-of date, at a
+    # different price. Fabricated, like every other figure in this file.
+    original_2 = original.replace(
+        ",2.5,1,0.65,0.12,,-250.77,903.11,", ",3.5,1,0.65,0.12,,-350.77,553.11,"
+    )
+    cancel_2 = cancel.replace(
+        ",2.5,-1,0.65,-0.12,,250.77,1628.21,", ",3.5,-1,0.65,-0.12,,350.77,1978.98,"
+    )
+    assert original_2 != original and cancel_2 != cancel, "the price edit must have applied"
+    text = (
+        "\n".join([header, correction, cancel, cancel_2, sell, original, original_2]) + "\n"
+    )
+
+    batch = FidelityImporter().parse(text)
+
+    assert not [w for w in batch.warnings if w.startswith("netted an amendment cluster")], (
+        "ambiguous across cancels is still ambiguous -- nothing may net"
+    )
+    assert [m for _, m in batch.blocking if "CANCEL" in m], "the cancels must block"
+    assert [m for _, m in batch.blocking if "CORRECTED CONFIRM" in m], (
+        "and so must the correction they could not agree on"
+    )
+    # Nothing was deleted: both originals and the sell are still fills, which
+    # is what fails when one cancel nets away an original it never reversed.
+    assert len([f for f in batch.fills if f.side is Side.BUY]) == 2
+    assert len([f for f in batch.fills if f.side is Side.SELL]) == 1
+
+
+def test_a_correction_with_no_cancel_blocks_instead_of_duplicating():
+    """The third degrade-to-blocking case, and the only one that used to fail
+    OPEN rather than closed.
+
+    An unplaced CANCEL or original falls through to the unmapped path, which
+    blocks on its own. A CORRECTED CONFIRM does not: it leads with
+    "YOU BOUGHT", so the dedicated trade branch claims it before classify()
+    is ever consulted and emits a fill. A lone correction therefore produced
+    a SECOND fill for the trade it exists to restate -- three fills, zero
+    warnings, zero blocking, and no way for a human to know.
+
+    This is the exact defect the whole task was written to close, surviving
+    in the one arrangement the netting pass declines to act on.
+    """
+    header, correction, cancel, sell, original = _cluster_rows()
+    text = "\n".join([header, correction, sell, original]) + "\n"
+
+    batch = FidelityImporter().parse(text)
+
+    assert [m for _, m in batch.blocking if "CORRECTED CONFIRM" in m]
+    # The original and the sell still import; only the correction is refused.
+    assert len(batch.fills) == 2
+    assert [f for f in batch.fills if f.side is Side.BUY][0].fee == Decimal("0.77"), (
+        "the surviving buy is the ORIGINAL, at its own fee -- not the "
+        "correction masquerading as one"
+    )

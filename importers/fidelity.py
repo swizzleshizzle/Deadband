@@ -764,13 +764,23 @@ _CORRECTION_PHRASE = "CORRECTED CONFIRM"
 
 @dataclass(frozen=True, slots=True)
 class _AmendmentPlan:
-    """Which rows the amendment pass removes, and how it re-dates the ones it
-    keeps. Keyed by the row's line number so the main loop can consult it
-    without re-deriving anything."""
+    """Which rows the amendment pass removes, how it re-dates the ones it
+    keeps, and which amendment legs it could NOT place. Keyed by the row's
+    line number so the main loop can consult it without re-deriving
+    anything."""
 
     suppressed: frozenset[int]
     redated: dict[int, datetime]
     notes: tuple[str, ...]
+    # line_no -> why this CORRECTED CONFIRM row was not netted. A correction
+    # leads with "YOU BOUGHT", so the ordinary path for one is the dedicated
+    # trade branch, which emits a fill -- meaning an unplaced correction
+    # would silently DUPLICATE the original it was supposed to replace,
+    # with no warning and nothing blocking. It is the one amendment leg the
+    # classifier already "handles", and therefore the only one that fails
+    # open. The main loop rejects these instead (D4: degrade to blocking,
+    # never to guessing).
+    unmatched: dict[int, str]
 
 
 def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
@@ -796,6 +806,15 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
     cancels: dict[tuple, list[int]] = {}
     corrections: dict[tuple, list[int]] = {}
     originals: dict[tuple, list[int]] = {}
+    # Every cancel line that could claim a given (symbol, as-of) correction
+    # bucket. Cancels are keyed on the FULL tuple and corrections on
+    # (symbol, as-of) alone, so two cancels differing only in price are two
+    # distinct `cancels` entries that both look up the SAME correction --
+    # each seeing len(correction_lines) == 1 and each netting, consuming one
+    # correction twice and deleting the second original outright. Uniqueness
+    # within a bucket does not imply uniqueness ACROSS the cancels competing
+    # for it, which is what this second index makes checkable.
+    cancel_claims: dict[tuple, list[int]] = {}
 
     for line_no, row in rows:
         action = (row.get("action") or "").strip().upper()
@@ -828,6 +847,7 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
         key = (symbol, as_of_date, abs(qty), price)
         if _CANCEL_PHRASE in action:
             cancels.setdefault(key, []).append(line_no)
+            cancel_claims.setdefault((symbol, as_of_date), []).append(line_no)
         elif _CORRECTION_PHRASE in action:
             # The correction's own quantity and price are the CORRECTED ones,
             # so it is matched on (symbol, as-of) only -- keying it on the
@@ -843,21 +863,50 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
         symbol, as_of_date, _qty, _price = key
         original_lines = originals.get(key, [])
         correction_lines = corrections.get((symbol, as_of_date), [])
-        # Every leg must be UNIQUE. An ambiguous match is treated as no match
-        # at all (D4) -- the rows fall through and block.
-        if len(cancel_lines) != 1 or len(original_lines) != 1 or len(correction_lines) != 1:
+        # Every leg must be UNIQUE, and the correction must be claimed by
+        # exactly ONE cancel -- `cancel_claims` is that last condition, and
+        # without it two cancels at different prices each net against the
+        # same correction (see its comment above). An ambiguous match in any
+        # direction is treated as no match at all (D4) -- the rows fall
+        # through and block.
+        if (
+            len(cancel_lines) != 1
+            or len(original_lines) != 1
+            or len(correction_lines) != 1
+            or len(cancel_claims.get((symbol, as_of_date), [])) != 1
+        ):
             continue
         cancel_line, original_line = cancel_lines[0], original_lines[0]
         correction_line = correction_lines[0]
         suppressed.update({cancel_line, original_line})
         redated[correction_line] = datetime.combine(as_of_date, time.min, tzinfo=UTC)
+        # "netted" appears in this message and deliberately NOWHERE else in
+        # the module -- the refusal message below is worded to avoid it, so
+        # that scanning warnings for the word cannot mistake a refusal for a
+        # netting (it did: "not netted" matched, and a test read it as one).
         notes.append(
             f"netted an amendment cluster on {symbol}: lines {original_line} "
             f"(original) and {cancel_line} (cancel) suppressed; line "
             f"{correction_line} (correction) dated to {as_of_date.isoformat()}"
         )
 
-    return _AmendmentPlan(frozenset(suppressed), redated, tuple(notes))
+    # Every correction the loop above did not place. See
+    # _AmendmentPlan.unmatched for why this one leg cannot simply be left to
+    # the ordinary paths the way an unplaced cancel or original can.
+    unmatched = {
+        line_no: (
+            f"CORRECTED CONFIRM as of {as_of_date.isoformat()} on "
+            f"{symbol or '(no symbol)'} matched no unique cancelled original "
+            "-- the amendment pass declined to act, and this row is not "
+            "imported as an ordinary trade, which would duplicate the fill "
+            "it was issued to correct"
+        )
+        for (symbol, as_of_date), correction_lines in corrections.items()
+        for line_no in correction_lines
+        if line_no not in redated
+    }
+
+    return _AmendmentPlan(frozenset(suppressed), redated, tuple(notes), unmatched)
 
 
 class FidelityImporter:
@@ -1176,6 +1225,23 @@ class FidelityImporter:
             # cluster this was built from. Rows outside a netting keep their
             # Run Date, which is what `when` already holds.
             when = plan.redated.get(line_no, when)
+
+            # A CORRECTED CONFIRM row the amendment pass could not place.
+            # Unlike an unplaced cancel (which no rule matches, so it falls
+            # through to the unmapped path and blocks on its own), a
+            # correction leads with "YOU BOUGHT" and would be taken by the
+            # dedicated trade branch below -- emitting a second fill for the
+            # trade it exists to RESTATE, with nothing said. Routed through
+            # reject() rather than appended to `blocking` directly, so it
+            # shares the one path every other dropped row uses (see
+            # reject()'s docstring): a correction carries a quantity, so in
+            # practice this always blocks, but a hypothetical one carrying
+            # no money warns instead of refusing, exactly as every other
+            # unmapped row does.
+            unmatched_reason = plan.unmatched.get(line_no)
+            if unmatched_reason is not None:
+                reject(row, raw_row, account, line_no, f"line {line_no}: {unmatched_reason}")
+                continue
 
             # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction
             # comes from the action text and the sign is corroboration, which
