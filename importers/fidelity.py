@@ -192,6 +192,12 @@ RULES: tuple[Rule, ...] = (
     Rule("merger", "MERGER", Outcome.CORPORATE_ACTION),
     Rule("spinoff_distribution", "DISTRIBUTION SPINOFF", Outcome.CORPORATE_ACTION),
     Rule("cash_in_lieu", "IN LIEU OF", Outcome.CORPORATE_ACTION),
+    # ORDERING IS LOAD-BEARING HERE, unlike the corporate-action block above:
+    # classify() is startswith + first-match-wins and "DISTRIBUTION" is a
+    # proper prefix of "DISTRIBUTION SPINOFF". This rule MUST stay after
+    # spinoff_distribution -- placed before it, every spinoff in every export
+    # silently reclassifies as a share distribution.
+    Rule("share_distribution", "DISTRIBUTION", Outcome.CORPORATE_ACTION),
     Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
     Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
     Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),
@@ -356,6 +362,7 @@ _KIND_BY_RULE_NAME: dict[str, str] = {
     "name_change": "name_change",
     "merger": "merger",
     "spinoff_distribution": "spinoff",
+    "share_distribution": "split",
 }
 
 # Group shapes from spec §5/§1: two legs for a reverse split and a name
@@ -367,6 +374,9 @@ _EXPECTED_LEG_COUNT: dict[str, int] = {
     "name_change": 2,
     "merger": 3,
     "spinoff": 1,
+    # One row: the shares received. There is no second leg -- the holding it
+    # was received on is in the ledger, not in the file.
+    "split": 1,
 }
 
 
@@ -387,6 +397,10 @@ class _CorporateActionRow:
     # The parent ticker a spinoff row states -- see _SPINOFF_PARENT_RE. None
     # for every other kind, and for a spinoff row that states none.
     parent_symbol: str | None = None
+    # The row's own Symbol column, carried through for a share_distribution
+    # row -- see CorporateActionProposal.subject_symbol. None for every
+    # other kind.
+    subject_symbol: str | None = None
 
 
 def _group_corporate_actions(
@@ -446,6 +460,11 @@ def _group_corporate_actions(
         # A spinoff's group is a single row, so "the group's parent" is that
         # row's own stated parent; the other kinds never carry one.
         parent_symbol = next((r.parent_symbol for r in group_rows if r.parent_symbol), None)
+        # Likewise, a share distribution's group is a single row -- its own
+        # Symbol column, carried the same way parent_symbol is above.
+        subject_symbol = next(
+            (r.subject_symbol for r in group_rows if r.subject_symbol), None
+        )
         proposals.append(
             CorporateActionProposal(
                 kind=kind,
@@ -459,6 +478,7 @@ def _group_corporate_actions(
                 approximate=approximate,
                 stated_ratio=stated_ratio,
                 parent_symbol=parent_symbol,
+                subject_symbol=subject_symbol,
                 group_ref=key[1] if key[0] == "reor" else None,
             )
         )
@@ -1150,6 +1170,21 @@ class FidelityImporter:
                     )
                     continue
 
+                # D5: only a positive quantity makes a plain DISTRIBUTION a
+                # SHARE distribution. A zero-quantity one has never been
+                # observed; treat it as unmapped so it blocks and is looked
+                # at, rather than proposing a split derived from no shares.
+                if rule.name == "share_distribution" and quantity <= 0:
+                    reject(
+                        row,
+                        raw_row,
+                        account,
+                        line_no,
+                        f"line {line_no}: DISTRIBUTION with no positive quantity "
+                        f"({quantity}) -- not a share distribution; see gap for D5",
+                    )
+                    continue
+
                 reor_ref, paren_cusips = _parse_reor(action)
                 if reor_ref:
                     group_key = ("reor", _reor_base(reor_ref))
@@ -1176,6 +1211,9 @@ class FidelityImporter:
                 # _SPINOFF_PARENT_RE); asking for one anywhere else would
                 # read a "FROM:(...)" that means something different.
                 parent_symbol = _parse_spinoff_parent(action) if kind == "spinoff" else None
+                # Only a share_distribution row's subject is its OWN Symbol
+                # column -- see CorporateActionProposal.subject_symbol.
+                subject_symbol = symbol or None if rule.name == "share_distribution" else None
 
                 corporate_action_rows.append(
                     _CorporateActionRow(
@@ -1188,6 +1226,7 @@ class FidelityImporter:
                         row_cusip=row_cusip,
                         group_key=group_key,
                         parent_symbol=parent_symbol,
+                        subject_symbol=subject_symbol,
                     )
                 )
                 continue

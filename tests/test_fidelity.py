@@ -593,6 +593,11 @@ RULE_COVERAGE_SAMPLES = [
      "06/30/2027 (Cash)", "AAAWS"),  # spinoff_distribution
     ("IN LIEU OF FRX SHARE FRACTIONAL PAYOUT ACME000009 ACME HOLDINGS "
      "CORP COM (Cash)", "AAA"),  # cash_in_lieu
+    # Deliberately NOT "DISTRIBUTION SPINOFF ..." -- that would match
+    # spinoff_distribution first and prove nothing about this rule's own
+    # reachability, which is the whole point of the ordering guard in
+    # importers/fidelity.py's RULES comment.
+    ("DISTRIBUTION ACME HOLDINGS SPON ADS EA... (ACME) (Cash)", "ACME"),  # share_distribution
 ]
 
 

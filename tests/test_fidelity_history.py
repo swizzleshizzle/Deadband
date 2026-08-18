@@ -6,8 +6,10 @@ See tests/fixtures/fidelity/real_shape_history.csv for the fixture's shape:
 a BOM, two blank preamble lines, the header on line 3, a trailing legal
 disclaimer block -- and, unique to this file, the corporate-action row
 shapes: a reverse split and a name change as FROM/TO pairs, a three-row
-merger, a single-row spinoff distribution, and a cash-in-lieu-of-fractional-
-shares row. All values are fabricated.
+merger, a single-row spinoff distribution, a cash-in-lieu-of-fractional-
+shares row, and -- since Task 2 (importer-blocking-verbs) -- a plain
+single-row DISTRIBUTION (a share distribution, proposed as a "split"). All
+values are fabricated.
 
 The `#REOR` reorganisation reference scheme, verified against the real
 exports (not invented -- spec §5 forbids guessing at a format): a
@@ -104,12 +106,13 @@ def test_corporate_action_rows_produce_exactly_the_ordinary_rows_worth_of_output
     Asserted instead on the EXACT count the fixture's four ordinary rows (one
     BUY, one dividend, and -- since Task 1 -- one retirement rollover deposit
     and one early-distribution withdrawal) produce: one fill, three cash
-    movements. The other nine rows -- the reverse split pair, the
-    name-change pair, the three-row merger, the spinoff, and the
-    cash-in-lieu row -- are recognised and deferred, not recorded. A count
-    is falsifiable in both directions: it fails if a corporate-action row
-    starts producing a fill or cash movement, and it fails if the ordinary
-    rows stop producing theirs."""
+    movements. The other ten rows -- the reverse split pair, the
+    name-change pair, the three-row merger, the spinoff, the cash-in-lieu
+    row, and -- since Task 2 -- the plain DISTRIBUTION share-distribution
+    row -- are recognised and deferred, not recorded. A count is falsifiable
+    in both directions: it fails if a corporate-action row starts producing
+    a fill or cash movement, and it fails if the ordinary rows stop
+    producing theirs."""
     batch = _batch()
     assert len(batch.fills) == 1
     assert len(batch.cash) == 3
@@ -140,9 +143,13 @@ def test_reor_base_matches_the_verified_docstring_examples():
 
 def test_each_reorganisation_becomes_one_proposal():
     """Grouping is on the venue's own #REOR reference -- Fidelity stating which
-    rows are one event -- not on inference from date and CUSIP."""
+    rows are one event -- not on inference from date and CUSIP.
+
+    Five kinds, not four, since Task 2 (importer-blocking-verbs): the
+    fixture's plain DISTRIBUTION row (no #REOR token, grouped by the
+    (ex-date, symbol) fallback key) now also proposes a "split"."""
     kinds = [p.kind for p in _batch().corporate_actions]
-    assert sorted(kinds) == ["merger", "name_change", "reverse_split", "spinoff"]
+    assert sorted(kinds) == ["merger", "name_change", "reverse_split", "spinoff", "split"]
 
 
 def test_the_three_row_merger_is_one_proposal_not_three():
@@ -308,6 +315,75 @@ def test_only_a_spinoff_carries_a_parent_ticker():
     for proposal in _batch().corporate_actions:
         if proposal.kind != "spinoff":
             assert proposal.parent_symbol is None
+
+
+# --- Task 2: a plain DISTRIBUTION is a share distribution ------------------
+
+
+def test_a_plain_distribution_is_proposed_as_a_split():
+    """A DISTRIBUTION with no SPINOFF marker delivers SHARES, not money --
+    the export's Amount column on this row is the market value of the shares
+    received, verified against the real exports by cash-balance continuity.
+    So it belongs to the split family, and the ratio is NOT derivable from
+    the row: the row states what was received, never what it was received
+    on. cli completes that from the ledger (Task 3)."""
+    batch = _batch()
+    splits = [p for p in batch.corporate_actions if p.kind == "split"]
+    assert len(splits) == 1
+    p = splits[0]
+    assert p.ex_date == date(2026, 3, 6)
+    assert p.quantities == (Decimal("40"),)
+    assert p.ratio is None, "not derivable from the row alone"
+    assert p.subject_symbol == "ZXDS"
+    assert not [m for _, m in batch.blocking if "DISTRIBUTION" in m]
+
+
+def test_a_spinoff_is_still_a_spinoff_not_a_share_distribution():
+    """Ordering guard. classify() is startswith + first-match-wins and
+    "DISTRIBUTION" is a proper prefix of "DISTRIBUTION SPINOFF", so a
+    share_distribution rule placed BEFORE spinoff_distribution silently
+    reclassifies every spinoff in every export. This is unlike the existing
+    corporate-action block, whose comment records that its position in RULES
+    is not load-bearing -- that comment does not cover this rule."""
+    batch = _batch()
+    kinds = [p.kind for p in batch.corporate_actions]
+    assert "spinoff" in kinds
+    assert kinds.count("split") == 1
+
+
+def test_a_distribution_with_no_quantity_still_blocks():
+    """D5. A DISTRIBUTION carrying zero quantity has never been observed in
+    the real exports, and proposing a split derived from no shares would be
+    a guess dressed as a derivation. Two observed rows is thin evidence to
+    generalise a verb from; this guard is what keeps the generalisation
+    honest.
+
+    Asserts the SPECIFIC reject message the D5 guard itself produces, not a
+    looser "mentions DISTRIBUTION or the date" check -- the looser form would
+    pass on any blocking message that merely mentions the verb, including one
+    produced by an unrelated row, so it could pass while the guard did
+    nothing.
+
+    The extra row is joined onto the fixture text without leaving a blank
+    CSV line: the fixture (unlike a hand-written one) does not end in a
+    trailing newline, so `.rstrip("\\n")` before appending "\\n" + the row
+    keeps the join from producing an empty row, which would otherwise yield
+    an extra unmapped warning and perturb the very counts this test reads.
+    """
+    extra_row = (
+        "03/07/2026,DISTRIBUTION ZXDS HOLDINGS SPON ADS EA... (ZXDS) (Cash),"
+        "ZXDS,ZXDS HOLDINGS SPON ADS EACH REP 1 ORD SHS,Cash,,0,,,,25,3903.55,"
+    )
+    base = FIXTURE.read_text(encoding="utf-8")
+    text = base.rstrip("\n") + "\n" + extra_row + "\n"
+    # The fixture's own disclaimer block already contains blank lines
+    # (paragraph breaks) -- a blanket "no blank line anywhere" check would
+    # be wrong. What must hold is that THIS join introduces no NEW one.
+    assert text.count("\n\n") == base.count("\n\n"), "join must not introduce a blank CSV line"
+
+    batch = FidelityImporter().parse(text)
+    assert len([p for p in batch.corporate_actions if p.kind == "split"]) == 1
+    assert any("no positive quantity" in m for _, m in batch.blocking)
 
 
 # --- Task 3: derivation --------------------------------------------------
