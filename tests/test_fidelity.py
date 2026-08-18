@@ -573,6 +573,8 @@ RULE_COVERAGE_SAMPLES = [
     ("CO CONTR 2026 Q1", ""),  # employer_contribution
     ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
     ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+    ("ROLLOVER CASH CHECK RECEIVED IRA DIR ROLOVR (Cash)", ""),  # rollover_deposit
+    ("EARLY DIST NO EXCEPT VS AAA00-000000-0 CASH (Cash)", ""),  # early_distribution
     ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
     ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
     ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option

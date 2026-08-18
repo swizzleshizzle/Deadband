@@ -188,16 +188,27 @@ def test_every_rule_is_exercised_by_a_fixture_row():
     would force inventing rows this dialect structurally cannot emit. Their
     coverage lives in tests/test_fidelity_history.py's
     real_shape_history.csv instead, asserted below in
-    test_corporate_action_rules_are_exercised_by_the_history_fixture."""
+    test_corporate_action_rules_are_exercised_by_the_history_fixture.
+
+    `rollover_deposit` and `early_distribution` (Task 1, importer-blocking-
+    verbs) are excluded by name for the identical reason, also verified
+    rather than assumed: every real occurrence found across the owner's
+    exports (three ROLLOVER CASH CHECK rows, one EARLY DIST row) is in a
+    file named `History_for_Account_*` -- none in this fixture's Activity &
+    Orders shape. Their coverage lives in real_shape_history.csv too,
+    asserted below in
+    test_retirement_cash_rules_are_exercised_by_the_history_fixture."""
     matched = set()
     for row in _data_rows():
         rule = classify(row["Action"], row["Symbol"])
         if rule is not None:
             matched.add(rule.name)
+    _history_dialect_only_cash_rules = {"rollover_deposit", "early_distribution"}
     required = {
         r.name
         for r in RULES
         if r.outcome not in (Outcome.UNSUPPORTED, Outcome.CORPORATE_ACTION)
+        and r.name not in _history_dialect_only_cash_rules
     }
     assert required - matched == set()
 
@@ -241,6 +252,33 @@ def test_corporate_action_rules_are_exercised_by_the_history_fixture():
         if rule is not None:
             matched.add(rule.name)
     required = {r.name for r in RULES if r.outcome is Outcome.CORPORATE_ACTION}
+    assert required - matched == set()
+
+
+def test_retirement_cash_rules_are_exercised_by_the_history_fixture():
+    """The same three-way split as the corporate-action test above, for the
+    two rules Task 1 (importer-blocking-verbs) added: `rollover_deposit` and
+    `early_distribution` resolve to Outcome.CASH, not Outcome.CORPORATE_ACTION,
+    so they are excluded from `test_every_rule_is_exercised_by_a_fixture_row`
+    above by name rather than by outcome -- but the underlying reason is
+    identical, and verified the same way: every real occurrence of either
+    verb (checked directly against the owner's own exports, not assumed) is
+    in a `History_for_Account_*` file, none in this fixture's Activity &
+    Orders shape."""
+    from tests.test_fidelity_history import FIXTURE as HISTORY_FIXTURE
+
+    text = HISTORY_FIXTURE.read_text(encoding="utf-8")
+    lines = text.lstrip("﻿").splitlines()
+    header_idx = next(i for i, line in enumerate(lines) if line.startswith("Run Date,"))
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
+    matched = set()
+    for row in reader:
+        if not _RUN_DATE_RE.match((row.get("Run Date") or "").strip()):
+            continue
+        rule = classify(row.get("Action") or "", row.get("Symbol") or "")
+        if rule is not None:
+            matched.add(rule.name)
+    required = {"rollover_deposit", "early_distribution"}
     assert required - matched == set()
 
 

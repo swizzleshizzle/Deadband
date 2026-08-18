@@ -53,6 +53,7 @@ never actually met.
 """
 
 import pathlib
+from datetime import date
 from decimal import Decimal
 
 from importers.fidelity import FidelityImporter, _reor_base
@@ -100,16 +101,18 @@ def test_corporate_action_rows_produce_exactly_the_ordinary_rows_worth_of_output
     started turning them into fills, which is exactly the regression this test
     exists to catch.
 
-    Asserted instead on the EXACT count the fixture's two ordinary rows (one
-    BUY, one dividend) produce: one fill, one cash movement. The other nine
-    rows -- the reverse split pair, the name-change pair, the three-row
-    merger, the spinoff, and the cash-in-lieu row -- are recognised and
-    deferred, not recorded. A count is falsifiable in both directions: it
-    fails if a corporate-action row starts producing a fill or cash movement,
-    and it fails if the ordinary rows stop producing theirs."""
+    Asserted instead on the EXACT count the fixture's four ordinary rows (one
+    BUY, one dividend, and -- since Task 1 -- one retirement rollover deposit
+    and one early-distribution withdrawal) produce: one fill, three cash
+    movements. The other nine rows -- the reverse split pair, the
+    name-change pair, the three-row merger, the spinoff, and the
+    cash-in-lieu row -- are recognised and deferred, not recorded. A count
+    is falsifiable in both directions: it fails if a corporate-action row
+    starts producing a fill or cash movement, and it fails if the ordinary
+    rows stop producing theirs."""
     batch = _batch()
     assert len(batch.fills) == 1
-    assert len(batch.cash) == 1
+    assert len(batch.cash) == 3
 
     fill = batch.fills[0]
     assert fill.instrument.symbol == "ZXCO"
@@ -526,6 +529,31 @@ def test_a_zero_over_zero_stated_ratio_does_not_crash_the_parse():
     # usable, so the two disagree -- reported, not crashed, and not rounded.
     assert split.ratio == (Decimal(1), Decimal(3))
     assert split.ratio_source == "derived+disputed"
+
+
+def test_a_rollover_cash_check_is_a_deposit():
+    """A retirement rollover is cash arriving from outside the ledger. It
+    carries a zero quantity and a real amount, which is exactly the shape
+    that blocks an import while unmapped -- three such rows across the real
+    exports are why two accounts could not be imported."""
+    batch = _batch()
+    deposits = [c for c in batch.cash if c.kind == "deposit" and c.amount == Decimal("1500")]
+    assert len(deposits) == 1
+    assert deposits[0].occurred_at.date() == date(2026, 3, 4)
+    assert not [m for _, m in batch.blocking if "ROLLOVER" in m]
+
+
+def test_an_early_distribution_is_a_withdrawal():
+    """Money leaving a retirement account. Recorded as a positive amount
+    under an outflow kind -- see importers.base.OUTFLOW_KINDS, which is why
+    the export's own negative sign must NOT leak through."""
+    batch = _batch()
+    withdrawals = [
+        c for c in batch.cash if c.kind == "withdrawal" and c.amount == Decimal("500")
+    ]
+    assert len(withdrawals) == 1
+    assert withdrawals[0].amount > 0, "OUTFLOW_KINDS amounts are always positive"
+    assert not [m for _, m in batch.blocking if "EARLY DIST" in m]
 
 
 def test_a_non_finite_corporate_action_quantity_warns_instead_of_crashing():

@@ -209,6 +209,18 @@ RULES: tuple[Rule, ...] = (
     Rule("employer_contribution", "CO CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("participant_contribution", "PARTIC CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("contributions", "CONTRIBUTIONS", Outcome.CASH, cash_kind="deposit"),
+    # Retirement cash flows. D1: these map to the GENERIC kinds, not to
+    # retirement-specific ones -- cash_movement.kind is a CHECK constraint
+    # with no retirement value in it, and the four contribution rules above
+    # already collapse the same way. A later tax-reporting feature wanting
+    # the distinction back recovers it from the note.
+    #
+    # The verb is "ROLLOVER CASH CHECK", not the shorter "ROLLOVER": both
+    # observed variants (one carries a trailing MOBILE DEPOSIT) share that
+    # prefix, and the narrower one does not speculate about ROLLOVER verbs
+    # the exports have never shown.
+    Rule("rollover_deposit", "ROLLOVER CASH CHECK", Outcome.CASH, cash_kind="deposit"),
+    Rule("early_distribution", "EARLY DIST", Outcome.CASH, cash_kind="withdrawal"),
     Rule("expired_option", "EXPIRED", Outcome.EXPIRY),
     Rule("assigned_option", "ASSIGNED", Outcome.UNSUPPORTED),
     Rule("exercised_option", "EXERCISED", Outcome.UNSUPPORTED),
