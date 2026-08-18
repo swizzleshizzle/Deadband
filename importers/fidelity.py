@@ -7,7 +7,7 @@ import enum
 import io
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 
 from importers.base import (
@@ -745,6 +745,121 @@ def _locate_header(text: str) -> tuple[list[str], int]:
     return lines, 0
 
 
+# All 45 date-bearing `as of` tokens across the real exports are ISO
+# YYYY-MM-DD; none is the MM/DD/YYYY the Run Date column uses. (The phrase
+# occurs 56 times in all; the other 11 are disclaimer prose -- "as of the
+# date it ..." -- and carry no date at all, which is why this pattern
+# requires the date rather than merely the words.) Strict on purpose -- an
+# unparsable as-of date means the row is not netted and keeps blocking (D4),
+# which is safer than guessing a format the venue has never emitted.
+_AS_OF_RE = re.compile(r"\bAS OF\s+(\d{4}-\d{2}-\d{2})\b")
+
+# Anchored on the two-word phrases, NOT on bare `CXL`/`CORR` tokens. Action
+# text carries the security name with its ticker in parentheses, so a bare
+# three- or four-letter token can collide with a real ticker and net an
+# ordinary trade out of existence. The phrases cannot.
+_CANCEL_PHRASE = "CANCELLED TRADE"
+_CORRECTION_PHRASE = "CORRECTED CONFIRM"
+
+
+@dataclass(frozen=True, slots=True)
+class _AmendmentPlan:
+    """Which rows the amendment pass removes, and how it re-dates the ones it
+    keeps. Keyed by the row's line number so the main loop can consult it
+    without re-deriving anything."""
+
+    suppressed: frozenset[int]
+    redated: dict[int, datetime]
+    notes: tuple[str, ...]
+
+
+def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
+    """Net original -> cancel -> correction clusters down to the correction,
+    dated to its as-of date (spec D3).
+
+    A complete chain is: an original whose (symbol, date, |quantity|, price)
+    matches a cancel's as-of tuple; and a correction sharing that cancel's
+    (symbol, as-of date). Every match must be UNIQUE -- an ambiguous one is
+    treated as no match at all.
+
+    Anything incomplete or ambiguous is left entirely alone, so its rows
+    reach the ordinary paths and, being unmapped and money-carrying, block
+    (D4). This matcher is fitted to a single real cluster; refusing to act is
+    the failure mode it is allowed to have.
+
+    `rows` carries NORMALIZED field names (the same {_normalize_field(k): v}
+    mapping the row loop reads), not the raw header spellings -- a real
+    export writes "Price ($)", and reading the raw key here would silently
+    see every price as absent and match originals to cancels on a shared
+    Decimal("0").
+    """
+    cancels: dict[tuple, list[int]] = {}
+    corrections: dict[tuple, list[int]] = {}
+    originals: dict[tuple, list[int]] = {}
+
+    for line_no, row in rows:
+        action = (row.get("action") or "").strip().upper()
+        symbol = (row.get("symbol") or "").strip()
+        try:
+            qty = _decimal(row.get("quantity"))
+            price = _decimal(row.get("price"))
+        except InvalidOperation:
+            continue                      # not nettable; the ordinary paths handle it
+        if not (qty.is_finite() and price.is_finite()):
+            continue
+
+        as_of = _AS_OF_RE.search(action)
+        if as_of is None:
+            # A candidate ORIGINAL is dated by its own Run Date, and carries
+            # no as-of marker at all -- that is what distinguishes it from
+            # the two amendment legs.
+            try:
+                when = datetime.strptime(
+                    (row.get("run date") or "").strip(), "%m/%d/%Y"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if action.startswith("YOU BOUGHT") or action.startswith("YOU SOLD"):
+                key = (symbol, when.date(), abs(qty), price)
+                originals.setdefault(key, []).append(line_no)
+            continue
+
+        as_of_date = date.fromisoformat(as_of.group(1))
+        key = (symbol, as_of_date, abs(qty), price)
+        if _CANCEL_PHRASE in action:
+            cancels.setdefault(key, []).append(line_no)
+        elif _CORRECTION_PHRASE in action:
+            # The correction's own quantity and price are the CORRECTED ones,
+            # so it is matched on (symbol, as-of) only -- keying it on the
+            # full tuple would fail exactly when the correction changed one
+            # of those values, which is the case corrections exist for.
+            corrections.setdefault((symbol, as_of_date), []).append(line_no)
+
+    suppressed: set[int] = set()
+    redated: dict[int, datetime] = {}
+    notes: list[str] = []
+
+    for key, cancel_lines in cancels.items():
+        symbol, as_of_date, _qty, _price = key
+        original_lines = originals.get(key, [])
+        correction_lines = corrections.get((symbol, as_of_date), [])
+        # Every leg must be UNIQUE. An ambiguous match is treated as no match
+        # at all (D4) -- the rows fall through and block.
+        if len(cancel_lines) != 1 or len(original_lines) != 1 or len(correction_lines) != 1:
+            continue
+        cancel_line, original_line = cancel_lines[0], original_lines[0]
+        correction_line = correction_lines[0]
+        suppressed.update({cancel_line, original_line})
+        redated[correction_line] = datetime.combine(as_of_date, time.min, tzinfo=UTC)
+        notes.append(
+            f"netted an amendment cluster on {symbol}: lines {original_line} "
+            f"(original) and {cancel_line} (cancel) suppressed; line "
+            f"{correction_line} (correction) dated to {as_of_date.isoformat()}"
+        )
+
+    return _AmendmentPlan(frozenset(suppressed), redated, tuple(notes))
+
+
 class FidelityImporter:
     venue = "fidelity"
     # Equal to `venue`: see importers/base.py's Importer.account_venue
@@ -992,11 +1107,35 @@ class FidelityImporter:
             return ImportBatch()
 
         reader = csv.DictReader(io.StringIO("\n".join(data_lines)))
-        for line_no, raw_row in enumerate(reader, start=preamble_offset + 2):
-            # Normalize header casing once — a real export's header is found
-            # case-insensitively (above), so the fields must be read the same
-            # way or a differently-cased header parses to zero usable rows.
-            row = {_normalize_field(k): v for k, v in raw_row.items()}
+        # Materialised, not streamed. The amendment pass (_amendment_plan)
+        # has to see every row before the first one is turned into a fill:
+        # a correction row leads with "YOU BOUGHT", so the dedicated branch
+        # below matches it on leading text and emits a fill regardless of
+        # what classify() thinks -- the decision to suppress its cancelled
+        # siblings cannot be made row-by-row. Real exports are a few
+        # thousand rows; holding them is not a memory concern.
+        #
+        # Normalize header casing once, here rather than inside the loop — a
+        # real export's header is found case-insensitively (above), so the
+        # fields must be read the same way or a differently-cased header
+        # parses to zero usable rows, and _amendment_plan reads the same
+        # normalized names the loop does.
+        materialised: list[tuple[int, dict[str, str], dict[str, str]]] = [
+            (line_no, raw_row, {_normalize_field(k): v for k, v in raw_row.items()})
+            for line_no, raw_row in enumerate(reader, start=preamble_offset + 2)
+        ]
+        plan = _amendment_plan([(line_no, row) for line_no, _raw, row in materialised])
+        # §6: a netting that happens silently is indistinguishable from rows
+        # being dropped, so every one of them is reported.
+        warnings.extend(plan.notes)
+
+        for line_no, raw_row, row in materialised:
+            if line_no in plan.suppressed:
+                # A cancelled original, or the cancel that reversed it.
+                # The pair nets to nothing and the correction row (which is
+                # NOT suppressed) carries the surviving truth -- recording
+                # either of them alongside it double-counts one trade.
+                continue
             action = (row.get("action") or "").strip().upper()
             symbol = (row.get("symbol") or "").strip()
             # external_ref MUST be the account NUMBER, never the nickname
@@ -1029,6 +1168,14 @@ class FidelityImporter:
                 # precisely what failed.
                 reject(row, raw_row, account, line_no, f"line {line_no}: bad date ({exc})")
                 continue
+
+            # The surviving leg of a netted cluster is dated to the cluster's
+            # as-of date, not to the Run Date on which the venue re-booked
+            # it (spec D3): the trade happened on the as-of date, and the
+            # correction's own Run Date is nineteen days later in the real
+            # cluster this was built from. Rows outside a netting keep their
+            # Run Date, which is what `when` already holds.
+            when = plan.redated.get(line_no, when)
 
             # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction
             # comes from the action text and the sign is corroboration, which

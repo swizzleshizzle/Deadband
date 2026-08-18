@@ -385,6 +385,58 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     )
 
 
+# --- Amendment clusters (importer-blocking-verbs, Task 4). A Fidelity
+# --- amendment is three rows -- the original, a CANCELLED TRADE reversing
+# --- it, and a CORRECTED CONFIRM re-booking it -- whose net truth is ONE
+# --- trade. The importer used to emit the original AND the correction as two
+# --- separate buys; only the sibling cancel row (unmapped, money-carrying,
+# --- so blocking) kept that phantom contract out of the ledger, which is a
+# --- guard that vanishes the moment anyone teaches the classifier the
+# --- CANCEL verb. This is the end-to-end proof that the netting reaches the
+# --- committed rows, not just the parsed batch. ---------------------------
+
+
+async def test_import_nets_an_amendment_cluster_and_reports_it(conn, monkeypatch, capsys):
+    """Two assertions, and both matter.
+
+    The netting must be SAID: rows that disappear silently are
+    indistinguishable from rows the importer lost, and this one removes two
+    money-carrying rows from a file the user handed over.
+
+    And the ledger must end FLAT. The fixture's cluster is a buy that was
+    cancelled and re-booked, plus the real sell that closed it -- one buy and
+    one sell, so the contract is gone. Un-netted it is two buys and one sell,
+    which leaves a phantom open long contract behind: asserting the position
+    (not merely that the commit succeeded) is what distinguishes those.
+    """
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    fixture = pathlib.Path(__file__).parents[1] / "fixtures" / "fidelity" / "amendment_cluster.csv"
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=str(fixture),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    # ONE readouterr(): it drains the capture, so reading it again for the
+    # assertion below would find it empty.
+    printed = "".join(capsys.readouterr())
+    assert rc == 0, printed
+    assert "netted an amendment cluster" in printed
+
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 2
+    assert await open_positions(conn, acc) == (), (
+        "one buy and one sell close the contract -- an un-netted import "
+        "leaves a second, phantom buy open"
+    )
+
+
 # --- Task 5: `deadband sync coinbase` must reuse this exact venue-match/
 # --- routing check, not a parallel copy of it -- and the check must not
 # --- mistake the PARSING importer's own identity ("coinbase-api") for the

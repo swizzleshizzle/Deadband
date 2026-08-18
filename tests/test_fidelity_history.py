@@ -61,7 +61,12 @@ from decimal import Decimal
 from importers.fidelity import FidelityImporter, _reor_base
 from ledger.types import Side
 
-FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "fidelity" / "real_shape_history.csv"
+_FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures" / "fidelity"
+FIXTURE = _FIXTURE_DIR / "real_shape_history.csv"
+
+
+def _read_fixture(name: str) -> str:
+    return (_FIXTURE_DIR / name).read_text(encoding="utf-8")
 
 
 def _batch():
@@ -653,3 +658,110 @@ def test_a_non_finite_corporate_action_quantity_warns_instead_of_crashing():
     # The rest of the file is unaffected -- one bad row, not one bad import.
     assert any(p.kind == "merger" for p in batch.corporate_actions)
     assert batch.blocking == ()
+
+
+# --- Task 4: broker amendment clusters ------------------------------------
+#
+# A Fidelity amendment is THREE rows: the original trade, a `BUY CANCEL ...
+# CANCELLED TRADE as of <date>` reversing it, and a `YOU BOUGHT ...
+# CORRECTED CONFIRM as of <date>` re-booking it with the corrected figures.
+# The net truth is ONE trade, on the as-of date, at the corrected fee.
+#
+# tests/fixtures/fidelity/amendment_cluster.csv holds that cluster plus the
+# real closing sell that falls chronologically BETWEEN the original and its
+# two amendment legs -- the ordering hazard is not reproducible without it,
+# since the amendment legs carry a Run Date nineteen days after the trade
+# they amend.
+#
+# Every figure in that fixture is fabricated. The brief's own draft values
+# were not: its prices, amounts and cash balances matched a real cluster in
+# the (gitignored) imports/ directory field-for-field, so they were replaced
+# with invented ones that appear nowhere in it. See the task report.
+
+
+def test_an_amendment_cluster_nets_to_one_fill():
+    """Original -> cancel -> correction is ONE buy, at the corrected fee, on
+    the as-of date. Asserting the FILL COUNT is the point: before this
+    existed the importer emitted a third fill for this contract, because
+    classify() returns None for the CORR row but the dedicated YOU BOUGHT
+    branch matched it anyway. A test that only asserted the import stops
+    refusing would pass while the duplicate persisted."""
+    batch = FidelityImporter().parse(_read_fixture("amendment_cluster.csv"))
+    buys = [f for f in batch.fills if f.side is Side.BUY]
+    sells = [f for f in batch.fills if f.side is Side.SELL]
+    assert len(buys) == 1, "the cancelled original and its cancel both vanish"
+    assert len(sells) == 1
+    assert buys[0].executed_at.date() == date(2026, 1, 2), "dated to the as-of, not the run date"
+    assert buys[0].fee == Decimal("0.68"), "0.65 commission + the CORRECTED 0.03"
+    assert not batch.blocking
+
+
+def test_a_netting_is_reported():
+    """A netting that happens silently is indistinguishable from rows being
+    dropped."""
+    batch = FidelityImporter().parse(_read_fixture("amendment_cluster.csv"))
+    assert any("netted" in w.lower() for w in batch.warnings)
+
+
+def test_a_cancel_with_no_matching_original_is_not_netted():
+    """D4: degrade to blocking, never to guessing. The matcher is fitted to a
+    single real cluster, so refusing to act is the failure mode it is allowed
+    to have."""
+    lines = _read_fixture("amendment_cluster.csv").splitlines()
+    header, rows = lines[0], lines[1:]
+    # drop the original (last row) -- the cancel now matches nothing
+    text = "\n".join([header] + rows[:-1]) + "\n"
+    batch = FidelityImporter().parse(text)
+    assert any("CANCEL" in m for _, m in batch.blocking)
+
+
+def test_an_ambiguous_match_is_not_netted():
+    """Two identical originals mean the cancel cannot say which it reverses.
+    Ambiguous is treated as no match."""
+    lines = _read_fixture("amendment_cluster.csv").splitlines()
+    text = "\n".join(lines + [lines[-1]]) + "\n"   # duplicate the original
+    batch = FidelityImporter().parse(text)
+    assert any("CANCEL" in m for _, m in batch.blocking)
+
+
+# The action text carries the security's NAME, not just its symbol, so a bare
+# `CORR` substring test would fire on any holding whose name happens to
+# contain those four letters -- CORRIDOR, CORRECTIONS, CorEnergy's own
+# `CORR` ticker. The real exports already carry ordinary option trades with
+# an `as of` token (as well as REINVESTMENT, FEE CHARGED and DIVIDEND
+# RECEIVED rows with one), so "carries an as-of" is nowhere near enough to
+# identify an amendment leg on its own: only the two-word phrase is.
+#
+# This is the one hazard no other test in this file can see, because it costs
+# nothing while no such name is held -- and then silently suppresses a real
+# original the first time one is. Under a bare-`CORR` match the decoy below
+# is mistaken for the cluster's missing correction, the cancel and the
+# original are both suppressed, and the import stops complaining about a
+# cancel it never reconciled.
+
+
+def test_a_row_merely_containing_corr_is_not_a_correction():
+    lines = _read_fixture("amendment_cluster.csv").splitlines()
+    header, rows = lines[0], lines[1:]
+    decoy = (
+        "01/16/2026,YOU BOUGHT OPENING TRANSACTION CALL (ZXCO) ZXCO CORRIDOR "
+        "TRUST JAN 10 26 $300 (100 SHS) (Cash) as of 2026-01-02,"
+        "-ZXCO260110C300,CALL (ZXCO) ZXCO CORRIDOR TRUST JAN 10 26 $300 "
+        "(100 SHS),Cash,3.15,2,0.65,0.04,,-630.69,746.75,01/20/2026"
+    )
+    assert "CORR" in decoy and "CORRECTED CONFIRM" not in decoy
+    # rows[1:] drops the genuine correction, so the only row left that
+    # contains "CORR" is the decoy.
+    text = "\n".join([header] + rows[1:] + [decoy]) + "\n"
+
+    batch = FidelityImporter().parse(text)
+    assert any("CANCEL" in m for _, m in batch.blocking), (
+        "with no genuine correction the cluster must not net, and its cancel "
+        "must keep blocking"
+    )
+    decoy_fills = [f for f in batch.fills if f.quantity == Decimal("2")]
+    assert len(decoy_fills) == 1
+    assert decoy_fills[0].executed_at.date() == date(2026, 1, 16), (
+        "an ordinary trade keeps its own Run Date -- it is not a correction "
+        "to be re-dated to the as-of it happens to carry"
+    )
