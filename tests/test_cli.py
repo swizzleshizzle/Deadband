@@ -430,14 +430,16 @@ def test_every_corporate_kind_maps_to_a_real_action_type():
 
 def test_the_commit_paths_two_printing_passes_cover_every_kind_exactly_once():
     """The commit path prints proposals in two passes: EARLY with
-    `_NON_LEDGER_KINDS`, LATE with `{"spinoff"}`. Nothing tied those two
-    sets to the full one, so a sixth kind added to importers/ would render
-    in preview (which passes every kind) and be SILENTLY DROPPED from the
+    `_NON_LEDGER_KINDS`, LATE with `{"spinoff", "split"}` (Task 3 added
+    split to the LATE set alongside spinoff -- both need this import's own
+    fills to have been committed, see _COMPLETERS). Nothing tied those two
+    sets to the full one, so a kind added to importers/ would render in
+    preview (which passes every kind) and be SILENTLY DROPPED from the
     commit path -- present in one output, absent from the other, with no
     error anywhere. Disjointness matters too: an overlap would print the
     same proposal twice in one commit."""
-    assert cli._NON_LEDGER_KINDS | {"spinoff"} == cli._ALL_CORPORATE_ACTION_KINDS
-    assert not cli._NON_LEDGER_KINDS & {"spinoff"}
+    assert cli._NON_LEDGER_KINDS | {"spinoff", "split"} == cli._ALL_CORPORATE_ACTION_KINDS
+    assert not cli._NON_LEDGER_KINDS & {"spinoff", "split"}
 
 
 def test_every_ratio_source_the_importer_can_emit_has_a_strength_sentence():

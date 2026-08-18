@@ -28,6 +28,7 @@ from db.positions import open_positions
 from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import CorporateActionProposal, ImportBatch
+from importers.fidelity import _reduce_ratio
 from importers.registry import get_importer, list_importers
 from ledger.corporate import ActionType, CorporateAction
 from ledger.pnl import unrealized_pnl
@@ -143,6 +144,7 @@ _KIND_TO_ACTION_TYPE: dict[str, str] = {
     "name_change": "symbol_change",
     "merger": "merger",
     "spinoff": "spinoff",
+    "split": "split",
 }
 
 # kinds (see _KIND_TO_ACTION_TYPE) whose ActionType needs --resulting-symbol
@@ -163,28 +165,41 @@ def _render_corporate_add_command(
     to read, edit and run; never executed by this code (see the module
     comment above and D2).
 
-    `--symbol` and `--resulting-symbol` are always a literal `<SYMBOL>`
-    placeholder. Spec D7 makes CUSIP resolution advisory and says plainly
-    that no CUSIP column is needed for this work -- there is no lookup this
-    function could perform that would ever fill them in. The description and
-    CUSIP printed alongside this command (_print_corporate_action_section)
-    are what let a human supply the symbol themselves.
+    `--resulting-symbol` is always a literal `<SYMBOL>` placeholder, and so
+    is `--symbol` for every kind EXCEPT split. Spec D7 makes CUSIP
+    resolution advisory and says plainly that no CUSIP column is needed for
+    this work -- there is no lookup this function could perform that would
+    ever fill in a resulting symbol, or a source symbol identified only by
+    CUSIP. The description and CUSIP printed alongside this command
+    (_print_corporate_action_section) are what let a human supply those
+    themselves.
 
-    `--ratio` is the one placeholder this module can sometimes complete:
-    always for name_change, for reverse_split when its two sources do not
-    contradict each other, and for spinoff when _complete_spinoff_ratio's
-    ledger read succeeds. When it can't -- always for merger, sometimes for
-    spinoff, and for a reverse split whose stated and derived ratios DISPUTE
-    each other (see _print_corporate_action_section) -- `ratio` here is None
-    and the command prints `<FILL IN>` instead, same shape as the symbol
-    placeholder, so this command is never rendered as though it were
-    ready to run when it is not.
+    A share distribution (kind == "split") is the one exception: unlike a
+    reorganisation row, which states its instrument only by CUSIP,
+    a share-distribution row states its own ticker outright
+    (CorporateActionProposal.subject_symbol) -- and _complete_split_ratio's
+    ratio, when present, is derived from THAT ticker's own holding. Printing
+    the `<SYMBOL>` placeholder beside a ratio the ticker already named would
+    be incoherent, so `--symbol` prints `subject_symbol` here whenever it is
+    present.
+
+    `--ratio` is the one other placeholder this module can sometimes
+    complete: always for name_change, for reverse_split when its two sources
+    do not contradict each other, and for spinoff or split when their
+    respective ledger completions (_complete_spinoff_ratio,
+    _complete_split_ratio) succeed. When it can't -- always for merger,
+    sometimes for spinoff or split, and for a reverse split whose stated and
+    derived ratios DISPUTE each other (see _print_corporate_action_section)
+    -- `ratio` here is None and the command prints `<FILL IN>` instead, same
+    shape as the symbol placeholder, so this command is never rendered as
+    though it were ready to run when it is not.
     """
     action_type = _KIND_TO_ACTION_TYPE[p.kind]
+    symbol_str = p.subject_symbol if p.subject_symbol is not None else "<SYMBOL>"
     parts = [
         "corporate add",
         f"--type {action_type}",
-        "--symbol <SYMBOL>",
+        f"--symbol {symbol_str}",
         f"--ex-date {p.ex_date.isoformat()}",
         f"--ratio {_placeholder_ratio_str(ratio)}",
     ]
@@ -245,6 +260,38 @@ def _reduce_decimal_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, 
     if divisor == 0:
         return new_qty, old_qty
     return new_qty / divisor, old_qty / divisor
+
+
+async def _long_holdings_as_of(
+    conn, account_id: UUID, cutoff: datetime, symbol: str | None
+) -> list:
+    """Instruments the account is NET LONG as of `cutoff`, optionally
+    restricted to one symbol. `> 0`, never `<> 0`: both corporate-action
+    completions ask "what shares was this received on?", and a net-short or
+    flat holding is not an answer to that question.
+
+    Extracted from _complete_spinoff_ratio so the split completion shares one
+    query rather than a second copy that could drift from it. `symbol=None`
+    reproduces the elimination path's own behaviour exactly (every
+    instrument the account has ever traded is a candidate); a symbol narrows
+    the candidate set to that one instrument.
+    """
+    return await conn.fetch(
+        """
+        SELECT i.symbol,
+               SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) AS net_qty
+          FROM fill f
+          JOIN instrument i ON i.id = f.instrument_id
+         WHERE f.account_id = $1
+           AND f.executed_at < $2
+           AND ($3::text IS NULL OR i.symbol = $3::text)
+         GROUP BY i.id, i.symbol
+        HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
+        """,
+        account_id,
+        cutoff,
+        symbol,
+    )
 
 
 async def _complete_spinoff_ratio(
@@ -308,27 +355,12 @@ async def _complete_spinoff_ratio(
     # very reorganisation being priced) is excluded rather than counted
     # toward the parent it is arguably already part of.
     cutoff = datetime.combine(p.ex_date, time.min, tzinfo=UTC)
-    # One query, parameterised on whether the row named a parent: $3 is the
-    # stated ticker or NULL, and a NULL means "every instrument", which is
-    # the elimination rule's own candidate set. Written this way rather than
-    # as two near-identical queries so the LONG-only, before-the-ex-date
-    # rules can never drift between the two paths.
-    rows = await conn.fetch(
-        """
-        SELECT i.symbol,
-               SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) AS net_qty
-          FROM fill f
-          JOIN instrument i ON i.id = f.instrument_id
-         WHERE f.account_id = $1
-           AND f.executed_at < $2
-           AND ($3::text IS NULL OR i.symbol = $3::text)
-         GROUP BY i.id, i.symbol
-        HAVING SUM(CASE WHEN f.side = 'buy' THEN f.quantity ELSE -f.quantity END) > 0
-        """,
-        account_id,
-        cutoff,
-        p.parent_symbol,
-    )
+    # $3 is the stated ticker or NULL, and a NULL means "every instrument",
+    # which is the elimination rule's own candidate set -- see
+    # _long_holdings_as_of, extracted here so the LONG-only,
+    # before-the-ex-date rules can never drift between this and the split
+    # completion's own read.
+    rows = await _long_holdings_as_of(conn, account_id, cutoff, p.parent_symbol)
     if p.parent_symbol is not None and len(rows) == 0:
         # The row named a parent and the account is not long it. Falling back
         # to elimination here would answer a question the venue already
@@ -371,30 +403,93 @@ async def _complete_spinoff_ratio(
     return ratio, note
 
 
-async def _spinoff_notes_for(
+async def _complete_split_ratio(
+    conn, account_id: UUID | None, p: CorporateActionProposal
+) -> tuple[tuple[Decimal, Decimal] | None, str]:
+    """A share distribution's ratio is (held + received) : held, and only the
+    RECEIVED half is in the file. Spec D2/§5.
+
+    Unlike a spinoff, the subject and the instrument receiving shares are the
+    SAME one -- the row's own Symbol column names it -- so this reads that
+    instrument's holding rather than another's, and never falls back to
+    identifying a holding by elimination.
+
+    The `> 0` long-position rule is deliberate and shared with the spinoff
+    completion: shares are distributed on shares you are LONG, so a net-short
+    or flat holding does not qualify. `<> 0` would let a short produce a
+    negative ratio that only cmd_corporate_add's positivity check would
+    catch, far downstream of where the mistake happened.
+
+    Returns (ratio, note) on the same contract as _complete_spinoff_ratio:
+    ratio is None when it could not be completed, and note always explains.
+    """
+    if conn is None:
+        return None, (
+            "not completed: preview opens no database connection -- rerun "
+            "with --commit to complete it from the ledger"
+        )
+    if account_id is None:
+        return None, "not completed: no --account given, so the holding is unknown"
+    if not p.quantities or p.subject_symbol is None:
+        return None, "not completed: the row states no symbol or no quantity received"
+
+    received = p.quantities[0]
+    cutoff = datetime.combine(p.ex_date, time.min, tzinfo=UTC)
+    rows = await _long_holdings_as_of(conn, account_id, cutoff, p.subject_symbol)
+    if not rows:
+        return None, (
+            f"not completed: account {account_id} holds no LONG position in "
+            f"{p.subject_symbol} as of {p.ex_date.isoformat()} -- import the file "
+            "containing that purchase and re-run, rather than deriving a ratio "
+            "from a holding that is not there"
+        )
+
+    held = rows[0]["net_qty"]
+    return _reduce_ratio(held + received, held), (
+        f"derived from the ledger: {p.subject_symbol} holding at the ex-date "
+        "plus the shares this row delivered"
+    )
+
+
+# Kinds whose ratio can only be completed by reading the ledger -- as opposed
+# to reverse_split/name_change (always carry their ratio out of importers/)
+# and merger (structurally never derivable). _ledger_completed_notes_for is
+# the one loop that calls both completions, keyed by the same _COMPLETERS
+# table, so a third such kind is one dict entry away rather than a second
+# hand-written loop that could drift from this one.
+_COMPLETERS = {
+    "spinoff": _complete_spinoff_ratio,
+    "split": _complete_split_ratio,
+}
+
+
+async def _ledger_completed_notes_for(
     conn, account_id: UUID | None, batch: ImportBatch
 ) -> dict[int, tuple[tuple[Decimal, Decimal] | None, str]]:
-    """(ratio, note) for every spinoff proposal in `batch.corporate_actions`,
-    keyed by its index -- see _complete_spinoff_ratio. `conn` is None in
-    preview (which opens no connection at all) and a real connection in the
-    commit path; either way _complete_spinoff_ratio degrades honestly."""
+    """(ratio, note) for every proposal in `batch.corporate_actions` whose
+    kind needs a ledger read (see _COMPLETERS), keyed by its index. `conn` is
+    None in preview (which opens no connection at all) and a real connection
+    in the commit path; either way, each completer degrades honestly."""
     notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]] = {}
     for i, p in enumerate(batch.corporate_actions):
-        if p.kind == "spinoff":
-            notes[i] = await _complete_spinoff_ratio(conn, account_id, p)
+        completer = _COMPLETERS.get(p.kind)
+        if completer is not None:
+            notes[i] = await completer(conn, account_id, p)
     return notes
 
 
-_ALL_CORPORATE_ACTION_KINDS = frozenset({"reverse_split", "name_change", "merger", "spinoff"})
+_ALL_CORPORATE_ACTION_KINDS = frozenset(
+    {"reverse_split", "name_change", "merger", "spinoff", "split"}
+)
 
 # The three kinds whose ratio never needs a ledger read: reverse_split and
 # name_change always carry their ratio out of importers/ already (spec §6),
 # and a merger's is structurally absent regardless of ledger state (spec
-# §6a). Only spinoff depends on this import's own committed fills (see
-# _complete_spinoff_ratio) -- which is exactly why the commit path below
-# splits its printing into an EARLY pass (this set, safe even on a refused
-# commit, since none of it reads anything the refusal left uncommitted) and
-# a LATE pass (spinoff alone, after the commit that might supply its parent
+# §6a). spinoff and split both depend on this import's own committed fills
+# (see _COMPLETERS) -- which is exactly why the commit path below splits its
+# printing into an EARLY pass (this set, safe even on a refused commit,
+# since none of it reads anything the refusal left uncommitted) and a LATE
+# pass (spinoff and split, after the commit that might supply their
 # holding).
 _NON_LEDGER_KINDS = frozenset({"reverse_split", "name_change", "merger"})
 
@@ -406,7 +501,7 @@ _CORPORATE_ACTION_HEADER = (
 
 def _print_corporate_action_section(
     batch: ImportBatch,
-    spinoff_notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]],
+    ledger_notes: dict[int, tuple[tuple[Decimal, Decimal] | None, str]],
     *,
     kinds: frozenset[str] = _ALL_CORPORATE_ACTION_KINDS,
     include_cash_in_lieu: bool = True,
@@ -427,8 +522,9 @@ def _print_corporate_action_section(
     _NON_LEDGER_KINDS` (reverse_split, name_change, merger -- none of which
     need this import's fills to have been committed, so they can still be
     reported on a refusal); and once LATE, after commit_batch runs, with
-    `kinds={"spinoff"}` and `include_cash_in_lieu=False` (already shown
-    early) -- see _preview_or_commit for why spinoff alone must wait.
+    `kinds={"spinoff", "split"}` and `include_cash_in_lieu=False` (already
+    shown early) -- see _preview_or_commit for why spinoff and split alone
+    must wait.
 
     D2/D3: never writes anything. Every command printed below is text for a
     human to read, edit and run; nothing here calls add_action.
@@ -442,8 +538,8 @@ def _print_corporate_action_section(
     for i, p in matching:
         ratio = p.ratio
         note: str | None = None
-        if p.kind == "spinoff":
-            ratio, note = spinoff_notes.get(i, (None, "not completed"))
+        if p.kind in _COMPLETERS:
+            ratio, note = ledger_notes.get(i, (None, "not completed"))
 
         print(f"\n{p.kind} ex {p.ex_date.isoformat()} -- {p.description}")
         if p.source_cusip or p.resulting_cusip:
@@ -501,7 +597,7 @@ def _print_corporate_action_section(
         if ratio is not None:
             strength = (
                 note
-                if p.kind == "spinoff"
+                if p.kind in _COMPLETERS
                 else _RATIO_SOURCE_STRENGTH.get(
                     p.ratio_source or "", _UNKNOWN_RATIO_SOURCE_STRENGTH
                 )
@@ -582,10 +678,10 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
         # account_id=None: preview never opens a database connection (a
         # tested invariant -- tests/test_cli.py's
         # test_preview_import_never_opens_a_database_connection), so a
-        # spinoff's ratio degrades to "not completed" here rather than being
-        # read from the ledger; see _complete_spinoff_ratio.
-        spinoff_notes = await _spinoff_notes_for(None, None, batch)
-        _print_corporate_action_section(batch, spinoff_notes)
+        # spinoff's or split's ratio degrades to "not completed" here rather
+        # than being read from the ledger; see _COMPLETERS.
+        ledger_notes = await _ledger_completed_notes_for(None, None, batch)
+        _print_corporate_action_section(batch, ledger_notes)
 
         # A single export can carry rows for more than one venue account
         # (Fidelity's account-number column, for instance). --commit routes
@@ -731,8 +827,9 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # written, so there is no reason to withhold them from a user
             # who has to fix the refusal and re-run anyway -- see
             # _print_corporate_action_section's docstring for the split.
-            # spinoff_notes={}: no spinoff kind is in _NON_LEDGER_KINDS, so
-            # _print_corporate_action_section never looks one up here.
+            # ledger_notes={}: neither spinoff nor split is in
+            # _NON_LEDGER_KINDS, so _print_corporate_action_section never
+            # looks one up here.
             _print_corporate_action_section(batch, {}, kinds=_NON_LEDGER_KINDS)
 
             plan = await route_batch(conn, venue, batch)
@@ -910,13 +1007,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     cash_inserted += result.cash_inserted
                     trades_regrouped += await regroup_account(conn, account_id)
 
-                # LATE: spinoff alone, printed here inside the same
+                # LATE: spinoff and split, printed here inside the same
                 # transaction as the commit above and after it -- the one
-                # point in this function where a spinoff's ratio can be
+                # point in this function where either's ratio can be
                 # completed against BOTH pre-existing fills and this
                 # import's own. A real multi-year History export commonly
-                # carries the original purchase and a later spinoff in the
-                # SAME file (see
+                # carries the original purchase and a later corporate action
+                # in the SAME file (see
                 # tests/fixtures/fidelity/real_shape_history.csv); reading
                 # the ledger before commit_batch runs would miss that
                 # purchase entirely and report "no holding" for a ratio
@@ -930,14 +1027,14 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                 # A refused commit (any of the early `return 2`s above, all
                 # of which run before this transaction even opens) never
                 # reaches this section -- nothing has been written in that
-                # case, so a spinoff's ledger read would be no more complete
-                # here than it was at the EARLY point above. reverse_split,
+                # case, so a ledger read would be no more complete here than
+                # it was at the EARLY point above. reverse_split,
                 # name_change and merger do not have this problem (see the
-                # EARLY call above, before route_batch) -- only spinoff's
-                # correctness trades away reporting on a refusal, and on
-                # refusal the user sees the refusal's own error and re-runs;
-                # the spinoff proposal reaches them on that next, successful
-                # attempt.
+                # EARLY call above, before route_batch) -- only spinoff's and
+                # split's correctness trades away reporting on a refusal,
+                # and on refusal the user sees the refusal's own error and
+                # re-runs; the proposal reaches them on that next,
+                # successful attempt.
                 #
                 # History-dialect rows (the only dialect with corporate
                 # actions) carry no per-row account ref, so the ENTIRE file
@@ -950,13 +1047,18 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                 account_id_for_corporate = (
                     UUID(args.account) if getattr(args, "account", None) else None
                 )
-                spinoff_notes = await _spinoff_notes_for(conn, account_id_for_corporate, batch)
+                ledger_notes = await _ledger_completed_notes_for(
+                    conn, account_id_for_corporate, batch
+                )
                 _print_corporate_action_section(
                     batch,
-                    spinoff_notes,
-                    kinds=frozenset({"spinoff"}),
+                    ledger_notes,
+                    kinds=frozenset({"spinoff", "split"}),
                     include_cash_in_lieu=False,
-                    header="\n=== Spinoff ratio(s) completed against the committed ledger ===",
+                    header=(
+                        "\n=== Spinoff/split ratio(s) completed against the "
+                        "committed ledger ==="
+                    ),
                 )
     finally:
         # pool.close() waits for every checked-out connection to be released.

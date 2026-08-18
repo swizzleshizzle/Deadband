@@ -2983,6 +2983,16 @@ _BLOCKING_ROW = (
     'DISBURSEMENT,Cash,"",0,"","","","500.00",1006.75,""'
 )
 
+# Task 3: a plain DISTRIBUTION (share distribution, proposed as a "split"),
+# the exact row shape verified in tests/fixtures/fidelity/real_shape_history.csv
+# and pinned by tests/test_fidelity_history.py's
+# test_a_plain_distribution_is_proposed_as_a_split -- 40 ZXDS shares received,
+# ex-date 03/06/2026. ZXDS is fabricated (see that fixture's own docstring).
+_SHARE_DISTRIBUTION_ROW_FOR_ZXDS = (
+    '03/06/2026,DISTRIBUTION ZXDS HOLDINGS SPON ADS EA... (ZXDS) (Cash),ZXDS,'
+    'ZXDS HOLDINGS SPON ADS EACH REP 1 ORD SHS,Cash,,40,,,,168,3878.55,'
+)
+
 
 async def test_import_proposes_a_corporate_add_command(conn, monkeypatch, capsys, tmp_path):
     """The importer proposes and never stores: a corporate action silently
@@ -3573,6 +3583,119 @@ async def test_the_spinoff_ratio_is_left_blank_when_the_account_is_short(
     assert "holds no LONG position" in out
     assert "-100" not in out
     assert "--ratio <FILL IN>" in out
+
+
+# --- Task 3: the split ratio completed from the ledger ---------------------
+
+
+async def test_the_split_ratio_is_completed_from_the_holding(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """(held + received) : held, reduced. The row states only what was
+    received; what it was received ON is in the ledger. Holding 60 and
+    receiving 40 is 100:60 -> 5:3."""
+    acc = await create_account(conn, name="Dist", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.BUY,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-open", is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: 5:3" in out
+    assert "--type split" in out
+    assert "--symbol ZXDS" in out
+    assert "<FILL IN>" not in out
+
+
+async def test_the_split_ratio_is_left_blank_when_the_holding_is_absent(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The year-file carrying the purchase has not been imported. Report and
+    stop -- never substitute another instrument, and never guess a ratio."""
+    acc = await create_account(conn, name="Empty", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "--ratio <FILL IN>" in out
+    assert "holds no LONG position" in out
+
+
+async def test_a_short_holding_does_not_qualify_for_a_split_ratio(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Shares are distributed on shares you are LONG. HAVING SUM(...) > 0,
+    not <> 0 -- a net-short holding would otherwise produce a nonsensical
+    negative ratio that only cmd_corporate_add's positivity check would
+    catch, far downstream of the mistake."""
+    acc = await create_account(conn, name="Short", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.SELL,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-short", is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "holds no LONG position" in out
 
 
 async def test_cash_in_lieu_is_reported_as_unapplied(conn, monkeypatch, capsys, tmp_path):
