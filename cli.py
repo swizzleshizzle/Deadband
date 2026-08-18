@@ -28,7 +28,6 @@ from db.positions import open_positions
 from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
 from importers.base import CorporateActionProposal, ImportBatch
-from importers.fidelity import _reduce_ratio
 from importers.registry import get_importer, list_importers
 from ledger.corporate import ActionType, CorporateAction
 from ledger.pnl import unrealized_pnl
@@ -445,7 +444,7 @@ async def _complete_split_ratio(
         )
 
     held = rows[0]["net_qty"]
-    return _reduce_ratio(held + received, held), (
+    return _reduce_decimal_ratio(held + received, held), (
         f"derived from the ledger: {p.subject_symbol} holding at the ex-date "
         "plus the shares this row delivered"
     )
