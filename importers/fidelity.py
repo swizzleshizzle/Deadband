@@ -787,10 +787,27 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
     """Net original -> cancel -> correction clusters down to the correction,
     dated to its as-of date (spec D3).
 
-    A complete chain is: an original whose (symbol, date, |quantity|, price)
-    matches a cancel's as-of tuple; and a correction sharing that cancel's
-    (symbol, as-of date). Every match must be UNIQUE -- an ambiguous one is
-    treated as no match at all.
+    A complete chain is: an original whose (account, symbol, date,
+    |quantity|, price) matches a cancel's as-of tuple; and a correction
+    sharing that cancel's (account, symbol, as-of date). Every match must be
+    UNIQUE -- an ambiguous one is treated as no match at all.
+
+    **Every key leads with the row's account ref**, and that is load-bearing
+    rather than decorative. The Activity & Orders dialect carries an
+    `Account Number` column and one real export of it spans five distinct
+    accounts; the History dialect has no such column, so `account` is
+    uniformly None there and the component is a constant that changes
+    nothing. Without it the matcher is account-BLIND, and the failure is
+    silent deletion, not a refusal: a cancel in account A whose own original
+    lies outside the file's window matches an unrelated genuine trade in
+    account B sharing (symbol, date, |quantity|, price), suppresses B's row,
+    and hands A a netted fill it never earned. B's fill is not blocked and
+    not warned about -- it is simply gone, and (before the fix below the
+    suppression check) B vanished from `refs_seen` too, so db/importing.py's
+    unregistered-ref net could not see it either. This is the same defect
+    family as the two-cancels-one-correction bug: uniqueness inside a bucket
+    is not uniqueness across a dimension the key omits. The account was the
+    omitted dimension.
 
     Anything incomplete or ambiguous is left entirely alone, so its rows
     reach the ordinary paths and, being unmapped and money-carrying, block
@@ -806,9 +823,10 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
     cancels: dict[tuple, list[int]] = {}
     corrections: dict[tuple, list[int]] = {}
     originals: dict[tuple, list[int]] = {}
-    # Every cancel line that could claim a given (symbol, as-of) correction
-    # bucket. Cancels are keyed on the FULL tuple and corrections on
-    # (symbol, as-of) alone, so two cancels differing only in price are two
+    # Every cancel line that could claim a given (account, symbol, as-of)
+    # correction bucket. Cancels are keyed on the FULL tuple and corrections
+    # on (account, symbol, as-of) alone, so two cancels differing only in
+    # price are two
     # distinct `cancels` entries that both look up the SAME correction --
     # each seeing len(correction_lines) == 1 and each netting, consuming one
     # correction twice and deleting the second original outright. Uniqueness
@@ -819,6 +837,11 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
     for line_no, row in rows:
         action = (row.get("action") or "").strip().upper()
         symbol = (row.get("symbol") or "").strip()
+        # Read exactly the way parse()'s row loop reads it, including the
+        # deliberate refusal to fall back to the nickname column: two
+        # accounts can share a nickname, so keying on one would re-open the
+        # cross-account collision this leading component exists to close.
+        account = (row.get("account number") or "").strip() or None
         try:
             qty = _decimal(row.get("quantity"))
             price = _decimal(row.get("price"))
@@ -839,30 +862,30 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
             except ValueError:
                 continue
             if action.startswith("YOU BOUGHT") or action.startswith("YOU SOLD"):
-                key = (symbol, when.date(), abs(qty), price)
+                key = (account, symbol, when.date(), abs(qty), price)
                 originals.setdefault(key, []).append(line_no)
             continue
 
         as_of_date = date.fromisoformat(as_of.group(1))
-        key = (symbol, as_of_date, abs(qty), price)
+        key = (account, symbol, as_of_date, abs(qty), price)
         if _CANCEL_PHRASE in action:
             cancels.setdefault(key, []).append(line_no)
-            cancel_claims.setdefault((symbol, as_of_date), []).append(line_no)
+            cancel_claims.setdefault((account, symbol, as_of_date), []).append(line_no)
         elif _CORRECTION_PHRASE in action:
             # The correction's own quantity and price are the CORRECTED ones,
             # so it is matched on (symbol, as-of) only -- keying it on the
             # full tuple would fail exactly when the correction changed one
             # of those values, which is the case corrections exist for.
-            corrections.setdefault((symbol, as_of_date), []).append(line_no)
+            corrections.setdefault((account, symbol, as_of_date), []).append(line_no)
 
     suppressed: set[int] = set()
     redated: dict[int, datetime] = {}
     notes: list[str] = []
 
     for key, cancel_lines in cancels.items():
-        symbol, as_of_date, _qty, _price = key
+        account, symbol, as_of_date, _qty, _price = key
         original_lines = originals.get(key, [])
-        correction_lines = corrections.get((symbol, as_of_date), [])
+        correction_lines = corrections.get((account, symbol, as_of_date), [])
         # Every leg must be UNIQUE, and the correction must be claimed by
         # exactly ONE cancel -- `cancel_claims` is that last condition, and
         # without it two cancels at different prices each net against the
@@ -873,7 +896,7 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
             len(cancel_lines) != 1
             or len(original_lines) != 1
             or len(correction_lines) != 1
-            or len(cancel_claims.get((symbol, as_of_date), [])) != 1
+            or len(cancel_claims.get((account, symbol, as_of_date), [])) != 1
         ):
             continue
         cancel_line, original_line = cancel_lines[0], original_lines[0]
@@ -901,7 +924,7 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
             "imported as an ordinary trade, which would duplicate the fill "
             "it was issued to correct"
         )
-        for (symbol, as_of_date), correction_lines in corrections.items()
+        for (_account, symbol, as_of_date), correction_lines in corrections.items()
         for line_no in correction_lines
         if line_no not in redated
     }
@@ -1179,12 +1202,6 @@ class FidelityImporter:
         warnings.extend(plan.notes)
 
         for line_no, raw_row, row in materialised:
-            if line_no in plan.suppressed:
-                # A cancelled original, or the cancel that reversed it.
-                # The pair nets to nothing and the correction row (which is
-                # NOT suppressed) carries the surviving truth -- recording
-                # either of them alongside it double-counts one trade.
-                continue
             action = (row.get("action") or "").strip().upper()
             symbol = (row.get("symbol") or "").strip()
             # external_ref MUST be the account NUMBER, never the nickname
@@ -1196,6 +1213,23 @@ class FidelityImporter:
             account = (row.get("account number") or "").strip() or None
             if account:
                 refs_seen.add(account)
+
+            if line_no in plan.suppressed:
+                # A cancelled original, or the cancel that reversed it.
+                # The pair nets to nothing and the correction row (which is
+                # NOT suppressed) carries the surviving truth -- recording
+                # either of them alongside it double-counts one trade.
+                #
+                # This `continue` sits BELOW refs_seen deliberately.
+                # ImportBatch.refs_seen's docstring makes an unconditional
+                # claim -- every account ref in the RAW rows, "whether or
+                # not the row went on to become a fill or cash movement" --
+                # and skipping before the add quietly made it conditional.
+                # It is also the one safety net (db/importing.py's
+                # unregistered-ref check) that would surface an account
+                # whose rows were ALL suppressed, which is exactly the shape
+                # an account-blind matcher used to produce.
+                continue
 
             try:
                 when = datetime.strptime((row.get("run date") or "").strip(), "%m/%d/%Y").replace(
