@@ -7,7 +7,7 @@ import enum
 import io
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 
 from importers.base import (
@@ -192,6 +192,12 @@ RULES: tuple[Rule, ...] = (
     Rule("merger", "MERGER", Outcome.CORPORATE_ACTION),
     Rule("spinoff_distribution", "DISTRIBUTION SPINOFF", Outcome.CORPORATE_ACTION),
     Rule("cash_in_lieu", "IN LIEU OF", Outcome.CORPORATE_ACTION),
+    # ORDERING IS LOAD-BEARING HERE, unlike the corporate-action block above:
+    # classify() is startswith + first-match-wins and "DISTRIBUTION" is a
+    # proper prefix of "DISTRIBUTION SPINOFF". This rule MUST stay after
+    # spinoff_distribution -- placed before it, every spinoff in every export
+    # silently reclassifies as a share distribution.
+    Rule("share_distribution", "DISTRIBUTION", Outcome.CORPORATE_ACTION),
     Rule("dividend_received", "DIVIDEND RECEIVED", Outcome.CASH, cash_kind="dividend"),
     Rule("dividends", "DIVIDENDS", Outcome.CASH, cash_kind="dividend"),
     Rule("interest", "INTEREST EARNED", Outcome.CASH, cash_kind="interest"),
@@ -209,6 +215,18 @@ RULES: tuple[Rule, ...] = (
     Rule("employer_contribution", "CO CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("participant_contribution", "PARTIC CONTR", Outcome.CASH, cash_kind="deposit"),
     Rule("contributions", "CONTRIBUTIONS", Outcome.CASH, cash_kind="deposit"),
+    # Retirement cash flows. D1: these map to the GENERIC kinds, not to
+    # retirement-specific ones -- cash_movement.kind is a CHECK constraint
+    # with no retirement value in it, and the four contribution rules above
+    # already collapse the same way. A later tax-reporting feature wanting
+    # the distinction back recovers it from the note.
+    #
+    # The verb is "ROLLOVER CASH CHECK", not the shorter "ROLLOVER": both
+    # observed variants (one carries a trailing MOBILE DEPOSIT) share that
+    # prefix, and the narrower one does not speculate about ROLLOVER verbs
+    # the exports have never shown.
+    Rule("rollover_deposit", "ROLLOVER CASH CHECK", Outcome.CASH, cash_kind="deposit"),
+    Rule("early_distribution", "EARLY DIST", Outcome.CASH, cash_kind="withdrawal"),
     Rule("expired_option", "EXPIRED", Outcome.EXPIRY),
     Rule("assigned_option", "ASSIGNED", Outcome.UNSUPPORTED),
     Rule("exercised_option", "EXERCISED", Outcome.UNSUPPORTED),
@@ -344,6 +362,7 @@ _KIND_BY_RULE_NAME: dict[str, str] = {
     "name_change": "name_change",
     "merger": "merger",
     "spinoff_distribution": "spinoff",
+    "share_distribution": "split",
 }
 
 # Group shapes from spec §5/§1: two legs for a reverse split and a name
@@ -355,6 +374,9 @@ _EXPECTED_LEG_COUNT: dict[str, int] = {
     "name_change": 2,
     "merger": 3,
     "spinoff": 1,
+    # One row: the shares received. There is no second leg -- the holding it
+    # was received on is in the ledger, not in the file.
+    "split": 1,
 }
 
 
@@ -375,6 +397,10 @@ class _CorporateActionRow:
     # The parent ticker a spinoff row states -- see _SPINOFF_PARENT_RE. None
     # for every other kind, and for a spinoff row that states none.
     parent_symbol: str | None = None
+    # The row's own Symbol column, carried through for a share_distribution
+    # row -- see CorporateActionProposal.subject_symbol. None for every
+    # other kind.
+    subject_symbol: str | None = None
 
 
 def _group_corporate_actions(
@@ -434,6 +460,11 @@ def _group_corporate_actions(
         # A spinoff's group is a single row, so "the group's parent" is that
         # row's own stated parent; the other kinds never carry one.
         parent_symbol = next((r.parent_symbol for r in group_rows if r.parent_symbol), None)
+        # Likewise, a share distribution's group is a single row -- its own
+        # Symbol column, carried the same way parent_symbol is above.
+        subject_symbol = next(
+            (r.subject_symbol for r in group_rows if r.subject_symbol), None
+        )
         proposals.append(
             CorporateActionProposal(
                 kind=kind,
@@ -447,6 +478,7 @@ def _group_corporate_actions(
                 approximate=approximate,
                 stated_ratio=stated_ratio,
                 parent_symbol=parent_symbol,
+                subject_symbol=subject_symbol,
                 group_ref=key[1] if key[0] == "reor" else None,
             )
         )
@@ -713,6 +745,193 @@ def _locate_header(text: str) -> tuple[list[str], int]:
     return lines, 0
 
 
+# All 45 date-bearing `as of` tokens across the real exports are ISO
+# YYYY-MM-DD; none is the MM/DD/YYYY the Run Date column uses. (The phrase
+# occurs 56 times in all; the other 11 are disclaimer prose -- "as of the
+# date it ..." -- and carry no date at all, which is why this pattern
+# requires the date rather than merely the words.) Strict on purpose -- an
+# unparsable as-of date means the row is not netted and keeps blocking (D4),
+# which is safer than guessing a format the venue has never emitted.
+_AS_OF_RE = re.compile(r"\bAS OF\s+(\d{4}-\d{2}-\d{2})\b")
+
+# Anchored on the two-word phrases, NOT on bare `CXL`/`CORR` tokens. Action
+# text carries the security name with its ticker in parentheses, so a bare
+# three- or four-letter token can collide with a real ticker and net an
+# ordinary trade out of existence. The phrases cannot.
+_CANCEL_PHRASE = "CANCELLED TRADE"
+_CORRECTION_PHRASE = "CORRECTED CONFIRM"
+
+
+@dataclass(frozen=True, slots=True)
+class _AmendmentPlan:
+    """Which rows the amendment pass removes, how it re-dates the ones it
+    keeps, and which amendment legs it could NOT place. Keyed by the row's
+    line number so the main loop can consult it without re-deriving
+    anything."""
+
+    suppressed: frozenset[int]
+    redated: dict[int, datetime]
+    notes: tuple[str, ...]
+    # line_no -> why this CORRECTED CONFIRM row was not netted. A correction
+    # leads with "YOU BOUGHT", so the ordinary path for one is the dedicated
+    # trade branch, which emits a fill -- meaning an unplaced correction
+    # would silently DUPLICATE the original it was supposed to replace,
+    # with no warning and nothing blocking. It is the one amendment leg the
+    # classifier already "handles", and therefore the only one that fails
+    # open. The main loop rejects these instead (D4: degrade to blocking,
+    # never to guessing).
+    unmatched: dict[int, str]
+
+
+def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
+    """Net original -> cancel -> correction clusters down to the correction,
+    dated to its as-of date (spec D3).
+
+    A complete chain is: an original whose (account, symbol, date,
+    |quantity|, price) matches a cancel's as-of tuple; and a correction
+    sharing that cancel's (account, symbol, as-of date). Every match must be
+    UNIQUE -- an ambiguous one is treated as no match at all.
+
+    **Every key leads with the row's account ref**, and that is load-bearing
+    rather than decorative. The Activity & Orders dialect carries an
+    `Account Number` column and one real export of it spans five distinct
+    accounts; the History dialect has no such column, so `account` is
+    uniformly None there and the component is a constant that changes
+    nothing. Without it the matcher is account-BLIND, and the failure is
+    silent deletion, not a refusal: a cancel in account A whose own original
+    lies outside the file's window matches an unrelated genuine trade in
+    account B sharing (symbol, date, |quantity|, price), suppresses B's row,
+    and hands A a netted fill it never earned. B's fill is not blocked and
+    not warned about -- it is simply gone, and (before the fix below the
+    suppression check) B vanished from `refs_seen` too, so db/importing.py's
+    unregistered-ref net could not see it either. This is the same defect
+    family as the two-cancels-one-correction bug: uniqueness inside a bucket
+    is not uniqueness across a dimension the key omits. The account was the
+    omitted dimension.
+
+    Anything incomplete or ambiguous is left entirely alone, so its rows
+    reach the ordinary paths and, being unmapped and money-carrying, block
+    (D4). This matcher is fitted to a single real cluster; refusing to act is
+    the failure mode it is allowed to have.
+
+    `rows` carries NORMALIZED field names (the same {_normalize_field(k): v}
+    mapping the row loop reads), not the raw header spellings -- a real
+    export writes "Price ($)", and reading the raw key here would silently
+    see every price as absent and match originals to cancels on a shared
+    Decimal("0").
+    """
+    cancels: dict[tuple, list[int]] = {}
+    corrections: dict[tuple, list[int]] = {}
+    originals: dict[tuple, list[int]] = {}
+    # Every cancel line that could claim a given (account, symbol, as-of)
+    # correction bucket. Cancels are keyed on the FULL tuple and corrections
+    # on (account, symbol, as-of) alone, so two cancels differing only in
+    # price are two
+    # distinct `cancels` entries that both look up the SAME correction --
+    # each seeing len(correction_lines) == 1 and each netting, consuming one
+    # correction twice and deleting the second original outright. Uniqueness
+    # within a bucket does not imply uniqueness ACROSS the cancels competing
+    # for it, which is what this second index makes checkable.
+    cancel_claims: dict[tuple, list[int]] = {}
+
+    for line_no, row in rows:
+        action = (row.get("action") or "").strip().upper()
+        symbol = (row.get("symbol") or "").strip()
+        # Read exactly the way parse()'s row loop reads it, including the
+        # deliberate refusal to fall back to the nickname column: two
+        # accounts can share a nickname, so keying on one would re-open the
+        # cross-account collision this leading component exists to close.
+        account = (row.get("account number") or "").strip() or None
+        try:
+            qty = _decimal(row.get("quantity"))
+            price = _decimal(row.get("price"))
+        except InvalidOperation:
+            continue                      # not nettable; the ordinary paths handle it
+        if not (qty.is_finite() and price.is_finite()):
+            continue
+
+        as_of = _AS_OF_RE.search(action)
+        if as_of is None:
+            # A candidate ORIGINAL is dated by its own Run Date, and carries
+            # no as-of marker at all -- that is what distinguishes it from
+            # the two amendment legs.
+            try:
+                when = datetime.strptime(
+                    (row.get("run date") or "").strip(), "%m/%d/%Y"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if action.startswith("YOU BOUGHT") or action.startswith("YOU SOLD"):
+                key = (account, symbol, when.date(), abs(qty), price)
+                originals.setdefault(key, []).append(line_no)
+            continue
+
+        as_of_date = date.fromisoformat(as_of.group(1))
+        key = (account, symbol, as_of_date, abs(qty), price)
+        if _CANCEL_PHRASE in action:
+            cancels.setdefault(key, []).append(line_no)
+            cancel_claims.setdefault((account, symbol, as_of_date), []).append(line_no)
+        elif _CORRECTION_PHRASE in action:
+            # The correction's own quantity and price are the CORRECTED ones,
+            # so it is matched on (symbol, as-of) only -- keying it on the
+            # full tuple would fail exactly when the correction changed one
+            # of those values, which is the case corrections exist for.
+            corrections.setdefault((account, symbol, as_of_date), []).append(line_no)
+
+    suppressed: set[int] = set()
+    redated: dict[int, datetime] = {}
+    notes: list[str] = []
+
+    for key, cancel_lines in cancels.items():
+        account, symbol, as_of_date, _qty, _price = key
+        original_lines = originals.get(key, [])
+        correction_lines = corrections.get((account, symbol, as_of_date), [])
+        # Every leg must be UNIQUE, and the correction must be claimed by
+        # exactly ONE cancel -- `cancel_claims` is that last condition, and
+        # without it two cancels at different prices each net against the
+        # same correction (see its comment above). An ambiguous match in any
+        # direction is treated as no match at all (D4) -- the rows fall
+        # through and block.
+        if (
+            len(cancel_lines) != 1
+            or len(original_lines) != 1
+            or len(correction_lines) != 1
+            or len(cancel_claims.get((account, symbol, as_of_date), [])) != 1
+        ):
+            continue
+        cancel_line, original_line = cancel_lines[0], original_lines[0]
+        correction_line = correction_lines[0]
+        suppressed.update({cancel_line, original_line})
+        redated[correction_line] = datetime.combine(as_of_date, time.min, tzinfo=UTC)
+        # "netted" appears in this message and deliberately NOWHERE else in
+        # the module -- the refusal message below is worded to avoid it, so
+        # that scanning warnings for the word cannot mistake a refusal for a
+        # netting (it did: "not netted" matched, and a test read it as one).
+        notes.append(
+            f"netted an amendment cluster on {symbol}: lines {original_line} "
+            f"(original) and {cancel_line} (cancel) suppressed; line "
+            f"{correction_line} (correction) dated to {as_of_date.isoformat()}"
+        )
+
+    # Every correction the loop above did not place. See
+    # _AmendmentPlan.unmatched for why this one leg cannot simply be left to
+    # the ordinary paths the way an unplaced cancel or original can.
+    unmatched = {
+        line_no: (
+            f"CORRECTED CONFIRM as of {as_of_date.isoformat()} on "
+            f"{symbol or '(no symbol)'} matched no unique cancelled original "
+            "-- the amendment pass declined to act, and this row is not "
+            "imported as an ordinary trade, which would duplicate the fill "
+            "it was issued to correct"
+        )
+        for (_account, symbol, as_of_date), correction_lines in corrections.items()
+        for line_no in correction_lines
+        if line_no not in redated
+    }
+
+    return _AmendmentPlan(frozenset(suppressed), redated, tuple(notes), unmatched)
+
+
 class FidelityImporter:
     venue = "fidelity"
     # Equal to `venue`: see importers/base.py's Importer.account_venue
@@ -960,11 +1179,29 @@ class FidelityImporter:
             return ImportBatch()
 
         reader = csv.DictReader(io.StringIO("\n".join(data_lines)))
-        for line_no, raw_row in enumerate(reader, start=preamble_offset + 2):
-            # Normalize header casing once — a real export's header is found
-            # case-insensitively (above), so the fields must be read the same
-            # way or a differently-cased header parses to zero usable rows.
-            row = {_normalize_field(k): v for k, v in raw_row.items()}
+        # Materialised, not streamed. The amendment pass (_amendment_plan)
+        # has to see every row before the first one is turned into a fill:
+        # a correction row leads with "YOU BOUGHT", so the dedicated branch
+        # below matches it on leading text and emits a fill regardless of
+        # what classify() thinks -- the decision to suppress its cancelled
+        # siblings cannot be made row-by-row. Real exports are a few
+        # thousand rows; holding them is not a memory concern.
+        #
+        # Normalize header casing once, here rather than inside the loop — a
+        # real export's header is found case-insensitively (above), so the
+        # fields must be read the same way or a differently-cased header
+        # parses to zero usable rows, and _amendment_plan reads the same
+        # normalized names the loop does.
+        materialised: list[tuple[int, dict[str, str], dict[str, str]]] = [
+            (line_no, raw_row, {_normalize_field(k): v for k, v in raw_row.items()})
+            for line_no, raw_row in enumerate(reader, start=preamble_offset + 2)
+        ]
+        plan = _amendment_plan([(line_no, row) for line_no, _raw, row in materialised])
+        # §6: a netting that happens silently is indistinguishable from rows
+        # being dropped, so every one of them is reported.
+        warnings.extend(plan.notes)
+
+        for line_no, raw_row, row in materialised:
             action = (row.get("action") or "").strip().upper()
             symbol = (row.get("symbol") or "").strip()
             # external_ref MUST be the account NUMBER, never the nickname
@@ -976,6 +1213,23 @@ class FidelityImporter:
             account = (row.get("account number") or "").strip() or None
             if account:
                 refs_seen.add(account)
+
+            if line_no in plan.suppressed:
+                # A cancelled original, or the cancel that reversed it.
+                # The pair nets to nothing and the correction row (which is
+                # NOT suppressed) carries the surviving truth -- recording
+                # either of them alongside it double-counts one trade.
+                #
+                # This `continue` sits BELOW refs_seen deliberately.
+                # ImportBatch.refs_seen's docstring makes an unconditional
+                # claim -- every account ref in the RAW rows, "whether or
+                # not the row went on to become a fill or cash movement" --
+                # and skipping before the add quietly made it conditional.
+                # It is also the one safety net (db/importing.py's
+                # unregistered-ref check) that would surface an account
+                # whose rows were ALL suppressed, which is exactly the shape
+                # an account-blind matcher used to produce.
+                continue
 
             try:
                 when = datetime.strptime((row.get("run date") or "").strip(), "%m/%d/%Y").replace(
@@ -996,6 +1250,31 @@ class FidelityImporter:
                 # ever having been computed -- it can't be, since the date is
                 # precisely what failed.
                 reject(row, raw_row, account, line_no, f"line {line_no}: bad date ({exc})")
+                continue
+
+            # The surviving leg of a netted cluster is dated to the cluster's
+            # as-of date, not to the Run Date on which the venue re-booked
+            # it (spec D3): the trade happened on the as-of date, and the
+            # correction's own Run Date is nineteen days later in the real
+            # cluster this was built from. Rows outside a netting keep their
+            # Run Date, which is what `when` already holds.
+            when = plan.redated.get(line_no, when)
+
+            # A CORRECTED CONFIRM row the amendment pass could not place.
+            # Unlike an unplaced cancel (which no rule matches, so it falls
+            # through to the unmapped path and blocks on its own), a
+            # correction leads with "YOU BOUGHT" and would be taken by the
+            # dedicated trade branch below -- emitting a second fill for the
+            # trade it exists to RESTATE, with nothing said. Routed through
+            # reject() rather than appended to `blocking` directly, so it
+            # shares the one path every other dropped row uses (see
+            # reject()'s docstring): a correction carries a quantity, so in
+            # practice this always blocks, but a hypothetical one carrying
+            # no money warns instead of refusing, exactly as every other
+            # unmapped row does.
+            unmatched_reason = plan.unmatched.get(line_no)
+            if unmatched_reason is not None:
+                reject(row, raw_row, account, line_no, f"line {line_no}: {unmatched_reason}")
                 continue
 
             # YOU BOUGHT / YOU SOLD keep their own dedicated branch: direction
@@ -1138,6 +1417,21 @@ class FidelityImporter:
                     )
                     continue
 
+                # D5: only a positive quantity makes a plain DISTRIBUTION a
+                # SHARE distribution. A zero-quantity one has never been
+                # observed; treat it as unmapped so it blocks and is looked
+                # at, rather than proposing a split derived from no shares.
+                if rule.name == "share_distribution" and quantity <= 0:
+                    reject(
+                        row,
+                        raw_row,
+                        account,
+                        line_no,
+                        f"line {line_no}: DISTRIBUTION with no positive quantity "
+                        f"({quantity}) -- not a share distribution; see gap for D5",
+                    )
+                    continue
+
                 reor_ref, paren_cusips = _parse_reor(action)
                 if reor_ref:
                     group_key = ("reor", _reor_base(reor_ref))
@@ -1164,6 +1458,9 @@ class FidelityImporter:
                 # _SPINOFF_PARENT_RE); asking for one anywhere else would
                 # read a "FROM:(...)" that means something different.
                 parent_symbol = _parse_spinoff_parent(action) if kind == "spinoff" else None
+                # Only a share_distribution row's subject is its OWN Symbol
+                # column -- see CorporateActionProposal.subject_symbol.
+                subject_symbol = symbol or None if rule.name == "share_distribution" else None
 
                 corporate_action_rows.append(
                     _CorporateActionRow(
@@ -1176,6 +1473,7 @@ class FidelityImporter:
                         row_cusip=row_cusip,
                         group_key=group_key,
                         parent_symbol=parent_symbol,
+                        subject_symbol=subject_symbol,
                     )
                 )
                 continue

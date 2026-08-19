@@ -171,6 +171,72 @@ def test_missing_account_number_column_falls_back_to_none_not_the_nickname():
     assert result.fills[0].external_ref is None
 
 
+# --- Final review, F1: the amendment matcher must be account-AWARE ---------
+#
+# The rest of the amendment-matcher surface is tested in
+# tests/test_fidelity_history.py, against the History dialect. This one case
+# cannot live there: the History dialect has no Account Number column at all,
+# so every row's account is None and a cross-account collision is not
+# expressible. It belongs in this module, beside the other multi-account
+# fixtures, because the Activity & Orders dialect is the one that carries the
+# column -- and one real export of it spans five distinct account refs.
+#
+# The hazard is silent DELETION, which is the one outcome D4 ("degrade to
+# blocking, never to guessing") does not permit. Account A has a cancel and a
+# correction whose own original lies outside this file's window. Account B has
+# an ordinary, unrelated buy that happens to share (symbol, date, |quantity|,
+# price) with what A's cancel is looking for. Keyed without the account, A's
+# cancel adopts B's buy as "its" original, suppresses it, and nets -- B's real
+# fill is not blocked and not warned about, it is simply gone, while A gains a
+# fill whose original it never had. Before the companion fix that moved the
+# suppression `continue` below refs_seen, B disappeared from refs_seen as well,
+# so db/importing.py's unregistered-ref check could not see it either.
+#
+# Same defect family as test_one_correction_cannot_be_consumed_by_two_cancels:
+# uniqueness inside a bucket is not uniqueness across a dimension the key
+# omits. Every value below is fabricated and checked against the real exports.
+
+_CROSS_ACCOUNT_AMENDMENT_FIXTURE = (
+    "Run Date,Account,Account Number,Action,Symbol,Description,Quantity,"
+    "Price,Commission,Fees,Amount\n"
+    # Account B: an ordinary buy, nothing to do with any amendment. Its date
+    # is the as-of date the cancel below quotes, and its symbol, absolute
+    # quantity and price are the ones that cancel is matching on -- which is
+    # the whole collision.
+    "01/02/2026,Individual,A0000002,YOU BOUGHT,ZZZQ,ZZZQ HOLDINGS INC,"
+    "3,12.50,0.00,0.00,-37.50\n"
+    # Account A: the two amendment legs. A's own original is deliberately
+    # absent -- the year-file holding it has not been imported, which is
+    # exactly the real shape gap #54 describes.
+    "01/21/2026,Individual,A0000001,BUY CANCEL OPENING TRANSACTION CXL "
+    "DESCRIPTION CANCELLED TRADE as of 2026-01-02 ZZZQ HOLDINGS INC (Cash),"
+    "ZZZQ,ZZZQ HOLDINGS INC,-3,12.50,0.00,0.00,37.50\n"
+    "01/21/2026,Individual,A0000001,YOU BOUGHT OPENING TRANSACTION CORR "
+    "DESCRIPTION CORRECTED CONFIRM as of 2026-01-02 ZZZQ HOLDINGS INC (Cash),"
+    "ZZZQ,ZZZQ HOLDINGS INC,3,12.50,0.00,0.01,-37.51\n"
+)
+
+
+def test_an_amendment_leg_cannot_net_away_another_accounts_fill():
+    result = FidelityImporter().parse(_CROSS_ACCOUNT_AMENDMENT_FIXTURE)
+
+    assert not [w for w in result.warnings if "netted" in w.lower()], (
+        "A's cancel has no original in THIS account; nothing may net"
+    )
+    # B's fill survives, intact, with its own date and its own ref.
+    survivors = [f for f in result.fills if f.external_ref == "A0000002"]
+    assert len(survivors) == 1, "account B's genuine buy must not be suppressed"
+    assert survivors[0].quantity == Decimal("3")
+    assert survivors[0].executed_at.date().isoformat() == "2026-01-02"
+    # And A's two unplaceable legs block, rather than producing a fill.
+    assert not [f for f in result.fills if f.external_ref == "A0000001"]
+    assert [m for _, m in result.blocking if "CANCEL" in m]
+    assert [m for _, m in result.blocking if "CORRECTED CONFIRM" in m]
+    # Both accounts stay visible to db/importing.py's unregistered-ref check,
+    # including the one whose every row was refused.
+    assert set(result.refs_seen) == {"A0000001", "A0000002"}
+
+
 # --- "Never drop a row silently" -------------------------------------------
 
 
@@ -573,6 +639,8 @@ RULE_COVERAGE_SAMPLES = [
     ("CO CONTR 2026 Q1", ""),  # employer_contribution
     ("PARTIC CONTR 2026 Q1", ""),  # participant_contribution
     ("CONTRIBUTIONS MISC 2026", ""),  # contributions
+    ("ROLLOVER CASH CHECK RECEIVED IRA DIR ROLOVR (Cash)", ""),  # rollover_deposit
+    ("EARLY DIST NO EXCEPT VS AAA00-000000-0 CASH (Cash)", ""),  # early_distribution
     ("EXPIRED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # expired_option
     ("ASSIGNED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # assigned_option
     ("EXERCISED CALL (ZXCO) ZXCO CORP", "-ZXCO261121C500"),  # exercised_option
@@ -591,6 +659,11 @@ RULE_COVERAGE_SAMPLES = [
      "06/30/2027 (Cash)", "AAAWS"),  # spinoff_distribution
     ("IN LIEU OF FRX SHARE FRACTIONAL PAYOUT ACME000009 ACME HOLDINGS "
      "CORP COM (Cash)", "AAA"),  # cash_in_lieu
+    # Deliberately NOT "DISTRIBUTION SPINOFF ..." -- that would match
+    # spinoff_distribution first and prove nothing about this rule's own
+    # reachability, which is the whole point of the ordering guard in
+    # importers/fidelity.py's RULES comment.
+    ("DISTRIBUTION ACME HOLDINGS SPON ADS EA... (ACME) (Cash)", "ACME"),  # share_distribution
 ]
 
 

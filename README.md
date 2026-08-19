@@ -98,8 +98,14 @@ for any account in the batch — and names itself in the refusal. The one carve-
 blocking row belonging to an account registered `ignore_on_import` refuses nothing, since
 it was never going to be part of the import. See
 [`docs/known-gaps.md`](docs/known-gaps.md) (gaps #30–32) for what this leaves open: an
-expiry whose opening fill hasn't been imported yet, corporate actions (`MERGER`,
-`REVERSE SPLIT`, and others), and backdated `as of` correction rows.
+expiry whose opening fill hasn't been imported yet, a `TRANSFER OF ASSETS ACAT` asset
+transfer, and backdated `as of` correction rows. `TRANSFER OF ASSETS ACAT` is the only
+verb that still refuses anything in the eleven real exports — it is **not** the only verb
+that refuses at all. `ASSIGNED` and `EXERCISED`, above, refuse unconditionally, whatever
+the row carries — even a zero-quantity, zero-amount one. And a plain `DISTRIBUTION`
+whose quantity is not positive is refused rather than read as a share distribution, which
+blocks whenever the row carries money (gap #49). None of those three has ever appeared in
+a real file, which is the whole of what makes `TRANSFER OF ASSETS ACAT` look singular.
 
 ### Corporate actions found during import
 

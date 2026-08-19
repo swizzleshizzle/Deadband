@@ -251,6 +251,13 @@ class CorporateActionProposal:
     # parent by elimination -- "the account's sole LONG holding" -- which is
     # ambiguous on 100% of the real accounts (see gap #47).
     parent_symbol: str | None = None
+    # The ticker a share distribution was received ON -- the row's own Symbol
+    # column. Distinct from parent_symbol, which a SPINOFF row states about a
+    # DIFFERENT instrument: here the subject and the instrument receiving
+    # shares are the same one, which is why the split ratio reads that
+    # instrument's own holding rather than another's. None for every other
+    # kind, and for any row whose Symbol column is empty.
+    subject_symbol: str | None = None
     group_ref: str | None = None    # the #REOR reference, or None when the fallback keyed it
 
 

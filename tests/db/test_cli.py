@@ -385,6 +385,64 @@ async def test_import_commits_when_account_venue_matches(conn, monkeypatch, caps
     )
 
 
+# --- Amendment clusters (importer-blocking-verbs, Task 4). A Fidelity
+# --- amendment is three rows -- the original, a CANCELLED TRADE reversing
+# --- it, and a CORRECTED CONFIRM re-booking it -- whose net truth is ONE
+# --- trade. The importer used to emit the original AND the correction as two
+# --- separate buys; only the sibling cancel row (unmapped, money-carrying,
+# --- so blocking) kept that phantom contract out of the ledger, which is a
+# --- guard that vanishes the moment anyone teaches the classifier the
+# --- CANCEL verb. This is the end-to-end proof that the netting reaches the
+# --- committed rows, not just the parsed batch. ---------------------------
+
+
+async def test_import_nets_an_amendment_cluster_and_reports_it(conn, monkeypatch, capsys):
+    """Two assertions, and both matter.
+
+    The netting must be SAID: rows that disappear silently are
+    indistinguishable from rows the importer lost, and this one removes two
+    money-carrying rows from a file the user handed over.
+
+    And the ledger must end FLAT. The fixture's cluster is a buy that was
+    cancelled and re-booked, plus the real sell that closed it -- one buy and
+    one sell, so the contract is gone. Un-netted it is two buys and one sell,
+    which leaves a phantom open long contract behind: asserting the position
+    (not merely that the commit succeeded) is what distinguishes those.
+    """
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    fixture = pathlib.Path(__file__).parents[1] / "fixtures" / "fidelity" / "amendment_cluster.csv"
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=str(fixture),
+        account=str(acc),
+        commit=True,
+    )
+    rc = await cli.cmd_import(args)
+    # ONE readouterr(): it drains the capture, so reading it again for the
+    # assertions below would find it empty.
+    captured = capsys.readouterr()
+    assert rc == 0, captured.out + captured.err
+    # On STDERR specifically, not on "".join(captured). Joining the two
+    # channels asserts the note exists SOMEWHERE, which is not the claim --
+    # every batch warning goes to stderr (_preview_or_commit, cli.py) so that a
+    # user piping stdout to a file still sees it, and a change that moved
+    # this one note to stdout would silently pass a joined assertion while
+    # breaking exactly that.
+    assert "netted an amendment cluster" in captured.err
+
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 2
+    assert await open_positions(conn, acc) == (), (
+        "one buy and one sell close the contract -- an un-netted import "
+        "leaves a second, phantom buy open"
+    )
+
+
 # --- Task 5: `deadband sync coinbase` must reuse this exact venue-match/
 # --- routing check, not a parallel copy of it -- and the check must not
 # --- mistake the PARSING importer's own identity ("coinbase-api") for the
@@ -2983,6 +3041,16 @@ _BLOCKING_ROW = (
     'DISBURSEMENT,Cash,"",0,"","","","500.00",1006.75,""'
 )
 
+# Task 3: a plain DISTRIBUTION (share distribution, proposed as a "split"),
+# the exact row shape verified in tests/fixtures/fidelity/real_shape_history.csv
+# and pinned by tests/test_fidelity_history.py's
+# test_a_plain_distribution_is_proposed_as_a_split -- 40 ZXDS shares received,
+# ex-date 03/06/2026. ZXDS is fabricated (see that fixture's own docstring).
+_SHARE_DISTRIBUTION_ROW_FOR_ZXDS = (
+    '03/06/2026,DISTRIBUTION ZXDS HOLDINGS SPON ADS EA... (ZXDS) (Cash),ZXDS,'
+    'ZXDS HOLDINGS SPON ADS EACH REP 1 ORD SHS,Cash,,40,,,,168,3878.55,'
+)
+
 
 async def test_import_proposes_a_corporate_add_command(conn, monkeypatch, capsys, tmp_path):
     """The importer proposes and never stores: a corporate action silently
@@ -3573,6 +3641,325 @@ async def test_the_spinoff_ratio_is_left_blank_when_the_account_is_short(
     assert "holds no LONG position" in out
     assert "-100" not in out
     assert "--ratio <FILL IN>" in out
+
+
+# --- Task 3: the split ratio completed from the ledger ---------------------
+
+
+async def test_the_split_ratio_is_completed_from_the_holding(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """(held + received) : held, reduced. The row states only what was
+    received; what it was received ON is in the ledger. Holding 60 and
+    receiving 40 is 100:60 -> 5:3."""
+    acc = await create_account(conn, name="Dist", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.BUY,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-open", is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: 5:3" in out
+    assert "--type split" in out
+    assert "--symbol ZXDS" in out
+    assert "<FILL IN>" not in out
+
+
+async def test_the_split_ratio_is_left_blank_when_the_holding_is_absent(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """The year-file carrying the purchase has not been imported. Report and
+    stop -- never substitute another instrument, and never guess a ratio."""
+    acc = await create_account(conn, name="Empty", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "--ratio <FILL IN>" in out
+    assert "holds no LONG position" in out
+
+
+async def test_a_short_holding_does_not_qualify_for_a_split_ratio(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """Shares are distributed on shares you are LONG. HAVING SUM(...) > 0,
+    not <> 0 -- a net-short holding would otherwise produce a nonsensical
+    negative ratio that only cmd_corporate_add's positivity check would
+    catch, far downstream of the mistake."""
+    acc = await create_account(conn, name="Short", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.SELL,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-short", is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "holds no LONG position" in out
+
+
+# --- Final review: three ways the split completion could answer wrongly ----
+
+
+async def test_the_split_note_prints_both_quantities(conn, monkeypatch, capsys, tmp_path):
+    """F9. The note used to name only the symbol -- "{symbol} holding at the
+    ex-date plus the shares this row delivered" -- while the sibling spinoff
+    note printed both of its quantities.
+
+    D2's whole posture is to force an INFORMED human decision before a
+    corporate action restates history across every account holding the
+    instrument. A reader who cannot see the two numbers the ratio came from
+    cannot check it, and gap #53 (the ratio is computed from RAW fills, which
+    a prior split makes wrong) is exactly the failure that only shows up when
+    someone reads the held figure and recognises it."""
+    acc = await create_account(conn, name="Both", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.BUY,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-both", is_estimated=False,
+            ),
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: 5:3" in out
+    # Both halves of (held + received) : held, not just the reduced result.
+    assert "40 share(s) delivered by this row" in out
+    assert "60 ZXDS share(s) held at 2026-03-06" in out
+
+
+async def test_two_instruments_sharing_a_symbol_make_the_split_ratio_ambiguous(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """F4. `instrument.symbol` is NOT unique -- only `natural_key` is
+    (db/schema.sql) -- so narrowing _long_holdings_as_of by symbol can return
+    several instruments, and GROUP BY i.id keeps them apart. The completion
+    used to take rows[0] with no length check at all and print a confident
+    ratio derived from whichever one the database happened to return first,
+    while its sibling _complete_spinoff_ratio reported "ambiguous" for the
+    same shape.
+
+    A dual-listed equity is the concrete case: same ticker, two quote
+    currencies, two natural keys, one symbol."""
+    acc = await create_account(conn, name="Dual", venue="fidelity", account_type="cash")
+    usd = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    cad = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="CAD"),
+    )
+    assert usd != cad, "two distinct instruments, one symbol -- the premise of this test"
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=uuid4(), account_id=acc, instrument_id=inst_id,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.BUY,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id=f"dist-dual-{n}", is_estimated=False,
+            )
+            for n, inst_id in enumerate((usd, cad))
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "2 distinct instruments under the symbol ZXDS" in out
+    assert "--ratio <FILL IN>" in out
+    # And no ratio is offered anywhere: taking rows[0] would have printed
+    # 5:3 off one of the two 60-share holdings.
+    assert "ratio: 5:3" not in out
+
+
+async def test_a_non_finite_holding_is_excluded_rather_than_reduced(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """F5. `fill.quantity`'s only CHECK is `quantity > 0` (db/schema.sql), and
+    Postgres NUMERIC orders 'NaN' ABOVE every finite value, so a NaN quantity
+    passes it -- migration 002_reject_non_finite_numerics.sql added the
+    `< 'Infinity'` bound to contract_multiplier and price, never to
+    fill.quantity. A NaN reaching _reduce_decimal_ratio does not produce a
+    wrong ratio, it produces NO RETURN: bool(Decimal("NaN")) is True and
+    NaN % x is NaN, so the Euclidean loop spins forever -- inside cmd_import's
+    open commit transaction, holding its locks.
+
+    The UPDATE below is the point of the test, not a shortcut around a
+    validator: it demonstrates that the CHECK constraint accepts the value.
+    If a future migration adds the `< 'Infinity'` bound to fill.quantity, this
+    UPDATE starts raising and this test fails loudly, which is the correct
+    signal that the seam guard is now belt-and-braces."""
+    acc = await create_account(conn, name="NaN", venue="fidelity", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXDS", quote_currency="USD"),
+    )
+    fill_id = uuid4()
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=fill_id, account_id=acc, instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, tzinfo=UTC), side=Side.BUY,
+                quantity=Decimal("60"), price=Decimal("4"), fee=Decimal("0"),
+                fee_currency="USD", source=FillSource.MANUAL,
+                venue_fill_id="dist-nan", is_estimated=False,
+            ),
+        ],
+    )
+    await conn.execute(
+        "UPDATE fill SET quantity = 'NaN'::numeric WHERE id = $1", fill_id
+    )
+    assert await conn.fetchval("SELECT quantity > 0 FROM fill WHERE id = $1", fill_id), (
+        "the premise: the CHECK admits NaN because NaN sorts above every "
+        "finite value"
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    # Reaching this line at all is most of the assertion -- un-guarded, this
+    # call never returns.
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "ratio: UNAVAILABLE" in out
+    assert "holds no LONG position" in out, (
+        "a holding that is not a number is reported as no holding, never as "
+        "a ratio"
+    )
+
+
+async def test_a_split_command_is_not_told_to_fill_in_a_symbol_it_already_has(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """T3-a. The INCOMPLETE reminder was printed unconditionally as "fill in
+    --ratio (and --symbol)". For a share distribution the rendered command
+    already carries the row's own stated ticker, so that sentence tells a
+    human to overwrite a correct value on a command they are about to run
+    against a real ledger.
+
+    This runs the holding-absent path, which is where a split reaches the
+    reminder at all."""
+    acc = await create_account(conn, name="NoSym", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    args = argparse.Namespace(
+        venue="fidelity",
+        file=_write_history_csv(tmp_path, _SHARE_DISTRIBUTION_ROW_FOR_ZXDS),
+        account=str(acc),
+        commit=True,
+    )
+    assert await cli.cmd_import(args) == 0
+
+    out = capsys.readouterr().out
+    assert "INCOMPLETE -- fill in --ratio before running:" in out
+    assert "(and --symbol)" not in out
+    # The command it introduces really does carry the ticker already.
+    assert "--symbol ZXDS" in out
 
 
 async def test_cash_in_lieu_is_reported_as_unapplied(conn, monkeypatch, capsys, tmp_path):
