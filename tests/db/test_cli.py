@@ -179,17 +179,25 @@ async def test_cmd_migrate_warns_to_regroup_when_migrations_applied_to_an_existi
     assert "regroup" in capsys.readouterr().out.lower()
 
 
+async def _virginize_current_schema(conn):
+    """Put the conn's schema in the state a brand-new Postgres would be in.
+    DDL only, on `conn`, so the conftest rollback restores everything."""
+    schema = await conn.fetchval("SELECT current_schema()")
+    await conn.execute(f'DROP SCHEMA "{schema}" CASCADE; CREATE SCHEMA "{schema}";')
+
+
 async def test_cmd_migrate_does_not_warn_to_regroup_on_a_virgin_database(
     conn, monkeypatch, capsys
 ):
     """A brand-new database has no pre-existing rows computed under the old
     fee convention -- there is nothing to regroup yet, so telling the
     operator to do so here would be misleading noise. Drops and recreates the
-    public schema (rolled back by conftest's `conn` fixture at teardown, same
-    as the existing virgin-database test above) to reach that state, then
+    conn's own schema — the per-session namespace since issue #15's fix, not
+    public — (rolled back by conftest's `conn` fixture at teardown, same as
+    the existing virgin-database test above) to reach that state, then
     runs the real cmd_migrate. Fails if the regroup warning fires even though
     `existed_before` is False."""
-    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    await _virginize_current_schema(conn)
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
@@ -236,13 +244,14 @@ async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, ca
 
 
 async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, monkeypatch, capsys):
-    """Drops and recreates the public schema on `conn` (rolled back by
+    """Drops and recreates the conn's own schema (since issue #15's fix, the
+    per-session namespace, not public) on `conn` (rolled back by
     conftest's `conn` fixture at teardown, same as every other test here) to
     put it in the "never migrated" state a brand-new Postgres would be in,
     then runs the real cmd_migrate against it. Fails if cmd_migrate still says
     "already up to date": that is what it said before this fix, on a database
     that had zero tables a moment earlier."""
-    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    await _virginize_current_schema(conn)
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
@@ -4774,3 +4783,30 @@ def test_corporate_add_parser_maps_every_flag_to_the_dest_its_handler_reads(monk
         "ZXCB", "0.25", "a spinoff",
     )
     assert args.commit is True
+
+
+async def test_cmd_migrate_existed_before_asks_about_the_schema_apply_writes(
+    conn, monkeypatch, capsys
+):
+    """apply()'s unqualified CREATEs target the FIRST existing schema on the
+    search_path, so cmd_migrate's existed_before probe must ask about that
+    schema alone. A probe that scans the whole search_path finds tables in a
+    later entry, decides the database "existed before", and prints the stale-
+    derived-columns regroup warning about a schema apply() is actually building
+    from nothing. Reproduced here by putting an empty schema first on the path
+    with the migrated session namespace behind it."""
+    empty = "probe_first_schema"
+    current = await conn.fetchval("SELECT current_schema()")
+    await conn.execute(f'CREATE SCHEMA "{empty}"')
+    await conn.execute(f'SET search_path TO "{empty}", "{current}"')
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "regroup" not in out.lower()
+    assert "001_a2_ledger_completion.sql" in out

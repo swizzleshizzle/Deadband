@@ -27,7 +27,7 @@ MIGRATION_003 = DB_DIR / "migrations" / "003_derived_fills.sql"
 
 
 async def test_schema_creates_expected_tables(conn):
-    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")
     names = {r["tablename"] for r in rows}
     assert {
         "account",
@@ -45,7 +45,7 @@ async def test_schema_creates_expected_tables(conn):
 
 async def test_apply_is_idempotent(pool):
     async with pool.acquire() as c:
-        assert await apply(c) == []  # already applied by the fixture
+        assert await apply(c) == []  # migration_namespace already applied them
 
 
 async def test_fill_rejects_non_positive_quantity(conn):
@@ -233,15 +233,13 @@ async def test_deleting_account_cascades_fills_trades_and_allocations(conn):
 
 
 async def test_migration_003_survives_a_populated_trade_fill(pool):
-    """The trade_fill PK rework is the only destructive step in 003, and it can
-    only genuinely be exercised once per database: migrate.apply() skips any
-    migration already recorded in schema_migrations, and the `pool` fixture
-    applies pending migrations OUTSIDE the per-test rolled-back transaction --
-    so 003 is permanently committed to this shared database's `public` schema
-    the first time any test runs, while `public.trade_fill` still holds zero
-    rows (every other test's writes roll back). Calling apply(conn) again
-    later is therefore a no-op: it neither re-runs 003 nor proves anything
-    about surviving populated rows.
+    """The trade_fill PK rework is the only destructive step in 003, and the
+    session namespace cannot exercise it against data: migration_namespace
+    (issue #15's fix) re-runs every migration each session, but into a schema
+    whose tables are seconds old and EMPTY -- and migrate.apply() skips any
+    migration already recorded in schema_migrations, so calling apply(conn)
+    again after seeding rows is a no-op: it neither re-runs 003 nor proves
+    anything about surviving populated rows.
 
     Instead, build an isolated namespace at the PRE-003 state (baseline + 001
     + 002 -- the old composite PRIMARY KEY (trade_id, fill_id), fill_id NOT
@@ -322,7 +320,7 @@ async def test_migration_003_survives_a_populated_trade_fill(pool):
             )
             assert one_source_chk == 1
         finally:
-            await conn.execute("SET search_path TO public")
+            await conn.execute("RESET search_path")
             await conn.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE')
 
 

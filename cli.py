@@ -46,9 +46,15 @@ async def cmd_migrate(_args) -> int:
             # having just been created on a virgin one. Those are different
             # outcomes and must not share one message. Check for a table
             # schema.sql creates before calling apply(), while it's still
-            # meaningful to ask "did this exist already?".
+            # meaningful to ask "did this exist already?". Pinned to
+            # current_schema() — the FIRST existing schema on the search_path —
+            # because that is the one place apply()'s unqualified CREATEs land.
+            # A bare to_regclass('account') scans the whole path and can find a
+            # table in a LATER entry, answering about a schema apply() never
+            # writes, and wrongly printing the regroup warning below.
             existed_before = await conn.fetchval(
-                "SELECT to_regclass('public.account') IS NOT NULL"
+                "SELECT to_regclass(quote_ident(current_schema()) || '.account')"
+                " IS NOT NULL"
             )
             applied = await apply_migrations(conn)
     finally:
