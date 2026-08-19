@@ -27,6 +27,7 @@ from db.pool import create_pool
 from db.positions import open_positions
 from db.snapshots import add_snapshot, latest_snapshot
 from db.trades import list_trades, regroup_account
+from ledger.grouping import TransferError
 from importers.base import CorporateActionProposal, ImportBatch
 from importers.registry import get_importer, list_importers
 from ledger.corporate import ActionType, CorporateAction
@@ -767,7 +768,10 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     preview/commit body for `sync`) is what the plan's "no second, parallel
     write path" constraint requires.
     """
-    print(f"parsed {len(batch.fills)} fills, {len(batch.cash)} cash movements")
+    print(
+        f"parsed {len(batch.fills)} fills, {len(batch.cash)} cash movements, "
+        f"{len(batch.transfers)} transfers"
+    )
     for w in batch.warnings:
         print(f"  warning: {w}", file=sys.stderr)
     if batch.unmapped_rows:
@@ -834,8 +838,9 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             unrouted = ImportBatch(
                 fills=tuple(f for f in batch.fills if f.external_ref is None),
                 cash=tuple(c for c in batch.cash if c.external_ref is None),
+                transfers=tuple(t for t in batch.transfers if t.external_ref is None),
             )
-            if (unrouted.fills or unrouted.cash) and not args.account:
+            if (unrouted.fills or unrouted.cash or unrouted.transfers) and not args.account:
                 print(
                     "error: cannot check duplicates -- this file has row(s) "
                     "with no account ref to route by; pass --account to say "
@@ -855,12 +860,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     plan = await route_batch(conn, venue, batch)
                     targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
-                    if (unrouted.fills or unrouted.cash) and args.account:
+                    if (unrouted.fills or unrouted.cash or unrouted.transfers) and args.account:
                         account_id = UUID(args.account)
                         existing = targets.get(account_id, ImportBatch())
                         targets[account_id] = ImportBatch(
                             fills=existing.fills + unrouted.fills,
                             cash=existing.cash + unrouted.cash,
+                            transfers=existing.transfers + unrouted.transfers,
                         )
 
                     # C: mirror --commit's own refusal exactly (see the
@@ -907,8 +913,9 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     unrouted = ImportBatch(
         fills=tuple(f for f in batch.fills if f.external_ref is None),
         cash=tuple(c for c in batch.cash if c.external_ref is None),
+        transfers=tuple(t for t in batch.transfers if t.external_ref is None),
     )
-    if (unrouted.fills or unrouted.cash) and not args.account:
+    if (unrouted.fills or unrouted.cash or unrouted.transfers) and not args.account:
         print(
             "error: this file has row(s) with no account ref to route by "
             "(e.g. this venue's export carries no per-row account number); "
@@ -970,7 +977,7 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
 
             targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
-            if unrouted.fills or unrouted.cash:
+            if unrouted.fills or unrouted.cash or unrouted.transfers:
                 account_id = UUID(args.account)
                 account = await get_account(conn, account_id)
                 if account is None:
@@ -991,6 +998,7 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                 targets[account_id] = ImportBatch(
                     fills=existing.fills + unrouted.fills,
                     cash=existing.cash + unrouted.cash,
+                    transfers=existing.transfers + unrouted.transfers,
                 )
 
             for account_id, sub_batch in targets.items():
@@ -1102,67 +1110,78 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                 return 2
 
             fills_inserted = fills_skipped = cash_inserted = trades_regrouped = 0
-            async with conn.transaction():
-                for account_id, sub_batch in targets.items():
-                    result = await commit_batch(conn, account_id, sub_batch, source=source)
-                    fills_inserted += result.fills_inserted
-                    fills_skipped += result.fills_skipped
-                    cash_inserted += result.cash_inserted
-                    trades_regrouped += await regroup_account(conn, account_id)
+            transfers_inserted = 0
+            try:
+                async with conn.transaction():
+                    for account_id, sub_batch in targets.items():
+                        result = await commit_batch(conn, account_id, sub_batch, source=source)
+                        fills_inserted += result.fills_inserted
+                        fills_skipped += result.fills_skipped
+                        cash_inserted += result.cash_inserted
+                        transfers_inserted += result.transfers_inserted
+                        trades_regrouped += await regroup_account(conn, account_id)
 
-                # LATE: spinoff and split, printed here inside the same
-                # transaction as the commit above and after it -- the one
-                # point in this function where either's ratio can be
-                # completed against BOTH pre-existing fills and this
-                # import's own. A real multi-year History export commonly
-                # carries the original purchase and a later corporate action
-                # in the SAME file (see
-                # tests/fixtures/fidelity/real_shape_history.csv); reading
-                # the ledger before commit_batch runs would miss that
-                # purchase entirely and report "no holding" for a ratio
-                # that is, in fact, determinable. Postgres sees a
-                # transaction's own uncommitted writes from within that same
-                # transaction (read-your-own-writes), so this placement --
-                # after the INSERTs, still inside `async with
-                # conn.transaction():` -- picks them up without waiting for
-                # the transaction to actually commit.
-                #
-                # A refused commit (any of the early `return 2`s above, all
-                # of which run before this transaction even opens) never
-                # reaches this section -- nothing has been written in that
-                # case, so a ledger read would be no more complete here than
-                # it was at the EARLY point above. reverse_split,
-                # name_change and merger do not have this problem (see the
-                # EARLY call above, before route_batch) -- only spinoff's and
-                # split's correctness trades away reporting on a refusal,
-                # and on refusal the user sees the refusal's own error and
-                # re-runs; the proposal reaches them on that next,
-                # successful attempt.
-                #
-                # History-dialect rows (the only dialect with corporate
-                # actions) carry no per-row account ref, so the ENTIRE file
-                # routes to one account: args.account, the same one the
-                # unrouted-rows check above already required whenever this
-                # batch has any unrouted fill or cash movement. getattr, not
-                # args.account: several existing tests build a bare
-                # Namespace without this attribute, same reasoning as
-                # cmd_accounts_add's ignore_on_import getattr.
-                account_id_for_corporate = (
-                    UUID(args.account) if getattr(args, "account", None) else None
+                    # LATE: spinoff and split, printed here inside the same
+                    # transaction as the commit above and after it -- the one
+                    # point in this function where either's ratio can be
+                    # completed against BOTH pre-existing fills and this
+                    # import's own. A real multi-year History export commonly
+                    # carries the original purchase and a later corporate action
+                    # in the SAME file (see
+                    # tests/fixtures/fidelity/real_shape_history.csv); reading
+                    # the ledger before commit_batch runs would miss that
+                    # purchase entirely and report "no holding" for a ratio
+                    # that is, in fact, determinable. Postgres sees a
+                    # transaction's own uncommitted writes from within that same
+                    # transaction (read-your-own-writes), so this placement --
+                    # after the INSERTs, still inside `async with
+                    # conn.transaction():` -- picks them up without waiting for
+                    # the transaction to actually commit.
+                    #
+                    # A refused commit (any of the early `return 2`s above, all
+                    # of which run before this transaction even opens) never
+                    # reaches this section -- nothing has been written in that
+                    # case, so a ledger read would be no more complete here than
+                    # it was at the EARLY point above. reverse_split,
+                    # name_change and merger do not have this problem (see the
+                    # EARLY call above, before route_batch) -- only spinoff's and
+                    # split's correctness trades away reporting on a refusal,
+                    # and on refusal the user sees the refusal's own error and
+                    # re-runs; the proposal reaches them on that next,
+                    # successful attempt.
+                    #
+                    # History-dialect rows (the only dialect with corporate
+                    # actions) carry no per-row account ref, so the ENTIRE file
+                    # routes to one account: args.account, the same one the
+                    # unrouted-rows check above already required whenever this
+                    # batch has any unrouted fill or cash movement. getattr, not
+                    # args.account: several existing tests build a bare
+                    # Namespace without this attribute, same reasoning as
+                    # cmd_accounts_add's ignore_on_import getattr.
+                    account_id_for_corporate = (
+                        UUID(args.account) if getattr(args, "account", None) else None
+                    )
+                    ledger_notes = await _ledger_completed_notes_for(
+                        conn, account_id_for_corporate, batch
+                    )
+                    _print_corporate_action_section(
+                        batch,
+                        ledger_notes,
+                        kinds=frozenset({"spinoff", "split"}),
+                        include_cash_in_lieu=False,
+                        header=(
+                            "\n=== Spinoff/split ratio(s) completed against the "
+                            "committed ledger ==="
+                        ),
+                    )
+            except TransferError as exc:
+                print(
+                    f"refusing import: {exc} -- an outbound transfer that the "
+                    "account's ledger cannot honour (importing years out of "
+                    "order?); nothing was committed",
+                    file=sys.stderr,
                 )
-                ledger_notes = await _ledger_completed_notes_for(
-                    conn, account_id_for_corporate, batch
-                )
-                _print_corporate_action_section(
-                    batch,
-                    ledger_notes,
-                    kinds=frozenset({"spinoff", "split"}),
-                    include_cash_in_lieu=False,
-                    header=(
-                        "\n=== Spinoff/split ratio(s) completed against the "
-                        "committed ledger ==="
-                    ),
-                )
+                return 2
     finally:
         # pool.close() waits for every checked-out connection to be released.
         # It must run after the `async with pool.acquire()` block has exited
@@ -1174,7 +1193,8 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
 
     print(
         f"inserted {fills_inserted} fills ({fills_skipped} already present), "
-        f"{cash_inserted} cash movements, {trades_regrouped} trades regrouped"
+        f"{cash_inserted} cash movements, {transfers_inserted} transfers, "
+        f"{trades_regrouped} trades regrouped"
     )
     return 0
 
@@ -1259,6 +1279,43 @@ async def cmd_regroup(args) -> int:
         # waiting for a release that will never come.
         await pool.close()
     print(f"{written} trades")
+    return 0
+
+
+async def cmd_transfers(args) -> int:
+    """List outbound asset transfers (branch B). A stored row type with no
+    read path is invisible; this exists for post-import verification."""
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.occurred_at, t.direction, t.quantity, t.market_value,
+                       t.note, a.name AS account_name, i.symbol
+                  FROM asset_transfer t
+                  JOIN account a    ON a.id = t.account_id
+                  JOIN instrument i ON i.id = t.instrument_id
+                 WHERE ($1::uuid IS NULL OR t.account_id = $1)
+                 ORDER BY t.occurred_at, t.id
+                """,
+                UUID(args.account) if args.account else None,
+            )
+    finally:
+        # See cmd_import's identical comment: pool.close() must run after the
+        # `async with pool.acquire()` block has exited, never from inside it,
+        # or close() deadlocks waiting for a release that will never come.
+        await pool.close()
+    if not rows:
+        print("no transfers")
+        return 0
+    for t in rows:
+        mv = t["market_value"]
+        print(
+            f"{t['occurred_at']:%Y-%m-%d}  {t['account_name']:<12} "
+            f"{t['symbol']:<8} {t['direction']:<4} qty={t['quantity']}  "
+            f"mv={mv if mv is not None else '--'}"
+            + (f"  note={t['note']}" if t["note"] else "")
+        )
     return 0
 
 
@@ -2415,6 +2472,12 @@ def main() -> int:
     p_trades = sub.add_parser("trades")
     p_trades.add_argument("--account")
     p_trades.set_defaults(fn=cmd_trades)
+
+    p_transfers = sub.add_parser("transfers", help="outbound asset transfers (ACAT)")
+    transfers_sub = p_transfers.add_subparsers(dest="transfers_cmd", required=True)
+    p_transfers_list = transfers_sub.add_parser("list", help="list stored transfers")
+    p_transfers_list.add_argument("--account")
+    p_transfers_list.set_defaults(fn=cmd_transfers)
 
     p_positions = sub.add_parser(
         "positions", help="open positions, with unrealized P&L where marked"

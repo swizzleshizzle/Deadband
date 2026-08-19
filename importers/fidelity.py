@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from importers.base import (
     CanonicalCash,
     CanonicalFill,
+    CanonicalTransfer,
     CorporateActionProposal,
     ImportBatch,
     normalize_field,
@@ -130,6 +131,13 @@ class Outcome(enum.Enum):
     # exists so the refusal names the verb, and blocks unconditionally
     # rather than depending on what the row's money columns happen to hold.
     UNSUPPORTED = "unsupported"
+    # An outbound ACAT (branch B): the share leg becomes an asset_transfer
+    # write, the cash residual a transfer_out cash movement -- both committed
+    # directly with content-hash dedupe, unlike corporate actions, which stay
+    # proposals (spec D5). Any other shape under the verb -- an inbound-looking
+    # row above all -- REFUSES the file (spec D6): an inbound transfer arrives
+    # with basis this ledger has no source for, and guessing would be worse.
+    TRANSFER = "transfer"
     # Recognised, produces nothing, and does NOT block -- the row's follow-up
     # is a `corporate add` proposal, not a fill or a cash movement.
     #
@@ -227,6 +235,10 @@ RULES: tuple[Rule, ...] = (
     # the exports have never shown.
     Rule("rollover_deposit", "ROLLOVER CASH CHECK", Outcome.CASH, cash_kind="deposit"),
     Rule("early_distribution", "EARLY DIST", Outcome.CASH, cash_kind="withdrawal"),
+    # Branch B. One rule for the whole verb family: the two legs (shares vs
+    # residual cash) and the inbound refusal are told apart by row SHAPE in
+    # parse(), not by verb text -- see Outcome.TRANSFER's docstring.
+    Rule("acat_transfer", "TRANSFER OF ASSETS", Outcome.TRANSFER),
     Rule("expired_option", "EXPIRED", Outcome.EXPIRY),
     Rule("assigned_option", "ASSIGNED", Outcome.UNSUPPORTED),
     Rule("exercised_option", "EXERCISED", Outcome.UNSUPPORTED),
@@ -942,6 +954,7 @@ class FidelityImporter:
     def parse(self, text: str) -> ImportBatch:
         fills: list[CanonicalFill] = []
         cash: list[CanonicalCash] = []
+        transfers: list[CanonicalTransfer] = []
         warnings: list[str] = []
         unmapped: list[str] = []
         # CORPORATE_ACTION rows (cash-in-lieu excluded), collected here and
@@ -1478,6 +1491,72 @@ class FidelityImporter:
                 )
                 continue
 
+            if rule.outcome is Outcome.TRANSFER:
+                try:
+                    quantity = _decimal(row.get("quantity"))
+                    amount = _decimal(row.get("amount"))
+                except InvalidOperation as exc:
+                    reject(row, raw_row, account, line_no, f"line {line_no}: bad number ({exc})")
+                    continue
+                if not quantity.is_finite() or not amount.is_finite():
+                    reject(
+                        row,
+                        raw_row,
+                        account,
+                        line_no,
+                        f"line {line_no}: non-finite number, skipped",
+                    )
+                    continue
+
+                if symbol and quantity < 0 and amount <= 0:
+                    # Shares delivered out. Amount is the broker's market-value
+                    # stamp, NOT a transaction price -- it rides along as
+                    # information and never touches P&L (the position closes at
+                    # average cost; see ledger/pnl.py).
+                    instrument = parse_option_symbol(symbol) or Instrument(
+                        id=None,
+                        asset_class=AssetClass.EQUITY,
+                        symbol=symbol.upper(),
+                        quote_currency="USD",
+                    )
+                    transfers.append(
+                        CanonicalTransfer(
+                            instrument=instrument,
+                            occurred_at=when,
+                            quantity=abs(quantity),
+                            market_value=abs(amount) or None,
+                            external_ref=account,
+                            note=(row.get("description") or "").strip() or None,
+                        )
+                    )
+                    continue
+
+                if not symbol and quantity == 0 and amount < 0:
+                    # The residual cash leg. Canonical amounts are positive;
+                    # direction lives in the kind (OUTFLOW_KINDS).
+                    cash.append(
+                        CanonicalCash(
+                            occurred_at=when,
+                            kind="transfer_out",
+                            amount=abs(amount),
+                            currency="USD",
+                            symbol=None,
+                            external_ref=account,
+                            note=(row.get("description") or "").strip() or None,
+                        )
+                    )
+                    continue
+
+                message = (
+                    f"line {line_no}: TRANSFER OF ASSETS row is not an outbound "
+                    "delivery -- an inbound transfer arrives with basis this "
+                    "ledger has no source for (spec D2/D6); refusing the file"
+                )
+                warnings.append(message)
+                unmapped.append(str(raw_row))
+                blocking.append((account, message))
+                continue
+
             if rule.outcome is not Outcome.CASH:
                 raise AssertionError(f"unhandled rule outcome {rule.outcome!r}")
             try:
@@ -1528,6 +1607,7 @@ class FidelityImporter:
         return ImportBatch(
             fills=tuple(fills),
             cash=tuple(cash),
+            transfers=tuple(transfers),
             warnings=tuple(warnings),
             unmapped_rows=tuple(unmapped),
             refs_seen=tuple(sorted(refs_seen)),

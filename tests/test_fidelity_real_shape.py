@@ -203,7 +203,10 @@ def test_every_rule_is_exercised_by_a_fixture_row():
         rule = classify(row["Action"], row["Symbol"])
         if rule is not None:
             matched.add(rule.name)
-    _history_dialect_only_cash_rules = {"rollover_deposit", "early_distribution"}
+    # acat_transfer joins by the same verified reasoning: both real TRANSFER
+    # OF ASSETS rows live in a History_for_Account_* file (branch B spec §1),
+    # none in this fixture's Activity & Orders shape.
+    _history_dialect_only_cash_rules = {"rollover_deposit", "early_distribution", "acat_transfer"}
     required = {
         r.name
         for r in RULES
@@ -278,7 +281,7 @@ def test_retirement_cash_rules_are_exercised_by_the_history_fixture():
         rule = classify(row.get("Action") or "", row.get("Symbol") or "")
         if rule is not None:
             matched.add(rule.name)
-    required = {"rollover_deposit", "early_distribution"}
+    required = {"rollover_deposit", "early_distribution", "acat_transfer"}
     assert required - matched == set()
 
 

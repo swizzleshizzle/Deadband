@@ -4810,3 +4810,147 @@ async def test_cmd_migrate_existed_before_asks_about_the_schema_apply_writes(
     out = capsys.readouterr().out
     assert "regroup" not in out.lower()
     assert "001_a2_ledger_completion.sql" in out
+
+
+# --- transfers (branch B): cmd_import reports them, and a transfer the ledger
+# --- cannot honour fails cleanly instead of dumping a traceback.
+
+_ACAT_HISTORY_CSV = (
+    "Run Date,Action,Symbol,Description,Type,Price ($),Quantity,"
+    "Commission ($),Fees ($),Accrued Interest ($),Amount ($),"
+    "Cash Balance ($),Settlement Date\n"
+    '03/11/2026,TRANSFER OF ASSETS ACAT DELIVER FAKECO INC COM'
+    ' (ZXCO) (Cash),ZXCO,FAKECO INC COM,Cash,"","-40","","","","-259.2",0,""\n'
+    '03/11/2026,TRANSFER OF ASSETS ACAT DELIVER (Cash),"",'
+    'No Description,Cash,"",0,"","","","-114.37",0,""\n'
+)
+
+
+async def _seed_zxco_position(conn, acc):
+    from db.fills import insert_fills
+    from db.instruments import upsert_instrument
+    from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
+    from uuid import uuid4 as _u
+
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"),
+    )
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=_u(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=datetime(2026, 1, 5, 15, 0, tzinfo=UTC),
+                side=Side.BUY,
+                quantity=Decimal("40"),
+                price=Decimal("6"),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id="seed1",
+                is_estimated=False,
+            )
+        ],
+    )
+
+
+async def test_cmd_import_reports_the_transfer_count(conn, monkeypatch, capsys, tmp_path):
+    acc = await create_account(conn, name="TX", venue="fidelity", account_type="cash")
+    await _seed_zxco_position(conn, acc)
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    f = tmp_path / "acat.csv"
+    f.write_text(_ACAT_HISTORY_CSV, encoding="utf-8")
+
+    rc = await cli.cmd_import(
+        argparse.Namespace(venue="fidelity", file=str(f), account=str(acc), commit=True)
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 transfers" in out
+    assert await conn.fetchval(
+        "SELECT count(*) FROM asset_transfer WHERE account_id = $1", acc
+    ) == 1
+    assert await conn.fetchval(
+        "SELECT count(*) FROM cash_movement WHERE account_id = $1 AND kind = 'transfer_out'",
+        acc,
+    ) == 1
+
+
+async def test_cmd_import_transfer_without_position_fails_cleanly(
+    conn, monkeypatch, capsys, tmp_path
+):
+    """A transfer-out of shares the account never held (e.g. importing years
+    out of order) must refuse with exit 2 and roll back -- not dump a
+    TransferError traceback with half the batch committed."""
+    acc = await create_account(conn, name="TY", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    f = tmp_path / "acat.csv"
+    f.write_text(_ACAT_HISTORY_CSV, encoding="utf-8")
+
+    rc = await cli.cmd_import(
+        argparse.Namespace(venue="fidelity", file=str(f), account=str(acc), commit=True)
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "transfer" in err.lower()
+    assert await conn.fetchval(
+        "SELECT count(*) FROM asset_transfer WHERE account_id = $1", acc
+    ) == 0
+
+
+async def test_cmd_transfers_lists_a_transfer(conn, monkeypatch, capsys):
+    from db.transfers import insert_transfers
+    from ledger.types import AssetTransfer
+    from uuid import uuid4 as _u
+
+    acc = await create_account(conn, name="TL", venue="fidelity", account_type="cash")
+    await _seed_zxco_position(conn, acc)
+    inst = await conn.fetchval("SELECT instrument_id FROM fill WHERE account_id = $1", acc)
+    await insert_transfers(
+        conn,
+        [
+            AssetTransfer(
+                id=_u(),
+                account_id=acc,
+                instrument_id=inst,
+                occurred_at=datetime(2026, 3, 11, tzinfo=UTC),
+                quantity=Decimal("40"),
+                market_value=Decimal("259.20"),
+            )
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_transfers(argparse.Namespace(account=None))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ZXCO" in out
+    assert "40" in out
+    assert "out" in out
+
+
+async def test_cmd_transfers_reports_when_empty(conn, monkeypatch, capsys):
+    acc = await create_account(conn, name="TE", venue="fidelity", account_type="cash")
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_transfers(argparse.Namespace(account=str(acc)))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no transfers" in out.lower()

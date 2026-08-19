@@ -664,6 +664,7 @@ RULE_COVERAGE_SAMPLES = [
     # reachability, which is the whole point of the ordering guard in
     # importers/fidelity.py's RULES comment.
     ("DISTRIBUTION ACME HOLDINGS SPON ADS EA... (ACME) (Cash)", "ACME"),  # share_distribution
+    ("TRANSFER OF ASSETS ACAT DELIVER FAKECO INC COM (ZXCO) (Cash)", "ZXCO"),  # acat_transfer
 ]
 
 
@@ -1158,6 +1159,70 @@ def test_every_outcome_member_has_a_dispatch_branch():
             Outcome.CASH,
             Outcome.INTERNAL,
             Outcome.EXPIRY,
+            Outcome.TRANSFER,
             Outcome.UNSUPPORTED,
             Outcome.CORPORATE_ACTION,
         }
+
+
+# --- TRANSFER OF ASSETS ACAT (branch B): the share leg becomes an
+# --- asset-transfer write, the cash residual a transfer_out movement, and any
+# --- inbound-looking shape refuses the file. Shapes mirror the real rows by
+# --- sign and column; every value is invented.
+
+_HISTORY_HEADER = (
+    "Run Date,Action,Symbol,Description,Type,Price ($),Quantity,"
+    "Commission ($),Fees ($),Accrued Interest ($),Amount ($),"
+    "Cash Balance ($),Settlement Date"
+)
+
+
+def _history(*rows):
+    return "\n".join([_HISTORY_HEADER, *rows]) + "\n"
+
+
+def test_acat_share_delivery_becomes_a_transfer():
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,TRANSFER OF ASSETS ACAT DELIVER FAKECO INC COM'
+            ' (ZXCO) (Cash),ZXCO,FAKECO INC COM,Cash,"","-40","","","","-259.2",0,""'
+        )
+    )
+    assert batch.blocking == ()
+    assert len(batch.transfers) == 1
+    t = batch.transfers[0]
+    assert t.quantity == Decimal("40")
+    assert t.market_value == Decimal("259.2")
+    assert t.instrument.symbol == "ZXCO"
+    assert batch.fills == ()
+    assert batch.cash == ()
+
+
+def test_acat_cash_residual_becomes_transfer_out_cash():
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,TRANSFER OF ASSETS ACAT DELIVER (Cash),"",'
+            'No Description,Cash,"",0,"","","","-114.37",0,""'
+        )
+    )
+    assert batch.blocking == ()
+    assert batch.transfers == ()
+    assert len(batch.cash) == 1
+    c = batch.cash[0]
+    assert c.kind == "transfer_out"
+    assert c.amount == Decimal("114.37")
+
+
+def test_inbound_shaped_acat_blocks_the_import():
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,TRANSFER OF ASSETS ACAT RECEIVE FAKECO INC COM'
+            ' (ZXCO) (Cash),ZXCO,FAKECO INC COM,Cash,"","40","","","","259.2",0,""'
+        )
+    )
+    assert batch.transfers == ()
+    assert batch.cash == ()
+    assert len(batch.blocking) == 1
+    _ref, reason = batch.blocking[0]
+    assert "TRANSFER OF ASSETS" in reason
+    assert "inbound" in reason.lower()

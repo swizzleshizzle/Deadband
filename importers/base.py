@@ -51,7 +51,7 @@ def normalize_field(name: str | None) -> str:
 # defined ONCE here so a consumer that needs to net cash movements (e.g. sum
 # deposits minus withdrawals/fees) has a single shared source for "which kinds
 # subtract" instead of every caller inventing its own sign map.
-OUTFLOW_KINDS = frozenset({"withdrawal", "fee", "tax"})
+OUTFLOW_KINDS = frozenset({"withdrawal", "fee", "tax", "transfer_out"})
 
 
 def _escape(part: str) -> str:
@@ -137,6 +137,23 @@ class CanonicalFill:
     # the distinction exists so contributed_capital can exclude reinvestment
     # while cost_basis stays tax-correct. Constrained by fill_funding_source_chk.
     funding_source: str = "external"
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTransfer:
+    """The share leg of an outbound ACAT (branch B): shares leave the account
+    with their basis; `market_value` is the broker's stamp, informational only
+    and never a transaction price. Written directly by commit_batch (spec D5)
+    -- account-scoped and mechanical like fills, unlike corporate actions,
+    which stay proposals."""
+
+    instrument: Instrument
+    occurred_at: datetime
+    quantity: Decimal  # always positive; direction is implicitly 'out' (spec D2)
+    market_value: Decimal | None
+    venue_ref: str | None = None
+    external_ref: str | None = None  # venue's account number, for routing
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +282,9 @@ class CorporateActionProposal:
 class ImportBatch:
     fills: tuple[CanonicalFill, ...] = ()
     cash: tuple[CanonicalCash, ...] = ()
+    # Outbound ACAT share legs (branch B). Committed directly with content-hash
+    # dedupe, same trust level as fills/cash; see CanonicalTransfer.
+    transfers: tuple[CanonicalTransfer, ...] = ()
     warnings: tuple[str, ...] = ()
     unmapped_rows: tuple[str, ...] = ()
     # Every distinct account ref seen in the RAW rows, whether or not the row
