@@ -5,8 +5,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ledger.grouping import group_fills
-from ledger.types import Direction, Fill, FillSource, Side, TradeStatus
+from ledger.grouping import TransferError, group_fills
+from ledger.types import AssetTransfer, Direction, Fill, FillSource, Side, TradeStatus
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 BTC = UUID("00000000-0000-0000-0000-0000000000b1")
@@ -286,3 +286,74 @@ def test_simultaneous_fills_deterministic_by_id():
     assert result_forward == result_reversed
     assert len(result_forward) == 1
     assert result_forward[0].status is TradeStatus.CLOSED
+
+
+# --- transfers (branch B): reduce-only closing events. Loud or not at all --
+# --- never clamped, never against a short, never with nothing held.
+
+
+def xfer(qty, minutes=0, instrument=BTC, account=ACC) -> AssetTransfer:
+    return AssetTransfer(
+        id=uuid4(),
+        account_id=account,
+        instrument_id=instrument,
+        occurred_at=T0 + timedelta(minutes=minutes),
+        quantity=Decimal(qty),
+        market_value=None,
+    )
+
+
+def test_transfer_out_closes_the_position():
+    fills = [fill(Side.BUY, "40", "6", 0)]
+    groups = group_fills(fills, [xfer("40", minutes=10)])
+    assert len(groups) == 1
+    g = groups[0]
+    assert g.status is TradeStatus.CLOSED
+    assert g.closed_at == T0 + timedelta(minutes=10)
+    assert len(g.transfers) == 1
+    assert g.transfers[0].quantity == Decimal(40)
+    assert total(g) == Decimal(40)  # allocations hold only the BUY
+
+
+def test_partial_transfer_leaves_the_trade_open():
+    fills = [fill(Side.BUY, "40", "6", 0)]
+    groups = group_fills(fills, [xfer("15", minutes=10)])
+    assert len(groups) == 1
+    g = groups[0]
+    assert g.status is TradeStatus.OPEN
+    assert g.closed_at is None
+    assert g.transfers[0].quantity == Decimal(15)
+
+
+def test_transfer_exceeding_position_raises():
+    fills = [fill(Side.BUY, "10", "6", 0)]
+    with pytest.raises(TransferError):
+        group_fills(fills, [xfer("45", minutes=10)])
+
+
+def test_transfer_against_a_short_position_raises():
+    fills = [fill(Side.SELL, "10", "6", 0)]
+    with pytest.raises(TransferError):
+        group_fills(fills, [xfer("5", minutes=10)])
+
+
+def test_transfer_with_no_open_position_raises():
+    with pytest.raises(TransferError):
+        group_fills([], [xfer("5")])
+
+
+def test_same_timestamp_fill_processes_before_transfer():
+    # BUY and transfer share one timestamp: the buy opens, the transfer closes.
+    fills = [fill(Side.BUY, "40", "6", 0)]
+    groups = group_fills(fills, [xfer("40", minutes=0)])
+    assert len(groups) == 1
+    assert groups[0].status is TradeStatus.CLOSED
+
+
+def test_transfer_only_touches_its_own_instrument():
+    fills = [fill(Side.BUY, "40", "6", 0), fill(Side.BUY, "7", "9", 0, instrument=ETH)]
+    groups = group_fills(fills, [xfer("40", minutes=10)])
+    by_inst = {g.instrument_ids[0]: g for g in groups}
+    assert by_inst[BTC].status is TradeStatus.CLOSED
+    assert by_inst[ETH].status is TradeStatus.OPEN
+    assert by_inst[ETH].transfers == ()

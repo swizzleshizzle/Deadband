@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from uuid import UUID
 
-from ledger.grouping import FillAllocation
+from ledger.grouping import FillAllocation, TransferAllocation
 from ledger.types import Direction, Fill, Side
 
 _QUANT = Decimal("1E-18")
@@ -44,6 +44,10 @@ class TradePnL:
     realized_pnl: Decimal  # net of fees
     open_quantity: Decimal
     open_cost_basis: Decimal  # per unit, running average after closes (excluding multiplier)
+    # Quantity that left via outbound transfer (branch B): closed the position
+    # at average cost, realising nothing. Not part of qty_closed -- a transfer
+    # is not an exit decision and never enters avg_exit or fee recognition.
+    qty_transferred: Decimal = Decimal(0)
 
 
 def compute_pnl(
@@ -51,6 +55,7 @@ def compute_pnl(
     fills_by_id: Mapping[UUID, Fill],
     multipliers: Mapping[UUID, Decimal],
     direction: Direction,
+    transfers: Sequence[TransferAllocation] = (),
 ) -> TradePnL:
     """Walk allocations chronologically, maintaining a running average cost."""
     if direction is Direction.SPREAD:
@@ -61,10 +66,13 @@ def compute_pnl(
     with localcontext() as ctx:
         ctx.prec = 50
 
-        ordered = sorted(
-            allocations,
-            key=lambda a: (fills_by_id[a.fill_id].executed_at, str(a.fill_id)),
-        )
+        # Fills sort before transfers at a tied timestamp, mirroring grouping's
+        # rule: a broker's same-day executions precede its ACAT snapshot.
+        events: list[tuple] = [
+            (fills_by_id[a.fill_id].executed_at, 0, str(a.fill_id), a) for a in allocations
+        ] + [(t.occurred_at, 1, str(t.transfer_id), t) for t in transfers]
+        events.sort(key=lambda e: (e[0], e[1], e[2]))
+        ordered = [e[3] for e in events]
         opening_side = Side.SELL if direction is Direction.SHORT else Side.BUY
 
         position = Decimal(0)  # units of open position
@@ -79,7 +87,30 @@ def compute_pnl(
         fees_exit = Decimal(0)
         entry_mult = Decimal(0)
 
+        qty_transferred = Decimal(0)
+
         for alloc in ordered:
+            if isinstance(alloc, TransferAllocation):
+                # Reduce-only, at running average cost: the removed slice takes
+                # its exact share of basis with it and contributes nothing to
+                # gross, exits, or fee recognition -- zero realised P&L is a
+                # consequence of this shape, not an adjustment made elsewhere.
+                # Grouping (ledger/grouping.py) has already validated the
+                # transfer against the walk; a violation here means the caller
+                # passed transfers grouping never saw.
+                if position <= 0 or alloc.quantity > position:
+                    raise ValueError(
+                        f"transfer of {alloc.quantity} cannot apply to a position of {position}"
+                    )
+                if alloc.quantity == position:
+                    basis_total = Decimal(0)  # exact: no division at all
+                    position = Decimal(0)
+                else:
+                    basis_total -= basis_total * (alloc.quantity / position)
+                    position -= alloc.quantity
+                qty_transferred += alloc.quantity
+                continue
+
             f = fills_by_id[alloc.fill_id]
             qty = alloc.quantity
             try:
@@ -173,6 +204,7 @@ def compute_pnl(
             realized_pnl=gross_val - fees_realized_val,
             open_quantity=position,
             open_cost_basis=open_cost_basis_val,
+            qty_transferred=qty_transferred,
         )
 
 
