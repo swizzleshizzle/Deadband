@@ -320,7 +320,9 @@ exit code cannot tell `DRIFT` from `UNRELIABLE` apart, nor one refusal from anot
 stderr and the printed verdict for that.
 
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
-tests; set it to run them too).
+tests; set it to run them too). The DB suite builds a disposable per-session schema, so
+the `TEST_PG_DSN` role needs `CREATE` on the database itself (`GRANT CREATE ON DATABASE
+<db> TO <role>`), not merely write access to `public`.
 
 ## Subsystems
 

@@ -124,7 +124,7 @@ async def _build(conn, namespace: str, sql_files: list[pathlib.Path]) -> None:
     await conn.execute(f'SET search_path TO "{namespace}"')
     for path in sql_files:
         await conn.execute(path.read_text())
-    await conn.execute("SET search_path TO public")
+    await conn.execute("RESET search_path")
 
 
 @requires_db
@@ -236,7 +236,7 @@ async def test_schema_sql_then_migrations_upgrades_a_pre_existing_database(conn)
         await conn.execute('SET search_path TO "eq_upgraded"')
         for path in (DB_DIR / "schema.sql", *migrations):
             await conn.execute(path.read_text())
-        await conn.execute("SET search_path TO public")
+        await conn.execute("RESET search_path")
 
         fresh = await _describe(conn, "eq_fresh")
         upgraded = await _describe(conn, "eq_upgraded")
@@ -274,7 +274,7 @@ async def test_schema_sql_then_migrations_upgrades_a_pre_existing_database(conn)
         # rollback still drops the namespaces in that case, so suppressing
         # here leaks nothing.
         try:
-            await conn.execute("SET search_path TO public")
+            await conn.execute("RESET search_path")
             for ns in ("eq_fresh", "eq_upgraded"):
                 await conn.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE')
         except asyncpg.PostgresError:
