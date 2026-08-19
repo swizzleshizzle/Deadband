@@ -23,8 +23,10 @@ from ledger.corporate import (
     CorporateAction,
     _spinoff_fill_id,
     adjust_fills,
+    adjust_transfers,
 )
 from ledger.grouping import group_fills
+from db.transfers import fetch_transfers
 from ledger.pnl import compute_pnl
 from ledger.types import TradeIntent
 
@@ -52,9 +54,11 @@ _TRADE_UPSERT_BODY = """
                     account_id, {opening}, primary_underlying, effective_instrument_id,
                     direction, status, intent, grouping_mode, opened_at, closed_at, qty_opened,
                     qty_closed, avg_entry, avg_exit, realized_pnl, gross_realized_pnl,
-                    fees_total, fees_realized, open_quantity, open_cost_basis, is_estimated
+                    fees_total, fees_realized, open_quantity, open_cost_basis, is_estimated,
+                    qty_transferred
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,'auto',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+                    $1,$2,$3,$4,$5,$6,$7,'auto',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                    $21
                 )
                 ON CONFLICT (account_id, {opening}) WHERE {opening} IS NOT NULL
                 DO UPDATE SET
@@ -75,6 +79,7 @@ _TRADE_UPSERT_BODY = """
                     open_quantity            = EXCLUDED.open_quantity,
                     open_cost_basis          = EXCLUDED.open_cost_basis,
                     is_estimated             = EXCLUDED.is_estimated,
+                    qty_transferred          = EXCLUDED.qty_transferred,
                     updated_at               = now()
                 RETURNING id
 """
@@ -184,15 +189,22 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     derived_provenance: dict[UUID, tuple[UUID, UUID]] = {}
     spinoffs: list[tuple[UUID, CorporateAction]] = []
 
-    if fills:
+    # Transfers (branch B) enter the same pipeline as fills, at the same
+    # moment: adjusted by the same actions BEFORE grouping (D7), so a transfer
+    # that predates a later split rescales exactly as the fills it closes out.
+    transfers = await fetch_transfers(conn, account_id)
+
+    if fills or transfers:
         pairs = await actions_with_ids_for_instruments(
-            conn, list({f.instrument_id for f in fills})
+            conn,
+            list({f.instrument_id for f in fills} | {t.instrument_id for t in transfers}),
         )
         if pairs:
             # Kept for the provenance pass below, which runs AFTER adjustment so
             # it can stop as soon as the fills that actually exist are attributed.
             spinoffs = [(aid, a) for aid, a in pairs if a.action_type is ActionType.SPINOFF]
             fills = adjust_fills(fills, [a for _id, a in pairs])
+            transfers = adjust_transfers(transfers, [a for _id, a in pairs])
 
     derived = [f for f in fills if f.id not in real_ids]
 
@@ -340,7 +352,11 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     seen_derived_openings: list[UUID] = []
     written = 0
 
-    if fills:
+    # `or transfers`: an account holding ONLY a transfer (e.g. importing years
+    # out of order) must still reach group_fills, whose TransferError is the
+    # loud refusal spec section 4 requires -- skipping on empty fills would
+    # silently accept an outflow of shares the ledger never saw arrive.
+    if fills or transfers:
         by_id = {f.id: f for f in fills}
         multipliers = await get_multipliers(conn, [f.instrument_id for f in fills])
         # IMPORTANT 3: primary_underlying must roll options up under their stock
@@ -357,10 +373,12 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
             )
         }
 
-        groups = group_fills(fills)
+        groups = group_fills(fills, transfers)
 
         for g in groups:
-            pnl = compute_pnl(g.allocations, by_id, multipliers, g.direction)
+            pnl = compute_pnl(
+                g.allocations, by_id, multipliers, g.direction, transfers=g.transfers
+            )
             # The opening allocation is this trade's stable identity across regroups.
             opening_allocation = min(
                 g.allocations, key=lambda a: (by_id[a.fill_id].executed_at, str(a.fill_id))
@@ -408,6 +426,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                 pnl.open_quantity,
                 pnl.open_cost_basis,
                 is_estimated,
+                pnl.qty_transferred if g.transfers else None,
             )
 
             # r_multiple depends on planned_risk, which is user-authored — recompute
@@ -497,7 +516,7 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
                opening_fill_id = NULL,
                opening_derived_fill_id = NULL,
                effective_instrument_id = NULL,
-               qty_opened = NULL, qty_closed = NULL,
+               qty_opened = NULL, qty_closed = NULL, qty_transferred = NULL,
                avg_entry = NULL, avg_exit = NULL,
                realized_pnl = NULL, gross_realized_pnl = NULL,
                fees_total = NULL, fees_realized = NULL,

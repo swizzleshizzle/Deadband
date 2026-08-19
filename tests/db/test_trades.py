@@ -12,8 +12,9 @@ from db.fills import fetch_fills, insert_fills
 from db.instruments import upsert_instrument
 from db.positions import open_positions
 from db.trades import UnattributableDerivedFillError, list_trades, regroup_account
+from db.transfers import insert_transfers
 from ledger.corporate import _spinoff_fill_id, adjust_fills
-from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
+from ledger.types import AssetClass, AssetTransfer, Fill, FillSource, Instrument, Side
 from tests.conftest import requires_db
 
 # account_with_1800, zxcb and zxcc are fixtures, auto-discovered from conftest.py.
@@ -1562,3 +1563,71 @@ async def test_only_a_spinoff_mints_a_fill_id(conn, account_with_1800, zxcb):
         # they preserve every id and drop nothing -- so equality is the honest
         # statement of what "does not mint an id" means here.
         assert {f.id for f in adjusted} == before
+
+
+# --- transfers (branch B): regroup threads them end to end.
+
+
+async def _seed_transfer(conn, acc, *, qty="40", when=None):
+    inst = await conn.fetchval("SELECT instrument_id FROM fill WHERE account_id = $1 LIMIT 1", acc)
+    t = AssetTransfer(
+        id=uuid4(),
+        account_id=acc,
+        instrument_id=inst,
+        occurred_at=when or (T0 + timedelta(hours=1)),
+        quantity=Decimal(qty),
+        market_value=Decimal("259.20"),
+    )
+    await insert_transfers(conn, [t])
+    return t
+
+
+async def test_regroup_closes_a_transferred_position_with_zero_pnl(conn):
+    acc = await seed(conn, [(Side.BUY, "40", "6")])
+    t = await _seed_transfer(conn, acc, qty="40")
+    assert await regroup_account(conn, acc) == 1
+    trades = await list_trades(conn, acc)
+    assert len(trades) == 1
+    row = trades[0]
+    assert row["status"] == "closed"
+    assert row["qty_transferred"] == Decimal(40)
+    assert row["realized_pnl"] == 0
+    assert row["open_quantity"] == 0
+    assert row["closed_at"] == t.occurred_at
+    assert row["avg_exit"] is None
+    assert not await open_positions(conn, acc)
+
+
+async def test_regroup_pre_split_transfer_is_adjusted_before_grouping(conn, account_with_1800):
+    # account_with_1800: BUY 1800 @ 0.05 before the 2026-03-02 ex-date. Transfer
+    # the full 1800 out, also before the ex-date, then record the 1:6 reverse
+    # split. Both sides adjust, so the trade closes cleanly at 300/300.
+    acc, inst = account_with_1800
+    await insert_transfers(
+        conn,
+        [
+            AssetTransfer(
+                id=uuid4(),
+                account_id=acc,
+                instrument_id=inst,
+                occurred_at=datetime(2026, 2, 15, 9, 0, tzinfo=UTC),
+                quantity=Decimal("1800"),
+                market_value=None,
+            )
+        ],
+    )
+    await add_action(conn, _split(inst))
+    assert await regroup_account(conn, acc) == 1
+    trades = await list_trades(conn, acc)
+    row = trades[0]
+    assert row["status"] == "closed"
+    assert row["qty_transferred"] == Decimal(300)
+    assert row["qty_opened"] == Decimal(300)
+    assert row["realized_pnl"] == 0
+
+
+async def test_regroup_without_transfers_leaves_qty_transferred_null(conn):
+    acc = await seed(conn, [(Side.BUY, "2", "100")])
+    await regroup_account(conn, acc)
+    trades = await list_trades(conn, acc)
+    assert trades[0]["qty_transferred"] is None
