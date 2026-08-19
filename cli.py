@@ -46,9 +46,12 @@ async def cmd_migrate(_args) -> int:
             # having just been created on a virgin one. Those are different
             # outcomes and must not share one message. Check for a table
             # schema.sql creates before calling apply(), while it's still
-            # meaningful to ask "did this exist already?".
+            # meaningful to ask "did this exist already?". Resolved via
+            # search_path, not pinned to public: apply() writes wherever the
+            # connection's search_path points, and the answer must be about
+            # that schema.
             existed_before = await conn.fetchval(
-                "SELECT to_regclass('public.account') IS NOT NULL"
+                "SELECT to_regclass('account') IS NOT NULL"
             )
             applied = await apply_migrations(conn)
     finally:

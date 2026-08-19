@@ -27,7 +27,7 @@ MIGRATION_003 = DB_DIR / "migrations" / "003_derived_fills.sql"
 
 
 async def test_schema_creates_expected_tables(conn):
-    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+    rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")
     names = {r["tablename"] for r in rows}
     assert {
         "account",

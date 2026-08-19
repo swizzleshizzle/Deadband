@@ -189,7 +189,8 @@ async def test_cmd_migrate_does_not_warn_to_regroup_on_a_virgin_database(
     as the existing virgin-database test above) to reach that state, then
     runs the real cmd_migrate. Fails if the regroup warning fires even though
     `existed_before` is False."""
-    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    schema = await conn.fetchval("SELECT current_schema()")
+    await conn.execute(f'DROP SCHEMA "{schema}" CASCADE; CREATE SCHEMA "{schema}";')
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
@@ -236,13 +237,15 @@ async def test_cmd_migrate_reports_applied_migration_names(conn, monkeypatch, ca
 
 
 async def test_cmd_migrate_reports_schema_created_on_a_virgin_database(conn, monkeypatch, capsys):
-    """Drops and recreates the public schema on `conn` (rolled back by
+    """Drops and recreates the conn's own schema (since issue #15's fix, the
+    per-session namespace, not public) on `conn` (rolled back by
     conftest's `conn` fixture at teardown, same as every other test here) to
     put it in the "never migrated" state a brand-new Postgres would be in,
     then runs the real cmd_migrate against it. Fails if cmd_migrate still says
     "already up to date": that is what it said before this fix, on a database
     that had zero tables a moment earlier."""
-    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    schema = await conn.fetchval("SELECT current_schema()")
+    await conn.execute(f'DROP SCHEMA "{schema}" CASCADE; CREATE SCHEMA "{schema}";')
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
