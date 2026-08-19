@@ -88,6 +88,29 @@ class Instrument:
 
 
 @dataclass(frozen=True, slots=True)
+class AssetTransfer:
+    """The share leg of an outbound ACAT (branch B). Not a fill: no transaction
+    price exists, and booking one would fabricate P&L -- the position closes at
+    average cost instead (ledger/pnl.py). `market_value` is the broker's stamp,
+    informational only. Direction is implicitly 'out'; the schema constrains it
+    and an inbound concept is deliberately undesigned (spec D2)."""
+
+    id: UUID | None
+    account_id: UUID
+    instrument_id: UUID
+    occurred_at: datetime
+    quantity: Decimal
+    market_value: Decimal | None
+    venue_ref: str | None = None
+    content_hash: str | None = None
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.quantity <= 0:
+            raise ValueError(f"transfer quantity must be positive, got {self.quantity}")
+
+
+@dataclass(frozen=True, slots=True)
 class Fill:
     id: UUID | None
     account_id: UUID
