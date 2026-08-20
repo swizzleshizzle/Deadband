@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncpg
 from fastapi import APIRouter, Request
 
+from api.serialization import DeadbandJSONResponse
 from db.migrate import MIGRATIONS
 
 router = APIRouter()
@@ -20,7 +21,7 @@ async def _pending(conn: asyncpg.Connection) -> list[str]:
 
 
 @router.get("/api/health")
-async def health(request: Request) -> dict:
+async def health(request: Request) -> DeadbandJSONResponse:
     from api.deps import ensure_pool
 
     try:
@@ -28,9 +29,9 @@ async def health(request: Request) -> dict:
         async with pool.acquire() as conn:
             pending = await _pending(conn)
     except Exception:
-        return {"db": False, "migrations_current": False, "pending_migrations": []}
-    return {
-        "db": True,
-        "migrations_current": not pending,
-        "pending_migrations": pending,
-    }
+        return DeadbandJSONResponse(
+            {"db": False, "migrations_current": False, "pending_migrations": []}
+        )
+    return DeadbandJSONResponse(
+        {"db": True, "migrations_current": not pending, "pending_migrations": pending}
+    )

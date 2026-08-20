@@ -11,6 +11,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.deps import get_conn
+from api.serialization import DeadbandJSONResponse
 from db.marks import latest_marks
 from db.trades import query_trades
 from ledger.pnl import unrealized_pnl
@@ -31,7 +32,7 @@ async def trades(
     tag: str | None = None,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-) -> dict:
+) -> DeadbandJSONResponse:
     rows, total = await query_trades(
         conn,
         account_id=account,
@@ -49,13 +50,18 @@ async def trades(
         limit=limit,
         offset=offset,
     )
-    return {"trades": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+    # Returned as the response class directly, NOT a bare dict: FastAPI's
+    # jsonable_encoder would str() every Decimal first (a quantized zero
+    # becomes '0E-18') and the exact-decimal renderer would never see them.
+    return DeadbandJSONResponse(
+        {"trades": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+    )
 
 
 @router.get("/api/trades/{trade_id}")
 async def trade_detail(
     trade_id: UUID, conn: asyncpg.Connection = Depends(get_conn)
-) -> dict:
+) -> DeadbandJSONResponse:
     trade = await conn.fetchrow("SELECT * FROM trade WHERE id = $1", trade_id)
     if trade is None:
         raise HTTPException(status_code=404, detail="trade not found")
@@ -191,7 +197,7 @@ async def trade_detail(
             )
             mark = {"price": price, "as_of": as_of}
 
-    return {
+    return DeadbandJSONResponse({
         "trade": dict(trade),
         "instrument": dict(instrument) if instrument else None,
         "effective_instrument": dict(effective) if effective else None,
@@ -207,4 +213,4 @@ async def trade_detail(
         },
         "r_multiple": trade["r_multiple"],
         "notes": trade["notes"],
-    }
+    })
