@@ -4,8 +4,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ledger.corporate import ActionType, CorporateAction, adjust_fills
-from ledger.types import Fill, FillSource, Side
+from ledger.corporate import ActionType, CorporateAction, adjust_fills, adjust_transfers
+from ledger.types import AssetTransfer, Fill, FillSource, Side
 
 ACC = UUID("00000000-0000-0000-0000-0000000000a1")
 OLD = UUID("00000000-0000-0000-0000-0000000000b1")
@@ -805,3 +805,88 @@ def test_circular_remap_dependency_raises():
 
     with pytest.raises(ValueError, match="circular"):
         adjust_fills([before], [merger1, merger2])
+
+
+# --- adjust_transfers (branch B): transfers follow the same rescale/remap the
+# --- fills they close out receive (spec D7), or held quantities stop
+# --- reconciling. Spinoffs are deliberately skipped -- a transfer is an
+# --- outflow, not a holding; minting child transfers would fabricate outflows
+# --- of shares never received (recorded as a gap).
+
+
+def _xfer(instrument=OLD, *, qty="1800", day=1):
+    return AssetTransfer(
+        id=uuid4(),
+        account_id=ACC,
+        instrument_id=instrument,
+        occurred_at=datetime(2026, 6, day, 15, 0, tzinfo=UTC),
+        quantity=Decimal(qty),
+        market_value=None,
+        content_hash="raw-hash",
+    )
+
+
+def _rsplit(ex_day=10, num="1", den="6", instrument=OLD):
+    return CorporateAction(
+        instrument_id=instrument,
+        action_type=ActionType.REVERSE_SPLIT,
+        ex_date=datetime(2026, 6, ex_day, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(num),
+        ratio_denominator=Decimal(den),
+    )
+
+
+def test_pre_ex_transfer_rescales_like_a_pre_ex_fill():
+    out = adjust_transfers([_xfer()], [_rsplit()])
+    assert out[0].quantity == Decimal(300)
+    assert out[0].content_hash is None  # adjusted copies shed raw-row identity
+
+
+def test_post_ex_transfer_is_untouched():
+    out = adjust_transfers([_xfer(day=15)], [_rsplit()])
+    assert out[0].quantity == Decimal(1800)
+    assert out[0].content_hash == "raw-hash"
+
+
+def test_symbol_change_remaps_a_pre_ex_transfer_instrument():
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SYMBOL_CHANGE,
+        ex_date=datetime(2026, 6, 10, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(1),
+        resulting_instrument_id=NEW,
+    )
+    out = adjust_transfers([_xfer()], [action])
+    assert out[0].instrument_id == NEW
+    assert out[0].quantity == Decimal(1800)
+
+
+def test_merger_remaps_and_rescales_a_pre_ex_transfer():
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.MERGER,
+        ex_date=datetime(2026, 6, 10, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(6),
+        resulting_instrument_id=NEW,
+    )
+    out = adjust_transfers([_xfer()], [action])
+    assert out[0].instrument_id == NEW
+    assert out[0].quantity == Decimal(300)
+
+
+def test_spinoff_leaves_transfers_untouched_and_mints_nothing():
+    action = CorporateAction(
+        instrument_id=OLD,
+        action_type=ActionType.SPINOFF,
+        ex_date=datetime(2026, 6, 10, tzinfo=UTC).date(),
+        ratio_numerator=Decimal(1),
+        ratio_denominator=Decimal(10),
+        resulting_instrument_id=NEW,
+        basis_allocation=Decimal("0.375"),
+    )
+    out = adjust_transfers([_xfer()], [action])
+    assert len(out) == 1
+    assert out[0].quantity == Decimal(1800)
+    assert out[0].instrument_id == OLD

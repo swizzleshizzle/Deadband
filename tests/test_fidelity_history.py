@@ -120,7 +120,11 @@ def test_corporate_action_rows_produce_exactly_the_ordinary_rows_worth_of_output
     producing theirs."""
     batch = _batch()
     assert len(batch.fills) == 1
-    assert len(batch.cash) == 3
+    # 4, not 3, since branch B: the fixture's ACAT pair adds a transfer_out
+    # cash residual (an ordinary row, not corporate-action output) alongside
+    # the share leg counted in batch.transfers below.
+    assert len(batch.cash) == 4
+    assert len(batch.transfers) == 1
 
     fill = batch.fills[0]
     assert fill.instrument.symbol == "ZXCO"

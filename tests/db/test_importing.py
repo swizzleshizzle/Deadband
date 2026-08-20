@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from db.accounts import create_account
 from db.importing import commit_batch, probe_duplicates, route_batch
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch
+from importers.base import CanonicalCash, CanonicalFill, CanonicalTransfer, ImportBatch
 from importers.coinbase import CoinbaseImporter
 from importers.fidelity import FidelityImporter
 from ledger.types import AssetClass, Instrument, Side
@@ -921,3 +921,83 @@ async def test_probe_agrees_with_commit_on_same_day_duplicate_rows(conn):
 
     report = await probe_duplicates(conn, account_id, batch)
     assert report.fill_dupes == 2
+
+
+# --- transfers (branch B): committed directly with content-hash dedupe.
+
+
+def _transfer_batch() -> ImportBatch:
+    return ImportBatch(
+        transfers=(
+            CanonicalTransfer(
+                instrument=Instrument(
+                    id=None,
+                    asset_class=AssetClass.EQUITY,
+                    symbol="ZXCO",
+                    quote_currency="USD",
+                ),
+                occurred_at=datetime(2026, 3, 11, tzinfo=UTC),
+                quantity=Decimal("40"),
+                market_value=Decimal("259.20"),
+            ),
+        )
+    )
+
+
+async def test_commit_batch_writes_transfers_and_dedupes_on_reimport(conn):
+    acc = await create_account(conn, name="T", venue="fidelity", account_type="cash")
+    first = await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    assert (first.transfers_inserted, first.transfers_skipped) == (1, 0)
+    second = await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    assert (second.transfers_inserted, second.transfers_skipped) == (0, 1)
+    rows = await conn.fetch(
+        "SELECT t.quantity, i.symbol FROM asset_transfer t"
+        " JOIN instrument i ON i.id = t.instrument_id WHERE t.account_id = $1",
+        acc,
+    )
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == Decimal("40")
+    assert rows[0]["symbol"] == "ZXCO"
+
+
+async def test_two_identical_same_day_transfers_in_one_batch_both_insert(conn):
+    """The occurrence-index tie-break, same contract as fills and cash: two
+    genuinely distinct same-day identical transfers must not collapse."""
+    acc = await create_account(conn, name="T2", venue="fidelity", account_type="cash")
+    single = _transfer_batch().transfers[0]
+    batch = ImportBatch(transfers=(single, single))
+    result = await commit_batch(conn, acc, batch, source="csv")
+    assert (result.transfers_inserted, result.transfers_skipped) == (2, 0)
+
+
+async def test_restated_market_value_still_dedupes(conn):
+    """market_value is the broker's informational stamp, not identity: the
+    same transfer event restated with a different (or blank) Amount across
+    two exports must dedupe, or the re-import inserts a phantom second
+    transfer and regroup refuses the file forever as an over-transfer."""
+    acc = await create_account(conn, name="T3", venue="fidelity", account_type="cash")
+    await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    restated = ImportBatch(
+        transfers=(
+            CanonicalTransfer(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"
+                ),
+                occurred_at=datetime(2026, 3, 11, tzinfo=UTC),
+                quantity=Decimal("40"),
+                market_value=None,
+            ),
+        )
+    )
+    result = await commit_batch(conn, acc, restated, source="csv")
+    assert (result.transfers_inserted, result.transfers_skipped) == (0, 1)
+
+
+async def test_probe_counts_committed_transfers(conn):
+    """probe_duplicates' own contract: it can never report a row as new that
+    commit_batch would then silently skip as a duplicate -- transfers
+    included, or the preview and the commit disagree."""
+    acc = await create_account(conn, name="T4", venue="fidelity", account_type="cash")
+    await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    report = await probe_duplicates(conn, acc, _transfer_batch())
+    assert report.transfer_dupes == 1

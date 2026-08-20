@@ -15,7 +15,7 @@ from decimal import Decimal, localcontext
 from enum import StrEnum
 from uuid import UUID, uuid5
 
-from ledger.types import Fill, Side
+from ledger.types import AssetTransfer, Fill, Side
 
 
 class ActionType(StrEnum):
@@ -127,6 +127,87 @@ def _ordered_actions(actions: Sequence[CorporateAction]) -> list[CorporateAction
             remaining.remove(nxt)
         ordered.extend(group[i] for i in emitted)
     return ordered
+
+
+def adjust_transfers(
+    transfers: Sequence[AssetTransfer], actions: Sequence[CorporateAction]
+) -> list[AssetTransfer]:
+    """Return adjusted copies of `transfers`, applying `actions` in ex-date
+    order -- the transfer-side mirror of adjust_fills (spec D7): a transfer that
+    predates a later split must rescale exactly as the fills it closes out, or
+    held quantities stop reconciling. Same strictly-before-ex_date day-boundary
+    rule, same rescale and identity remaps, same shedding of raw-row identity
+    (content_hash/venue_ref) on adjusted copies.
+
+    SPINOFFS ARE DELIBERATELY SKIPPED. A transfer is an outflow, not a holding:
+    minting a child transfer would fabricate an outflow of shares that were
+    never received (the parent shares left before the child existed for them).
+    The transfer-by-spinoff interplay is recorded as a gap rather than solved
+    here -- adjust_fills mints children per-fill regardless of later outflows,
+    which is the same position-blindness gap #53 tracks."""
+    missing = [t for t in transfers if t.id is None]
+    if missing:
+        raise ValueError(
+            f"adjust_transfers requires persisted transfers; {len(missing)} have id=None"
+        )
+
+    result = list(transfers)
+
+    with localcontext() as ctx:
+        ctx.prec = 50
+
+        for action in _ordered_actions(actions):
+            if action.action_type is ActionType.SPINOFF:
+                continue
+            next_result: list[AssetTransfer] = []
+            for t in result:
+                if (
+                    t.instrument_id != action.instrument_id
+                    or t.occurred_at.date() >= action.ex_date
+                ):
+                    next_result.append(t)
+                    continue
+
+                if action.action_type in {ActionType.SPLIT, ActionType.REVERSE_SPLIT}:
+                    next_result.append(
+                        dataclasses.replace(
+                            t,
+                            quantity=t.quantity * action.ratio_numerator / action.ratio_denominator,
+                            venue_ref=None,
+                            content_hash=None,
+                        )
+                    )
+                elif action.action_type is ActionType.SYMBOL_CHANGE:
+                    next_result.append(
+                        dataclasses.replace(
+                            t,
+                            instrument_id=action.resulting_instrument_id,
+                            venue_ref=None,
+                            content_hash=None,
+                        )
+                    )
+                elif action.action_type is ActionType.MERGER:
+                    next_result.append(
+                        dataclasses.replace(
+                            t,
+                            instrument_id=action.resulting_instrument_id,
+                            quantity=t.quantity * action.ratio_numerator / action.ratio_denominator,
+                            venue_ref=None,
+                            content_hash=None,
+                        )
+                    )
+                else:  # pragma: no cover -- every ActionType is handled above
+                    # Loud, unlike adjust_fills' own if/elif chain, which
+                    # silently DROPS a fill on an unhandled type (pre-existing;
+                    # recorded as a gap). A new ActionType added to one walk
+                    # but not the other must fail the first regroup, not
+                    # quietly diverge the two adjusted views.
+                    raise ValueError(
+                        f"adjust_transfers: unhandled action type {action.action_type!r}"
+                    )
+            result = next_result
+
+    return result
 
 
 def adjust_fills(fills: Sequence[Fill], actions: Sequence[CorporateAction]) -> list[Fill]:

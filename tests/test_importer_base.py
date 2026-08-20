@@ -207,3 +207,11 @@ def test_zero_amount_warning_fires_on_a_zero_amount_cash_movement():
 
 def test_zero_amount_warning_is_silent_on_a_real_amount():
     assert zero_amount_warning(7, "dividend", Decimal("42.15")) is None
+
+
+def test_transfer_out_is_an_outflow_kind():
+    """The ACAT cash residual leaves the account; ledger.cash.net_cash reads
+    direction from OUTFLOW_KINDS alone, so membership here IS the sign."""
+    from importers.base import OUTFLOW_KINDS
+
+    assert "transfer_out" in OUTFLOW_KINDS

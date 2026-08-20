@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ledger.grouping import FillAllocation, group_fills
+from ledger.grouping import FillAllocation, TransferAllocation, group_fills
 from ledger.pnl import compute_pnl, r_multiple, unrealized_pnl
 from ledger.types import Direction, Fill, FillSource, Side
 
@@ -530,3 +530,72 @@ def test_unrealized_pnl_spread_direction_raises_not_implemented():
             multiplier=Decimal("1"),
             direction=Direction.SPREAD,
         )
+
+
+# --- transfers (branch B): the position closes at running average cost, so
+# --- realised P&L is untouched by construction and the basis (and its share
+# --- of entry fees) leaves with the shares.
+
+
+def _talloc(qty, minutes=10):
+    return TransferAllocation(
+        transfer_id=uuid4(), quantity=Decimal(qty), occurred_at=T0 + timedelta(minutes=minutes)
+    )
+
+
+def _pnl_with_transfers(fills, transfers):
+    allocs = [FillAllocation(f.id, f.quantity) for f in fills]
+    by_id = {f.id: f for f in fills}
+    return compute_pnl(allocs, by_id, ONE, Direction.LONG, transfers=transfers)
+
+
+def test_full_transfer_realises_exactly_zero():
+    f = fill(Side.BUY, "40", "6.17", 0)
+    pnl = _pnl_with_transfers([f], [_talloc("40")])
+    assert pnl.realized_pnl == 0
+    assert pnl.gross_realized_pnl == 0
+    assert pnl.qty_transferred == Decimal(40)
+    assert pnl.qty_closed == 0
+    assert pnl.avg_exit is None  # a transfer is not an exit
+    assert pnl.open_quantity == 0
+    assert pnl.open_cost_basis == 0
+
+
+def test_partial_transfer_keeps_per_unit_basis():
+    f = fill(Side.BUY, "40", "10", 0)
+    pnl = _pnl_with_transfers([f], [_talloc("15")])
+    assert pnl.open_quantity == Decimal(25)
+    assert pnl.open_cost_basis == Decimal(10)  # per-unit; unchanged by the exit-free reduction
+    assert pnl.realized_pnl == 0
+    assert pnl.qty_transferred == Decimal(15)
+
+
+def test_sell_after_partial_transfer_uses_surviving_basis():
+    f_buy = fill(Side.BUY, "40", "10", 0)
+    f_sell = fill(Side.SELL, "25", "12", 20)
+    allocs = [FillAllocation(f_buy.id, f_buy.quantity), FillAllocation(f_sell.id, f_sell.quantity)]
+    by_id = {f.id: f for f in (f_buy, f_sell)}
+    pnl = compute_pnl(allocs, by_id, ONE, Direction.LONG, transfers=[_talloc("15", minutes=10)])
+    assert pnl.realized_pnl == Decimal(50)  # 25 * (12 - 10), fees zero
+    assert pnl.qty_closed == Decimal(25)
+    assert pnl.avg_exit == Decimal(12)
+    assert pnl.open_quantity == 0
+    assert pnl.qty_transferred == Decimal(15)
+
+
+def test_entry_fees_of_transferred_quantity_stay_unrecognised():
+    f = fill(Side.BUY, "40", "10", 0, fee="3")
+    pnl = _pnl_with_transfers([f], [_talloc("40")])
+    assert pnl.fees_total == Decimal(3)
+    assert pnl.fees_realized == 0
+    assert pnl.realized_pnl == 0
+
+
+def test_transfer_on_a_short_trade_raises_instead_of_draining_proceeds():
+    """position is an unsigned magnitude, so the in-walk guard alone cannot
+    see that 'average cost' is meaningless against a short's sale proceeds --
+    the misuse must refuse at the door, as the guard's comment promises."""
+    f = fill(Side.SELL, "40", "10", 0)
+    allocs = [FillAllocation(f.id, f.quantity)]
+    with pytest.raises(ValueError, match="short"):
+        compute_pnl(allocs, {f.id: f}, ONE, Direction.SHORT, transfers=[_talloc("40")])

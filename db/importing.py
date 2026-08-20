@@ -18,9 +18,10 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from db.fills import insert_fills
+from db.transfers import insert_transfers
 from db.instruments import upsert_instrument
-from importers.base import CanonicalCash, CanonicalFill, ImportBatch, content_hash
-from ledger.types import Fill, FillSource
+from importers.base import CanonicalCash, CanonicalFill, CanonicalTransfer, ImportBatch, content_hash
+from ledger.types import AssetTransfer, Fill, FillSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,8 @@ class CommitResult:
     fills_skipped: int
     cash_inserted: int
     warnings: tuple[str, ...]
+    transfers_inserted: int = 0
+    transfers_skipped: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,7 @@ class DuplicateReport:
 
     fill_dupes: int
     cash_dupes: int
+    transfer_dupes: int = 0
 
 
 def _fill_dedupe_keys(
@@ -103,6 +107,39 @@ def _cash_dedupe_hashes(account_id: UUID, cash: tuple[CanonicalCash, ...]) -> li
     return hashes
 
 
+def _transfer_dedupe_hashes(
+    account_id: UUID, transfers: tuple[CanonicalTransfer, ...]
+) -> list[str]:
+    """The content_hash for each transfer, in order. Same occurrence-index
+    tie-break as fills and cash: exports carry date-only timestamps, so two
+    genuinely distinct same-day identical transfers would otherwise collapse
+    onto one hash and one would be silently deduped away."""
+    occurrence: dict[tuple, int] = defaultdict(int)
+    hashes: list[str] = []
+    for t in transfers:
+        key = (t.occurred_at, t.instrument.symbol.upper(), t.quantity)
+        occ = occurrence[key]
+        occurrence[key] += 1
+        # market_value is deliberately NOT hashed: it is the broker's
+        # informational stamp, and the same event restated with a different
+        # (or blank) Amount across two exports must dedupe -- a phantom
+        # second transfer makes regroup refuse the file forever as an
+        # over-transfer. The hash inputs match the occurrence key above,
+        # which is the same-statement rule _fill_dedupe_keys documents.
+        hashes.append(
+            content_hash(
+                account_id,
+                t.occurred_at,
+                t.instrument.symbol,
+                "transfer_out",
+                t.quantity,
+                Decimal(0),
+                occ,
+            )
+        )
+    return hashes
+
+
 @dataclass(frozen=True, slots=True)
 class RoutingPlan:
     by_account: dict[UUID, ImportBatch]
@@ -162,11 +199,12 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
     # fills/cash of their own simply route to an empty ImportBatch below,
     # which is harmless. This is the set that may drive REFUSAL (see
     # unknown_refs above) -- it must stay scoped to money-carrying refs only.
-    money_refs = {
-        f.external_ref for f in batch.fills if f.external_ref is not None
-    } | {c.external_ref for c in batch.cash if c.external_ref is not None} | {
-        ref for ref, _msg in batch.blocking if ref is not None
-    }
+    money_refs = (
+        {f.external_ref for f in batch.fills if f.external_ref is not None}
+        | {c.external_ref for c in batch.cash if c.external_ref is not None}
+        | {t.external_ref for t in batch.transfers if t.external_ref is not None}
+        | {ref for ref, _msg in batch.blocking if ref is not None}
+    )
 
     # F: batch.refs_seen carries every account ref seen in the RAW rows,
     # independent of whether the row went on to become a fill, a cash
@@ -215,6 +253,7 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
 
     fills_by_account: dict[UUID, list] = defaultdict(list)
     cash_by_account: dict[UUID, list] = defaultdict(list)
+    transfers_by_account: dict[UUID, list] = defaultdict(list)
 
     for f in batch.fills:
         account_id = routable.get(f.external_ref) if f.external_ref is not None else None
@@ -226,10 +265,16 @@ async def route_batch(conn: asyncpg.Connection, venue: str, batch: ImportBatch) 
         if account_id is not None:
             cash_by_account[account_id].append(c)
 
+    for t in batch.transfers:
+        account_id = routable.get(t.external_ref) if t.external_ref is not None else None
+        if account_id is not None:
+            transfers_by_account[account_id].append(t)
+
     by_account = {
         account_id: ImportBatch(
             fills=tuple(fills_by_account.get(account_id, ())),
             cash=tuple(cash_by_account.get(account_id, ())),
+            transfers=tuple(transfers_by_account.get(account_id, ())),
         )
         for account_id in routable.values()
     }
@@ -385,10 +430,31 @@ async def commit_batch(
         if row is not None:
             cash_inserted += 1
 
+    transfer_rows: list[AssetTransfer] = []
+    for t, thash in zip(
+        batch.transfers, _transfer_dedupe_hashes(account_id, batch.transfers), strict=True
+    ):
+        transfer_rows.append(
+            AssetTransfer(
+                id=uuid4(),
+                account_id=account_id,
+                instrument_id=await upsert_instrument(conn, t.instrument),
+                occurred_at=t.occurred_at,
+                quantity=t.quantity,
+                market_value=t.market_value,
+                venue_ref=t.venue_ref,
+                content_hash=thash,
+                note=t.note,
+            )
+        )
+    transfer_result = await insert_transfers(conn, transfer_rows)
+
     return CommitResult(
         fills_inserted=fill_result.inserted,
         fills_skipped=fill_result.skipped,
         cash_inserted=cash_inserted,
+        transfers_inserted=transfer_result.inserted,
+        transfers_skipped=transfer_result.skipped,
         warnings=batch.warnings,
     )
 
@@ -437,4 +503,16 @@ async def probe_duplicates(
         cash_hashes,
     )
 
-    return DuplicateReport(fill_dupes=fill_dupes, cash_dupes=cash_dupes)
+    transfer_hashes = _transfer_dedupe_hashes(account_id, batch.transfers)
+    transfer_dupes = await conn.fetchval(
+        """
+        SELECT count(*) FROM asset_transfer
+         WHERE account_id = $1 AND content_hash = ANY($2::text[])
+        """,
+        account_id,
+        transfer_hashes,
+    )
+
+    return DuplicateReport(
+        fill_dupes=fill_dupes, cash_dupes=cash_dupes, transfer_dupes=transfer_dupes
+    )

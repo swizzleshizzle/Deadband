@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS trade (
     closed_at           TIMESTAMPTZ,
     qty_opened          NUMERIC,
     qty_closed          NUMERIC,
+    qty_transferred     NUMERIC,
     avg_entry           NUMERIC,
     avg_exit            NUMERIC,
     realized_pnl        NUMERIC,
@@ -181,6 +182,7 @@ CREATE TABLE IF NOT EXISTS trade (
 -- the file, which is only reached long after both of those indexes have already run.
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS effective_instrument_id UUID;
 ALTER TABLE trade ADD COLUMN IF NOT EXISTS opening_derived_fill_id UUID;
+ALTER TABLE trade ADD COLUMN IF NOT EXISTS qty_transferred NUMERIC;
 
 CREATE INDEX IF NOT EXISTS trade_account_status_idx ON trade (account_id, status);
 CREATE INDEX IF NOT EXISTS trade_opened_at_idx ON trade (opened_at DESC);
@@ -233,9 +235,7 @@ CREATE TABLE IF NOT EXISTS cash_movement (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     occurred_at     TIMESTAMPTZ NOT NULL,
-    kind            TEXT NOT NULL CHECK (kind IN
-                    ('deposit','withdrawal','fee','funding','interest',
-                     'dividend','payout','rebate','tax','return_of_capital')),
+    kind            TEXT NOT NULL,
     amount          NUMERIC NOT NULL,
     currency        TEXT NOT NULL DEFAULT 'USD',
     instrument_id   UUID REFERENCES instrument(id),
@@ -247,6 +247,16 @@ CREATE TABLE IF NOT EXISTS cash_movement (
 
 CREATE UNIQUE INDEX IF NOT EXISTS cash_content_hash_uniq
     ON cash_movement (account_id, content_hash) WHERE content_hash IS NOT NULL;
+
+-- Named constraint, attached by ALTER in both this file and migration 004 --
+-- see trade_effective_instrument_fk's comment for why inline would diverge.
+-- The first DROP also retires the auto-named inline CHECK that databases
+-- created before migration 004 still carry.
+ALTER TABLE cash_movement DROP CONSTRAINT IF EXISTS cash_movement_kind_check;
+ALTER TABLE cash_movement DROP CONSTRAINT IF EXISTS cash_movement_kind_chk;
+ALTER TABLE cash_movement ADD CONSTRAINT cash_movement_kind_chk CHECK (kind IN
+    ('deposit','withdrawal','fee','funding','interest',
+     'dividend','payout','rebate','tax','return_of_capital','transfer_out'));
 
 CREATE TABLE IF NOT EXISTS mark (
     instrument_id   UUID NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
@@ -342,6 +352,30 @@ CREATE TABLE IF NOT EXISTS account_snapshot (
     note            TEXT,
     UNIQUE (account_id, as_of)
 );
+
+-- Branch B (spec 2026-08-19-acat-transfer-out-design): the share leg of an
+-- outbound ACAT. Neither a fill nor a corporate action -- see migration 004's
+-- header comment. Direction admits only 'out' (D2).
+CREATE TABLE IF NOT EXISTS asset_transfer (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id      UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+    instrument_id   UUID NOT NULL REFERENCES instrument(id),
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    direction       TEXT NOT NULL CONSTRAINT asset_transfer_direction_chk
+                    CHECK (direction IN ('out')),
+    quantity        NUMERIC NOT NULL CONSTRAINT asset_transfer_quantity_chk
+                    CHECK (quantity > 0 AND quantity < 'Infinity'::numeric),
+    market_value    NUMERIC,  -- broker's stamp; informational, never P&L
+    venue_ref       TEXT,
+    content_hash    TEXT,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS asset_transfer_content_hash_uniq
+    ON asset_transfer (account_id, content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS asset_transfer_account_time_idx
+    ON asset_transfer (account_id, instrument_id, occurred_at);
 
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
 BEGIN

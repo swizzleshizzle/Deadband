@@ -31,6 +31,7 @@ async def test_schema_creates_expected_tables(conn):
     names = {r["tablename"] for r in rows}
     assert {
         "account",
+        "asset_transfer",
         "instrument",
         "fill",
         "trade",
@@ -387,3 +388,81 @@ async def test_derived_fill_rejects_a_cross_account_trade_reference(conn):
             acc_b,
             derived_id,
         )
+
+
+async def test_migration_004_survives_populated_rows_and_widens_the_kind_check(pool):
+    """Build a pre-004 namespace (baseline + 001..003), seed cash_movement rows
+    under the OLD kind constraint, run 004 alone, and prove: existing rows
+    survive, 'transfer_out' becomes insertable, a bogus kind still raises, and
+    trade grew qty_transferred. Guards the named-constraint conversion: 004
+    must drop the auto-named inline CHECK and install cash_movement_kind_chk."""
+    ns = "mig004_populated"
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE')
+            await conn.execute(f'CREATE SCHEMA "{ns}"')
+            await conn.execute(f'SET search_path TO "{ns}"')
+            await conn.execute(BASELINE.read_text())
+            for m in (
+                "001_a2_ledger_completion.sql",
+                "002_reject_non_finite_numerics.sql",
+                "003_derived_fills.sql",
+            ):
+                await conn.execute((DB_DIR / "migrations" / m).read_text())
+
+            acc = await conn.fetchval(
+                "INSERT INTO account (name, venue, account_type)"
+                " VALUES ('t', 'manual', 'cash') RETURNING id"
+            )
+            await conn.execute(
+                "INSERT INTO cash_movement (account_id, occurred_at, kind, amount)"
+                " VALUES ($1, now(), 'deposit', 10), ($1, now(), 'withdrawal', 5)",
+                acc,
+            )
+
+            await conn.execute((DB_DIR / "migrations" / "004_asset_transfers.sql").read_text())
+
+            assert await conn.fetchval("SELECT count(*) FROM cash_movement") == 2
+            await conn.execute(
+                "INSERT INTO cash_movement (account_id, occurred_at, kind, amount)"
+                " VALUES ($1, now(), 'transfer_out', 1)",
+                acc,
+            )
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO cash_movement (account_id, occurred_at, kind, amount)"
+                        " VALUES ($1, now(), 'bogus', 1)",
+                        acc,
+                    )
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM information_schema.columns"
+                    " WHERE table_schema = $1 AND table_name = 'trade'"
+                    " AND column_name = 'qty_transferred'",
+                    ns,
+                )
+                == 1
+            )
+            inst = await conn.fetchval(
+                "INSERT INTO instrument (natural_key, asset_class, symbol)"
+                " VALUES ('equity:TSTX', 'equity', 'TSTX') RETURNING id"
+            )
+            await conn.execute(
+                "INSERT INTO asset_transfer (account_id, instrument_id, occurred_at,"
+                " direction, quantity, market_value) VALUES ($1,$2,now(),'out',40,259.2)",
+                acc,
+                inst,
+            )
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO asset_transfer (account_id, instrument_id, occurred_at,"
+                        " direction, quantity) VALUES ($1,$2,now(),'in',40)",
+                        acc,
+                        inst,
+                    )
+        finally:
+            await tx.rollback()
