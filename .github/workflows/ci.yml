@@ -50,10 +50,12 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Pure suite
-        run: uv run pytest tests --ignore=tests/db -q
+        # tests/api is DB-gated despite living outside tests/db -- it belongs
+        # to the DB lane below, where the skip guard covers it.
+        run: uv run pytest tests --ignore=tests/db --ignore=tests/api -q
 
       - name: DB suite
-        run: uv run pytest tests/db -q --junit-xml=db-report.xml
+        run: uv run pytest tests/db tests/api -q --junit-xml=db-report.xml
 
       - name: Refuse a silently-skipped DB suite
         run: |

@@ -18,8 +18,10 @@ async def test_api_pool_refuses_writes(monkeypatch):
     try:
         async with pool.acquire() as conn:
             with pytest.raises(asyncpg.ReadOnlySQLTransactionError):
-                await conn.execute(
-                    "INSERT INTO schema_migrations (name) VALUES ('never_lands.sql')"
-                )
+                # DDL, not an INSERT into a named table: the refusal must not
+                # depend on any table existing -- on a fresh CI database an
+                # INSERT dies on UndefinedTableError before proving anything
+                # about the read-only setting.
+                await conn.execute("CREATE TABLE api_readonly_probe (id int)")
     finally:
         await pool.close()
