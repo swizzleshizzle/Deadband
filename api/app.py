@@ -38,9 +38,20 @@ def create_app() -> FastAPI:
     app.include_router(dashboard_router)
 
     if _WEB_DIST.exists():
+        from fastapi.responses import FileResponse
         from fastapi.staticfiles import StaticFiles
 
-        app.mount("/", StaticFiles(directory=_WEB_DIST, html=True), name="web")
+        app.mount("/assets", StaticFiles(directory=_WEB_DIST / "assets"), name="assets")
+
+        # SPA fallback, not StaticFiles(html=True): the client router owns
+        # /trades and friends, so a refresh there must serve index.html
+        # rather than 404. Registered last -- every /api route wins first.
+        @app.get("/{path:path}", include_in_schema=False)
+        async def spa(path: str) -> FileResponse:
+            candidate = _WEB_DIST / path
+            if path and ".." not in path and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(_WEB_DIST / "index.html")
 
     return app
 

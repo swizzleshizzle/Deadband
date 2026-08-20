@@ -319,6 +319,26 @@ command's contract, and they fail before `reconcile` starts. A script that only 
 exit code cannot tell `DRIFT` from `UNRELIABLE` apart, nor one refusal from another; read
 stderr and the printed verdict for that.
 
+## Web UI (read-only slice)
+
+The first UI milestone: Dashboard, Trades, Trade detail — read-only, bound to
+`127.0.0.1` with no auth (reach it over an SSH tunnel). One process serves
+both the API and the built frontend:
+
+```
+cd web && pnpm install && pnpm build && cd ..
+uv run uvicorn api.app:app --host 127.0.0.1 --port 8000
+# then e.g.:  ssh -L 8000:127.0.0.1:8000 <this-box>  and open http://127.0.0.1:8000
+```
+
+For frontend development, run the API and the Vite dev server side by side —
+the dev server proxies `/api`:
+
+```
+uv run uvicorn api.app:app --host 127.0.0.1 --port 8000
+cd web && pnpm dev
+```
+
 Run the test suite with `uv run pytest` (`TEST_PG_DSN` unset skips the database-backed
 tests; set it to run them too). The DB suite builds a disposable per-session schema, so
 the `TEST_PG_DSN` role needs `CREATE` on the database itself (`GRANT CREATE ON DATABASE
