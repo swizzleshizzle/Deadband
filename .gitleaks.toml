@@ -89,4 +89,9 @@ regexes = [
   '''changeme''',
   '''YOUR_[A-Z_]+''',
   '''xxxxx''',
+  # The CI workflow assembles TEST_PG_DSN for its OWN throwaway service
+  # container: user/password 'deadband', alive for one job on a GitHub
+  # runner, guarding nothing. Allowlisted by exact content rather than by
+  # weakening the dsn-password rule.
+  '''postgresql://deadband:\$CI_PG_PW@''',
 ]
