@@ -585,6 +585,60 @@ async def regroup_account(conn: asyncpg.Connection, account_id: UUID) -> int:
     return written
 
 
+# The trades screen's query (read-only API spec §5). A separate function
+# beside list_trades rather than new parameters on it: list_trades is the
+# CLI's whole-history listing and keeps its exact shape; this one is the
+# filterable, paged view, and the two evolving independently is expected.
+_QUERY_TRADES_PREDICATE = """
+     WHERE ($1::uuid IS NULL OR t.account_id = $1)
+       AND ($2::text IS NULL OR t.intent = $2)
+       AND ($3::text IS NULL OR lower(t.primary_underlying) = lower($3))
+       AND ($4::text IS NULL OR t.status = $4)
+       AND ($5::timestamptz IS NULL OR t.opened_at >= $5)
+       AND ($6::timestamptz IS NULL OR t.opened_at < $6)
+       AND ($7::text IS NULL OR lower(t.strategy_tag) = lower($7))
+"""
+
+
+async def query_trades(
+    conn: asyncpg.Connection,
+    *,
+    account_id: UUID | None = None,
+    intent: str | None = None,
+    underlying: str | None = None,
+    status: str | None = None,
+    opened_from=None,
+    opened_before=None,
+    tag: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[asyncpg.Record], int]:
+    """Filtered, paged trades plus the total under the same predicate.
+    `opened_before` is EXCLUSIVE (the API layer turns an inclusive `to` date
+    into the next midnight). The display symbol resolves through the effective
+    instrument first -- the only place a symbol change or merger is visible --
+    with the opening fill's instrument as the unregrouped-history fallback,
+    same COALESCE as db/positions.py."""
+    args = [account_id, intent, underlying, status, opened_from, opened_before, tag]
+    rows = await conn.fetch(
+        """
+        SELECT t.*, i.symbol AS instrument_symbol
+          FROM trade t
+          LEFT JOIN fill f       ON f.id = t.opening_fill_id
+          LEFT JOIN instrument i ON i.id = COALESCE(t.effective_instrument_id, f.instrument_id)
+        """
+        + _QUERY_TRADES_PREDICATE
+        + " ORDER BY t.opened_at DESC, t.id LIMIT $8 OFFSET $9",
+        *args,
+        limit,
+        offset,
+    )
+    total = await conn.fetchval(
+        "SELECT count(*) FROM trade t" + _QUERY_TRADES_PREDICATE, *args
+    )
+    return rows, total
+
+
 async def list_trades(
     conn: asyncpg.Connection, account_id: UUID | None = None
 ) -> list[asyncpg.Record]:

@@ -14,6 +14,7 @@ import pathlib
 from fastapi import FastAPI
 
 from api.health import router as health_router
+from api.trades import router as trades_router
 from api.serialization import DeadbandJSONResponse
 
 _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
     )
     app.state.pool = None
     app.include_router(health_router)
+    app.include_router(trades_router)
 
     if _WEB_DIST.exists():
         from fastapi.staticfiles import StaticFiles
