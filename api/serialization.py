@@ -15,7 +15,10 @@ from fastapi.responses import JSONResponse
 
 def _default(value: Any) -> str:
     if isinstance(value, Decimal):
-        return str(value)
+        # format 'f', not str(): a quantized zero is Decimal('0E-18') and str()
+        # would ship the exponent form; 'f' renders every scale as plain
+        # fixed-point without losing a digit.
+        return format(value, "f")
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, UUID):
