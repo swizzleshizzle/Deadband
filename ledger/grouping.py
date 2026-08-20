@@ -51,6 +51,26 @@ class TradeGroup:
     closed_at: datetime | None
 
 
+def merge_fill_transfer_events(fill_events, transfer_events):
+    """Order fills and transfers into one walk: by UTC day first, with every
+    fill preceding every transfer WITHIN a day, exact timestamps ordering
+    events inside their kind. Day-bucketed, not tie-broken on exact equality:
+    a broker's executions precede its end-of-day ACAT snapshot, and date-only
+    exports stamp transfers at midnight while manually entered fills can carry
+    intraday times -- exact-tie ranking would process such a transfer FIRST
+    and raise a spurious TransferError on an ordinary buy-then-transfer day.
+
+    Both walks that consume this ordering (group_fills here, compute_pnl in
+    ledger/pnl.py) MUST use this one helper -- the rule is load-bearing and
+    a divergent copy is how grouping accepts a sequence pnl then refuses.
+
+    Items are (at, tie, payload) triples; returns payloads in walk order."""
+    decorated = [(at.date(), 0, at, tie, p) for at, tie, p in fill_events]
+    decorated += [(at.date(), 1, at, tie, p) for at, tie, p in transfer_events]
+    decorated.sort(key=lambda e: e[:4])
+    return [e[4] for e in decorated]
+
+
 def _sort_key(f: Fill) -> tuple[datetime, str]:
     # Ties broken by id so grouping is deterministic for simultaneous fills.
     return (f.executed_at, str(f.id))
@@ -64,8 +84,8 @@ def group_fills(
     Transfers (branch B) enter the same walk as reduce-only closing events: an
     outbound transfer reduces a LONG position at its timestamp, closing the
     trade if it reaches zero. It never opens, never flips, and never clamps --
-    an impossible transfer raises TransferError. At a tied timestamp fills
-    process first: a broker's same-day executions precede its ACAT snapshot.
+    an impossible transfer raises TransferError. Within a UTC day fills
+    process before transfers -- see merge_fill_transfer_events.
     """
     missing = [f for f in fills if f.id is None]
     if missing:
@@ -92,11 +112,10 @@ def group_fills(
             xfer_buckets[(account_id, instrument_id)],
             key=lambda t: (t.occurred_at, str(t.id)),
         )
-        # Fills sort before transfers at a tied timestamp (rank 0 vs 1).
-        events: list[tuple[datetime, int, str, object]] = [
-            (f.executed_at, 0, str(f.id), f) for f in bucket
-        ] + [(t.occurred_at, 1, str(t.id), t) for t in xfers]
-        events.sort(key=lambda e: (e[0], e[1], e[2]))
+        events = merge_fill_transfer_events(
+            [(f.executed_at, str(f.id), f) for f in bucket],
+            [(t.occurred_at, str(t.id), t) for t in xfers],
+        )
 
         with localcontext() as ctx:
             ctx.prec = 200
@@ -128,7 +147,7 @@ def group_fills(
                 opened_at = None
                 direction = None
 
-            for _at, _rank, _tie, ev in events:
+            for ev in events:
                 if isinstance(ev, AssetTransfer):
                     t = ev
                     if position == 0:

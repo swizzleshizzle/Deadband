@@ -1137,7 +1137,7 @@ async def test_check_duplicates_reports_an_existing_fill_and_writes_nothing(
 
     out = capsys.readouterr().out
     assert "preview only" in out
-    assert "duplicate check: 1 fill(s), 0 cash movement(s) already present" in out
+    assert "duplicate check: 1 fill(s), 0 cash movement(s), 0 transfer(s) already present" in out
 
     after = await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", known)
     assert after == before == 1
@@ -1187,7 +1187,7 @@ async def test_check_duplicates_uses_explicit_account_for_unrouted_rows(
 
     out = capsys.readouterr().out
     assert "preview only" in out
-    assert "duplicate check: 0 fill(s), 2 cash movement(s) already present" in out
+    assert "duplicate check: 0 fill(s), 2 cash movement(s), 0 transfer(s) already present" in out
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
 
 
@@ -4954,3 +4954,124 @@ async def test_cmd_transfers_reports_when_empty(conn, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "no transfers" in out.lower()
+
+
+async def test_cmd_regroup_transfer_error_is_a_clean_exit_2(conn, monkeypatch, capsys):
+    """cmd_import already refuses a transfer the ledger cannot honour with a
+    clean exit 2; cmd_regroup hits the same TransferError through the same
+    regroup_account and must not dump a traceback instead."""
+    from db.transfers import insert_transfers
+    from ledger.types import AssetTransfer
+    from uuid import uuid4 as _u
+
+    acc = await create_account(conn, name="RG", venue="fidelity", account_type="cash")
+    inst = await conn.fetchval(
+        "INSERT INTO instrument (natural_key, asset_class, symbol)"
+        " VALUES ('equity:ZXRG', 'equity', 'ZXRG') RETURNING id"
+    )
+    await insert_transfers(
+        conn,
+        [
+            AssetTransfer(
+                id=_u(),
+                account_id=acc,
+                instrument_id=inst,
+                occurred_at=datetime(2026, 3, 11, tzinfo=UTC),
+                quantity=Decimal("40"),
+                market_value=None,
+            )
+        ],
+    )
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_regroup(argparse.Namespace(account=str(acc)))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "transfer" in err.lower()
+
+
+async def test_cmd_corporate_add_transfer_conflict_refuses_cleanly(
+    conn, monkeypatch, capsys
+):
+    """Recording a mis-dated split can make a stored transfer impossible to
+    apply (fills rescale, the post-ex transfer does not). The refusal must be
+    a clean exit 2 with the action rolled back -- not a TransferError
+    traceback out of _regroup_holders with a half-explained rollback."""
+    from db.transfers import insert_transfers
+    from ledger.types import AssetTransfer
+    from uuid import uuid4 as _u
+
+    acc = await create_account(conn, name="CC", venue="fidelity", account_type="cash")
+    inst = await conn.fetchval(
+        "INSERT INTO instrument (natural_key, asset_class, symbol)"
+        " VALUES ('equity:ZXCC', 'equity', 'ZXCC') RETURNING id"
+    )
+    await _seed_fill(conn, acc, inst, qty="1800", price="0.05",
+                     at=datetime(2026, 2, 1, 9, 0, tzinfo=UTC))
+    await insert_transfers(
+        conn,
+        [
+            AssetTransfer(
+                id=_u(),
+                account_id=acc,
+                instrument_id=inst,
+                occurred_at=datetime(2026, 4, 1, tzinfo=UTC),  # AFTER the ex-date below
+                quantity=Decimal("1800"),
+                market_value=None,
+            )
+        ],
+    )
+    from db.trades import regroup_account as _rg
+    await _rg(conn, acc)  # sane before the action: 1800 held, 1800 transferred
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    rc = await cli.cmd_corporate_add(
+        argparse.Namespace(
+            type="reverse_split",
+            symbol="ZXCC",
+            ex_date="2026-03-02",
+            ratio="1:6",
+            resulting_symbol=None,
+            basis_allocation=None,
+            note=None,
+            commit=True,
+        )
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "transfer" in err.lower()
+    assert await conn.fetchval(
+        "SELECT count(*) FROM corporate_action WHERE instrument_id = $1", inst
+    ) == 0  # rolled back
+
+
+async def _seed_fill(conn, acc, inst, *, qty, price, at):
+    from db.fills import insert_fills
+    from ledger.types import Fill, FillSource, Side
+    from uuid import uuid4 as _u
+
+    await insert_fills(
+        conn,
+        [
+            Fill(
+                id=_u(),
+                account_id=acc,
+                instrument_id=inst,
+                executed_at=at,
+                side=Side.BUY,
+                quantity=Decimal(qty),
+                price=Decimal(price),
+                fee=Decimal("0"),
+                fee_currency="USD",
+                source=FillSource.MANUAL,
+                venue_fill_id=f"sf-{_u().hex[:6]}",
+                is_estimated=False,
+            )
+        ],
+    )

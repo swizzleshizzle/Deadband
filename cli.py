@@ -835,12 +835,8 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # dropped from `targets` below and the probe printed a count
             # that silently omitted them -- indistinguishable from "this
             # file has no duplicates" even though it was never checked.
-            unrouted = ImportBatch(
-                fills=tuple(f for f in batch.fills if f.external_ref is None),
-                cash=tuple(c for c in batch.cash if c.external_ref is None),
-                transfers=tuple(t for t in batch.transfers if t.external_ref is None),
-            )
-            if (unrouted.fills or unrouted.cash or unrouted.transfers) and not args.account:
+            unrouted = batch.unrouted()
+            if unrouted.has_rows() and not args.account:
                 print(
                     "error: cannot check duplicates -- this file has row(s) "
                     "with no account ref to route by; pass --account to say "
@@ -860,14 +856,10 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     plan = await route_batch(conn, venue, batch)
                     targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
-                    if (unrouted.fills or unrouted.cash or unrouted.transfers) and args.account:
+                    if unrouted.has_rows() and args.account:
                         account_id = UUID(args.account)
                         existing = targets.get(account_id, ImportBatch())
-                        targets[account_id] = ImportBatch(
-                            fills=existing.fills + unrouted.fills,
-                            cash=existing.cash + unrouted.cash,
-                            transfers=existing.transfers + unrouted.transfers,
-                        )
+                        targets[account_id] = existing.merge_rows(unrouted)
 
                     # C: mirror --commit's own refusal exactly (see the
                     # identical check further below) -- a row that routes to
@@ -886,14 +878,16 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                         )
                         return 2
 
-                    fill_dupes = cash_dupes = 0
+                    fill_dupes = cash_dupes = transfer_dupes = 0
                     for account_id, sub_batch in targets.items():
                         report = await probe_duplicates(conn, account_id, sub_batch)
                         fill_dupes += report.fill_dupes
                         cash_dupes += report.cash_dupes
+                        transfer_dupes += report.transfer_dupes
                     print(
                         f"  duplicate check: {fill_dupes} fill(s), "
-                        f"{cash_dupes} cash movement(s) already present"
+                        f"{cash_dupes} cash movement(s), "
+                        f"{transfer_dupes} transfer(s) already present"
                     )
             finally:
                 # See cmd_import's identical comment further below: pool.close()
@@ -910,12 +904,8 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     # an explicit destination. Whether that's a problem depends only on the
     # parsed file, not on the database, so this check runs before the pool is
     # ever opened.
-    unrouted = ImportBatch(
-        fills=tuple(f for f in batch.fills if f.external_ref is None),
-        cash=tuple(c for c in batch.cash if c.external_ref is None),
-        transfers=tuple(t for t in batch.transfers if t.external_ref is None),
-    )
-    if (unrouted.fills or unrouted.cash or unrouted.transfers) and not args.account:
+    unrouted = batch.unrouted()
+    if unrouted.has_rows() and not args.account:
         print(
             "error: this file has row(s) with no account ref to route by "
             "(e.g. this venue's export carries no per-row account number); "
@@ -977,7 +967,7 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
 
             targets: dict[UUID, ImportBatch] = dict(plan.by_account)
 
-            if unrouted.fills or unrouted.cash or unrouted.transfers:
+            if unrouted.has_rows():
                 account_id = UUID(args.account)
                 account = await get_account(conn, account_id)
                 if account is None:
@@ -995,11 +985,7 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     )
                     return 2
                 existing = targets.get(account_id, ImportBatch())
-                targets[account_id] = ImportBatch(
-                    fills=existing.fills + unrouted.fills,
-                    cash=existing.cash + unrouted.cash,
-                    transfers=existing.transfers + unrouted.transfers,
-                )
+                targets[account_id] = existing.merge_rows(unrouted)
 
             for account_id, sub_batch in targets.items():
                 n = len(sub_batch.fills) + len(sub_batch.cash)
@@ -1270,6 +1256,12 @@ async def cmd_regroup(args) -> int:
         # Same clean-error treatment cmd_import gives an unknown --account,
         # rather than the ValueError('None is not a valid TradeIntent')
         # traceback this used to produce with no account id in it anywhere.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except TransferError as exc:
+        # Same data-refusal cmd_import's commit path already gives this: a
+        # stored transfer the ledger cannot honour is a clean exit 2, never a
+        # traceback. The transaction above rolled back with the exception.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     finally:
@@ -2280,9 +2272,22 @@ async def cmd_corporate_add(args) -> int:
             # ONE transaction over the write and every regroup it invalidates:
             # a crash between them would otherwise leave a stored action whose
             # effect has reached some accounts' trades and not others.
-            async with conn.transaction():
-                action_id = await add_action(conn, action, args.note)
-                regrouped = await _regroup_holders(conn, instrument_id)
+            try:
+                async with conn.transaction():
+                    action_id = await add_action(conn, action, args.note)
+                    regrouped = await _regroup_holders(conn, instrument_id)
+            except TransferError as exc:
+                # Recording this action re-adjusts every holder's fills, and a
+                # stored transfer can become impossible against the adjusted
+                # view (e.g. a mis-dated ex-date rescales the fills but not a
+                # post-ex-date transfer). The transaction rolled back: nothing
+                # was recorded. Refuse cleanly and name the conflict.
+                print(
+                    "error: recording this action makes a stored transfer "
+                    f"impossible to apply -- {exc}; nothing was recorded",
+                    file=sys.stderr,
+                )
+                return 2
     finally:
         # See cmd_trades's identical comment: pool.close() must run after the
         # `async with pool.acquire()` block has exited (including via every
@@ -2379,14 +2384,26 @@ async def cmd_corporate_remove(args) -> int:
                 print("\npreview only — rerun with --commit to write")
                 return 0
 
-            async with conn.transaction():
-                # remove_action returns False for an unknown id; that case was
-                # already refused above, on this same connection, so the only
-                # way to see it here is a concurrent deleter -- not a case
-                # worth a second refusal path inside an open transaction, where
-                # `return` would COMMIT rather than roll back.
-                await remove_action(conn, action_id)
-                regrouped = await _regroup_holders(conn, instrument_id)
+            try:
+                async with conn.transaction():
+                    # remove_action returns False for an unknown id; that case
+                    # was already refused above, on this same connection, so
+                    # the only way to see it here is a concurrent deleter --
+                    # not a case worth a second refusal path inside an open
+                    # transaction, where `return` would COMMIT rather than
+                    # roll back.
+                    await remove_action(conn, action_id)
+                    regrouped = await _regroup_holders(conn, instrument_id)
+            except TransferError as exc:
+                # The mirror of cmd_corporate_add's refusal: undoing an action
+                # can equally strand a stored transfer against the re-adjusted
+                # view. Rolled back; nothing was removed.
+                print(
+                    "error: removing this action makes a stored transfer "
+                    f"impossible to apply -- {exc}; nothing was removed",
+                    file=sys.stderr,
+                )
+                return 2
     finally:
         # See cmd_trades's identical comment: pool.close() must run after the
         # `async with pool.acquire()` block has exited, never from inside it,

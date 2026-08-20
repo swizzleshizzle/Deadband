@@ -40,6 +40,7 @@ class DuplicateReport:
 
     fill_dupes: int
     cash_dupes: int
+    transfer_dupes: int = 0
 
 
 def _fill_dedupe_keys(
@@ -119,6 +120,12 @@ def _transfer_dedupe_hashes(
         key = (t.occurred_at, t.instrument.symbol.upper(), t.quantity)
         occ = occurrence[key]
         occurrence[key] += 1
+        # market_value is deliberately NOT hashed: it is the broker's
+        # informational stamp, and the same event restated with a different
+        # (or blank) Amount across two exports must dedupe -- a phantom
+        # second transfer makes regroup refuse the file forever as an
+        # over-transfer. The hash inputs match the occurrence key above,
+        # which is the same-statement rule _fill_dedupe_keys documents.
         hashes.append(
             content_hash(
                 account_id,
@@ -126,7 +133,7 @@ def _transfer_dedupe_hashes(
                 t.instrument.symbol,
                 "transfer_out",
                 t.quantity,
-                t.market_value if t.market_value is not None else Decimal(0),
+                Decimal(0),
                 occ,
             )
         )
@@ -496,4 +503,16 @@ async def probe_duplicates(
         cash_hashes,
     )
 
-    return DuplicateReport(fill_dupes=fill_dupes, cash_dupes=cash_dupes)
+    transfer_hashes = _transfer_dedupe_hashes(account_id, batch.transfers)
+    transfer_dupes = await conn.fetchval(
+        """
+        SELECT count(*) FROM asset_transfer
+         WHERE account_id = $1 AND content_hash = ANY($2::text[])
+        """,
+        account_id,
+        transfer_hashes,
+    )
+
+    return DuplicateReport(
+        fill_dupes=fill_dupes, cash_dupes=cash_dupes, transfer_dupes=transfer_dupes
+    )

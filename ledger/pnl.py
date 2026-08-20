@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from uuid import UUID
 
-from ledger.grouping import FillAllocation, TransferAllocation
+from ledger.grouping import (
+    FillAllocation,
+    TransferAllocation,
+    merge_fill_transfer_events,
+)
 from ledger.types import Direction, Fill, Side
 
 _QUANT = Decimal("1E-18")
@@ -60,19 +64,29 @@ def compute_pnl(
     """Walk allocations chronologically, maintaining a running average cost."""
     if direction is Direction.SPREAD:
         raise NotImplementedError("multi-leg SPREAD trades need their own P&L path")
+    if transfers and direction is Direction.SHORT:
+        # Refused at the door, not left to the in-walk guard: `position` is an
+        # unsigned magnitude, so a transfer against a short would pass that
+        # guard and silently drain basis_total -- which holds sale PROCEEDS
+        # for a short, not cost. Grouping already refuses shorts+transfers;
+        # this covers any future caller that bypasses it.
+        raise ValueError(
+            "transfers cannot apply to a short trade: delivering shares out "
+            "requires a long holding"
+        )
 
     # Wrap in a precision context: 50 digits is sufficient for displayed/stored
     # values (unlike grouping's 200, which prevents rounding during computation).
     with localcontext() as ctx:
         ctx.prec = 50
 
-        # Fills sort before transfers at a tied timestamp, mirroring grouping's
-        # rule: a broker's same-day executions precede its ACAT snapshot.
-        events: list[tuple] = [
-            (fills_by_id[a.fill_id].executed_at, 0, str(a.fill_id), a) for a in allocations
-        ] + [(t.occurred_at, 1, str(t.transfer_id), t) for t in transfers]
-        events.sort(key=lambda e: (e[0], e[1], e[2]))
-        ordered = [e[3] for e in events]
+        # One shared ordering rule with group_fills -- see
+        # merge_fill_transfer_events for why it is day-bucketed and why the
+        # two walks must never diverge.
+        ordered = merge_fill_transfer_events(
+            [(fills_by_id[a.fill_id].executed_at, str(a.fill_id), a) for a in allocations],
+            [(t.occurred_at, str(t.transfer_id), t) for t in transfers],
+        )
         opening_side = Side.SELL if direction is Direction.SHORT else Side.BUY
 
         position = Decimal(0)  # units of open position
@@ -98,6 +112,12 @@ def compute_pnl(
                 # Grouping (ledger/grouping.py) has already validated the
                 # transfer against the walk; a violation here means the caller
                 # passed transfers grouping never saw.
+                #
+                # Fees are deliberately untouched (spec D4): the transferred
+                # units' entry-fee share leaves with the basis, so a CLOSED
+                # transfer-bearing trade legitimately ends with fees_realized
+                # < fees_total. That is the design, not a leak -- the module's
+                # identity is realized = gross - fees_REALIZED, which holds.
                 if position <= 0 or alloc.quantity > position:
                     raise ValueError(
                         f"transfer of {alloc.quantity} cannot apply to a position of {position}"

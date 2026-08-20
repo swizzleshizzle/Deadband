@@ -589,3 +589,13 @@ def test_entry_fees_of_transferred_quantity_stay_unrecognised():
     assert pnl.fees_total == Decimal(3)
     assert pnl.fees_realized == 0
     assert pnl.realized_pnl == 0
+
+
+def test_transfer_on_a_short_trade_raises_instead_of_draining_proceeds():
+    """position is an unsigned magnitude, so the in-walk guard alone cannot
+    see that 'average cost' is meaningless against a short's sale proceeds --
+    the misuse must refuse at the door, as the guard's comment promises."""
+    f = fill(Side.SELL, "40", "10", 0)
+    allocs = [FillAllocation(f.id, f.quantity)]
+    with pytest.raises(ValueError, match="short"):
+        compute_pnl(allocs, {f.id: f}, ONE, Direction.SHORT, transfers=[_talloc("40")])

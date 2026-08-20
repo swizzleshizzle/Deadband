@@ -197,7 +197,14 @@ def adjust_transfers(
                         )
                     )
                 else:  # pragma: no cover -- every ActionType is handled above
-                    next_result.append(t)
+                    # Loud, unlike adjust_fills' own if/elif chain, which
+                    # silently DROPS a fill on an unhandled type (pre-existing;
+                    # recorded as a gap). A new ActionType added to one walk
+                    # but not the other must fail the first regroup, not
+                    # quietly diverge the two adjusted views.
+                    raise ValueError(
+                        f"adjust_transfers: unhandled action type {action.action_type!r}"
+                    )
             result = next_result
 
     return result

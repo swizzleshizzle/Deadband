@@ -357,3 +357,22 @@ def test_transfer_only_touches_its_own_instrument():
     assert by_inst[BTC].status is TradeStatus.CLOSED
     assert by_inst[ETH].status is TradeStatus.OPEN
     assert by_inst[ETH].transfers == ()
+
+
+def test_midnight_stamped_transfer_processes_after_same_day_intraday_fills():
+    """Fidelity stamps date-only rows at midnight while manual fills can carry
+    intraday times, so a same-day transfer must sort after that DAY's fills --
+    a broker's executions precede its end-of-day ACAT snapshot -- or a
+    perfectly ordinary buy-then-transfer day raises a spurious TransferError."""
+    buy = fill(Side.BUY, "40", "6", minutes=6 * 60)  # 15:00 UTC, same day as T0 (09:00)
+    midnight = AssetTransfer(
+        id=uuid4(),
+        account_id=ACC,
+        instrument_id=BTC,
+        occurred_at=T0.replace(hour=0, minute=0),
+        quantity=Decimal("40"),
+        market_value=None,
+    )
+    groups = group_fills([buy], [midnight])
+    assert len(groups) == 1
+    assert groups[0].status is TradeStatus.CLOSED

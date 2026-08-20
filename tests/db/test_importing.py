@@ -968,3 +968,36 @@ async def test_two_identical_same_day_transfers_in_one_batch_both_insert(conn):
     batch = ImportBatch(transfers=(single, single))
     result = await commit_batch(conn, acc, batch, source="csv")
     assert (result.transfers_inserted, result.transfers_skipped) == (2, 0)
+
+
+async def test_restated_market_value_still_dedupes(conn):
+    """market_value is the broker's informational stamp, not identity: the
+    same transfer event restated with a different (or blank) Amount across
+    two exports must dedupe, or the re-import inserts a phantom second
+    transfer and regroup refuses the file forever as an over-transfer."""
+    acc = await create_account(conn, name="T3", venue="fidelity", account_type="cash")
+    await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    restated = ImportBatch(
+        transfers=(
+            CanonicalTransfer(
+                instrument=Instrument(
+                    id=None, asset_class=AssetClass.EQUITY, symbol="ZXCO", quote_currency="USD"
+                ),
+                occurred_at=datetime(2026, 3, 11, tzinfo=UTC),
+                quantity=Decimal("40"),
+                market_value=None,
+            ),
+        )
+    )
+    result = await commit_batch(conn, acc, restated, source="csv")
+    assert (result.transfers_inserted, result.transfers_skipped) == (0, 1)
+
+
+async def test_probe_counts_committed_transfers(conn):
+    """probe_duplicates' own contract: it can never report a row as new that
+    commit_batch would then silently skip as a duplicate -- transfers
+    included, or the preview and the commit disagree."""
+    acc = await create_account(conn, name="T4", venue="fidelity", account_type="cash")
+    await commit_batch(conn, acc, _transfer_batch(), source="csv")
+    report = await probe_duplicates(conn, acc, _transfer_batch())
+    assert report.transfer_dupes == 1

@@ -1226,3 +1226,20 @@ def test_inbound_shaped_acat_blocks_the_import():
     _ref, reason = batch.blocking[0]
     assert "TRANSFER OF ASSETS" in reason
     assert "inbound" in reason.lower()
+
+
+def test_zero_money_acat_row_warns_without_blocking():
+    """A TRANSFER OF ASSETS row that moves nothing (zero quantity, zero
+    amount) is unmapped-but-harmless, the same policy _carries_money enforces
+    everywhere else -- it must warn, not refuse the whole file with a message
+    claiming it is inbound-shaped."""
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,TRANSFER OF ASSETS ACAT DELIVER MEMO (Cash),"",'
+            'No Description,Cash,"",0,"","","",0,0,""'
+        )
+    )
+    assert batch.blocking == ()
+    assert batch.transfers == ()
+    assert batch.cash == ()
+    assert any("TRANSFER OF ASSETS" in w for w in batch.warnings)

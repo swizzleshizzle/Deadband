@@ -1547,6 +1547,19 @@ class FidelityImporter:
                     )
                     continue
 
+                if quantity == 0 and amount == 0:
+                    # Moves nothing -- unmapped-but-harmless, the same policy
+                    # _carries_money enforces everywhere else. Warn, never
+                    # refuse: blocking a no-money memo row with an
+                    # "inbound-shaped" diagnosis would be both unactionable
+                    # and wrong.
+                    warnings.append(
+                        f"line {line_no}: TRANSFER OF ASSETS row carries no "
+                        "quantity and no amount; recorded nothing"
+                    )
+                    unmapped.append(str(raw_row))
+                    continue
+
                 message = (
                     f"line {line_no}: TRANSFER OF ASSETS row is not an outbound "
                     "delivery -- an inbound transfer arrives with basis this "
