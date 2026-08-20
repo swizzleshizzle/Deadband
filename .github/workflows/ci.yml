@@ -1,0 +1,87 @@
+name: CI
+
+# Runs on main and every PR. Lesson inherited from the QuantConnect repo's own
+# ci.yml: point CI at the branches work actually lands on, and keep
+# workflow_dispatch so a run can be triggered without inventing a PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # 16: the version the schema-equivalence suite was verified against
+        # (and what the deployment target runs). The schema itself needs >=15
+        # (column-scoped ON DELETE SET NULL).
+        image: postgres:16
+        env:
+          POSTGRES_USER: deadband
+          POSTGRES_PASSWORD: deadband
+          POSTGRES_DB: deadband_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deadband"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The DB suite SKIPS silently without TEST_PG_DSN -- and a green run
+      # that skipped ~300 tests is this repo's documented worst failure mode;
+      # the count assertion at the end is the guard. Assembled in a step
+      # (throwaway CI-only credential) so no cred-shaped URL sits in a
+      # committed file, which this repo's own commit hook refuses.
+      - name: Point TEST_PG_DSN at the service container
+        run: echo "TEST_PG_DSN=postgresql://deadband:$CI_PG_PW@localhost:5432/deadband_test" >> "$GITHUB_ENV"
+        env:
+          CI_PG_PW: deadband
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Pure suite
+        run: uv run pytest tests --ignore=tests/db -q
+
+      - name: DB suite
+        run: uv run pytest tests/db -q --junit-xml=db-report.xml
+
+      - name: Refuse a silently-skipped DB suite
+        run: |
+          python3 - << 'PY'
+          import xml.etree.ElementTree as ET
+          s = ET.parse("db-report.xml").getroot().find(".//testsuite") \
+              or ET.parse("db-report.xml").getroot()
+          tests, skipped = int(s.get("tests", 0)), int(s.get("skipped", 0))
+          print(f"db suite: {tests} tests, {skipped} skipped")
+          assert tests > 200, "DB suite barely ran -- TEST_PG_DSN wiring is broken"
+          assert skipped == 0, "DB tests skipped -- that is this repo's known silent failure"
+          PY
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck and build
+        working-directory: web
+        run: pnpm build
