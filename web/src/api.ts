@@ -53,6 +53,51 @@ export interface Dashboard {
   drift_warnings: { account_id: string; verdict: string; detail: string }[]
 }
 
+// The Accounts screen. Deliberately carries no equity, headroom or drift:
+// those need marks and milestone C, and the endpoint computes nothing it
+// cannot back (see api/accounts.py).
+export interface AccountSummary {
+  id: string
+  name: string
+  venue: string
+  account_type: string
+  base_currency: string
+  default_intent: string
+  is_active: boolean
+  ignore_on_import: boolean
+  opened_at: string | null
+  closed_at: string | null
+  cash: string | null
+  open_trades: number
+  closed_trades: number
+  realized_pnl: string | null
+  has_rule: boolean
+}
+
+export interface FundedRule {
+  account_id: string
+  max_drawdown: string | null
+  drawdown_type: string | null
+  daily_loss_limit: string | null
+  profit_target: string | null
+  payout_split: string | null
+  consistency_rule: string | null
+  evaluated_at: string | null
+}
+
+export interface AccountDetail {
+  account: AccountSummary
+  funded_rule: FundedRule | null
+  open_positions: {
+    instrument: { id: string; symbol: string; multiplier: string }
+    quantity: string
+    // PER-UNIT average cost, not the position total (ledger/positions.py).
+    cost_basis: string
+    is_estimated: boolean
+    unvaluable_reason: string | null
+  }[]
+}
+
 export interface TradeRow {
   id: string
   account_id: string
@@ -125,3 +170,5 @@ export const fetchDashboard = () => get<Dashboard>('/api/dashboard')
 export const fetchTrades = (params: URLSearchParams) =>
   get<TradesPage>(`/api/trades?${params.toString()}`)
 export const fetchTradeDetail = (id: string) => get<TradeDetail>(`/api/trades/${id}`)
+export const fetchAccounts = () => get<{ accounts: AccountSummary[] }>('/api/accounts')
+export const fetchAccountDetail = (id: string) => get<AccountDetail>(`/api/accounts/${id}`)

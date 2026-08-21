@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router-dom'
 import { fetchHealth, type Health } from './api'
+import AccountDetailScreen from './screens/AccountDetail'
+import Accounts from './screens/Accounts'
 import Dashboard from './screens/Dashboard'
 import TradeDetailScreen from './screens/TradeDetail'
 import Trades from './screens/Trades'
@@ -21,6 +23,7 @@ export default function App() {
         <NavLink to="/" end>
           Dashboard
         </NavLink>
+        <NavLink to="/accounts">Accounts</NavLink>
         <NavLink to="/trades">Trades</NavLink>
         <div className="health">
           {health === null ? (
@@ -37,6 +40,8 @@ export default function App() {
       <main className="content">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/accounts" element={<Accounts />} />
+          <Route path="/accounts/:id" element={<AccountDetailScreen />} />
           <Route path="/trades" element={<Trades />} />
           <Route path="/trades/:id" element={<TradeDetailScreen />} />
         </Routes>
