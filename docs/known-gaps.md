@@ -78,13 +78,16 @@ across rows.
 
 ---
 
-## Must land before A-2's manual-grouping UI — sequence it first
+## Closed: `group_fills` quantity-aware exclusion
 
-### `group_fills` needs quantity-aware exclusion
+**Fixed 2026-08-06 by `cefd27d`, on `main`.** Kept here rather than deleted because this
+entry spent long enough saying "sequence it first" that a reader who remembers the gap
+needs to be told it is gone — and because the failure it describes is worth
+understanding even now that it cannot happen.
 
-`db/trades.py` excludes a manual trade's fills from the auto pass **whole**, but a
-zero-crossing fill may be only *partly* that trade's. The remainder is then never
-regrouped and is reaped:
+`db/trades.py` used to exclude a manual trade's fills from the auto pass **whole**, but a
+zero-crossing fill may be only *partly* that trade's. The remainder was then never
+regrouped, and was reaped:
 
 ```
 SELL 1 @100, BUY 5 @90   ->  closed short 1, open long 4
@@ -92,15 +95,17 @@ hand-mark the closed trade manual, regroup:
   fill qty=5  allocated=1     *** the open long of 4 vanishes permanently
 ```
 
-Unreachable today — the only writer of `grouping_mode='manual'` is the protection step,
-which drops its allocations first — and guarded by a `NotImplementedError` in
-`regroup_account` that was verified load-bearing and not over-broad.
+`regroup_account` now reduces each fill's *available quantity* by what manual trades hold
+(`manual_held`) and lets the pure grouper allocate the remainder, so the open long
+survives. The `NotImplementedError` that converted this into a hard error for the entire
+regroup is gone with it; nothing in `regroup_account` raises it today.
 
-**Sequence it as A-2's first task, not alongside the UI.** The guard converts the failure
-into a hard error for the *entire* regroup, so the day the UI creates the first partial
-allocation, imports stop working for that account until the pure-layer fix lands.
+Covered by `test_partial_manual_allocation_leaves_the_remainder_groupable` and
+`test_a_fill_partly_held_by_a_manual_trade_is_not_dropped` in `tests/db/test_trades.py`,
+which assert on the surviving open quantity and on full allocation of the crossing fill —
+not on a trade count, which a wrongly-sized remainder would also satisfy.
 
-**Fix:** exclude only the quantity a manual trade actually holds, rather than the fill id.
+**This no longer gates the manual-grouping UI, and no longer gates Entry & Import.**
 
 ---
 
