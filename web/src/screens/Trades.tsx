@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { fetchTrades, type TradesPage } from '../api'
+import { fetchAccounts, fetchTrades, type AccountSummary, type TradesPage } from '../api'
 import { money, pnlClass, qty, shortDate, signedMoney } from '../format'
 
 const PAGE = 50
-const FILTERS = ['status', 'intent', 'instrument', 'tag', 'from', 'to'] as const
+const FILTERS = ['account', 'status', 'intent', 'instrument', 'tag', 'from', 'to'] as const
 
 export default function Trades() {
   const [params, setParams] = useSearchParams()
   const [page, setPage] = useState<TradesPage | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const navigate = useNavigate()
+
+  // Names, not ids: /api/trades filters by account id, but a uuid in a
+  // dropdown is unreadable. Failure is silent and leaves the filter absent
+  // rather than breaking the log over a secondary control.
+  useEffect(() => {
+    fetchAccounts()
+      .then((r) => setAccounts(r.accounts))
+      .catch(() => setAccounts([]))
+  }, [])
 
   const offset = Number(params.get('offset') ?? '0')
   const query = useMemo(() => {
@@ -43,6 +53,20 @@ export default function Trades() {
       <h1>Trades</h1>
 
       <div className="filters">
+        {accounts.length > 0 && (
+          <select
+            value={params.get('account') ?? ''}
+            onChange={(e) => setFilter('account', e.target.value)}
+            aria-label="Account"
+          >
+            <option value="">any account</option>
+            {accounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        )}
         <select
           value={params.get('status') ?? ''}
           onChange={(e) => setFilter('status', e.target.value)}
