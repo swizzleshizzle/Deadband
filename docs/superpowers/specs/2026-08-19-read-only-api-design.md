@@ -222,9 +222,10 @@ repo's existing pure-core style (`tests/test_purity.py` guards it).
 ## 8. Out of scope, named
 
 - All writes; Entry & Import (milestone 2). The `group_fills` quantity-aware
-  exclusion (`docs/known-gaps.md`, "Must land before A-2's manual-grouping UI")
-  gates milestone 2, not this slice — a read-only UI cannot create the partial
-  manual trade the hazard needs.
+  exclusion gated milestone 2, not this slice — a read-only UI cannot create the
+  partial manual trade the hazard needs. **Since closed** (`cefd27d`, 2026-08-06);
+  `docs/known-gaps.md` carries it under "Closed: `group_fills` quantity-aware
+  exclusion", and it gates nothing now.
 - The Accounts screen (§8 screen 2) and any screen beyond the three named.
 - Auth of any kind (D1); exposure beyond `127.0.0.1`.
 - Live updates (websockets/SSE/polling); the UI refetches on navigation.
