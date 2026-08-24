@@ -66,3 +66,40 @@ async def find_by_external_ref(
 
 async def list_accounts(conn: asyncpg.Connection) -> list[asyncpg.Record]:
     return await conn.fetch("SELECT * FROM account ORDER BY name")
+
+
+async def account_rollups(conn: asyncpg.Connection) -> dict[UUID, asyncpg.Record]:
+    """Per-account trade counts, total realized P&L, and whether a funded rule
+    exists, keyed by account id.
+
+    One grouped query rather than three per account: the Accounts list renders
+    every account at once, and the per-account shape would be N+1 round trips
+    against a screen whose whole job is the overview.
+
+    LEFT JOINs, so an account with no trades still appears -- with zeroes. An
+    INNER JOIN here would drop exactly the accounts a new user has, which is
+    the case where an empty screen is least informative.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT a.id,
+               count(t.id) FILTER (WHERE t.status = 'open')   AS open_trades,
+               count(t.id) FILTER (WHERE t.status = 'closed') AS closed_trades,
+               coalesce(sum(t.realized_pnl), 0)               AS realized_pnl,
+               (r.account_id IS NOT NULL)                     AS has_rule
+          FROM account a
+          LEFT JOIN trade t ON t.account_id = a.id
+          LEFT JOIN funded_account_rule r ON r.account_id = a.id
+         GROUP BY a.id, r.account_id
+        """
+    )
+    return {r["id"]: r for r in rows}
+
+
+async def funded_rule(conn: asyncpg.Connection, account_id: UUID) -> asyncpg.Record | None:
+    """The account's funded-account rule row, or None. Returned exactly as
+    recorded -- nothing here computes headroom or distance to breach, which
+    belong to milestone C (analytics/funded.py) and need marks."""
+    return await conn.fetchrow(
+        "SELECT * FROM funded_account_rule WHERE account_id = $1", account_id
+    )

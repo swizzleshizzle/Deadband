@@ -181,11 +181,11 @@ tbody tr.rowlink:hover td { background: var(--surface); }
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
-.tile .figures { margin: 10px 0 4px; display: flex; gap: 18px; }
-.tile .figures .lbl { font-size: 10.5px; color: var(--muted); display: block; }
-.tile .figures .val { font-size: 15px; }
+.figures { margin: 10px 0 4px; display: flex; gap: 18px; }
+.figures .lbl { font-size: 10.5px; color: var(--muted); display: block; }
+.figures .val { font-size: 15px; }
 
-.tile .why { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+.why { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
 
 /* the deadband gauge: drift needle against the tolerance band */
 .gauge { margin-top: 10px; }
@@ -323,3 +323,9 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 @media (prefers-reduced-motion: no-preference) {
   .tile, tbody tr.rowlink td { transition: background-color 120ms ease; }
 }
+
+/* Account configuration: label/value pairs that are read, not scanned, so a
+   two-column grid rather than the .figures row. */
+.config { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin-top: 10px; }
+.config dt { font-size: 11px; color: var(--muted); text-transform: lowercase; }
+.config dd { margin: 0; font-size: 13px; }
