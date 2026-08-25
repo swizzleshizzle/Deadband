@@ -174,14 +174,17 @@ stop — a guarantee that is not one.
 
 **The enforcement instead:** `create_app()` registers the write routers only
 when `DEADBAND_ENABLE_WRITES` is set. The published unit does not set it, so the
-write endpoints **do not exist** there and return `404` to every proxied
-request, regardless of who asks. Nothing is trusted — not a header, not a source
-address, not a hostname.
+write endpoints **do not exist** there and return `404`, or `405` when the SPA
+fallback is mounted — that catch-all is registered `GET`-only, so a write verb
+still path-matches it and Starlette answers with the wrong-method status
+instead — to every proxied request, regardless of who asks. Nothing is
+trusted — not a header, not a source address, not a hostname.
 
 Writes are served by a second unit on a **different local port that the proxy
 does not publish**, reached over an SSH tunnel. The claim is verifiable in one
 command by anyone at any time: a `POST` to a write path on the published
-endpoint returns `404`.
+endpoint returns `404`, or `405` when `web/dist` is present (SPA fallback
+GET-only, wrong-method match — see above).
 
 **Ops consequence, called out because it is not free:** this adds a second
 systemd unit and a tunnel step to the deployment kit under `docs/ops/`.

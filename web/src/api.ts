@@ -163,7 +163,18 @@ async function get<T>(path: string): Promise<T> {
   return (await r.json()) as T
 }
 
-export class NotFound extends Error {}
+// A message is required, not optional: some callers deliberately catch this
+// by `instanceof` and substitute their own copy ("no such account"), but
+// others (Entry.tsx) surface `err.message` straight to the user, and a bare
+// `new NotFound()` gives Error's default empty string there -- `{error && ...}`
+// then renders nothing at all, so a 404 looks like the form silently did
+// nothing rather than reporting what happened.
+export class NotFound extends Error {
+  constructor(message = 'not found') {
+    super(message)
+    this.name = 'NotFound'
+  }
+}
 
 export const fetchHealth = () => get<Health>('/api/health')
 export const fetchDashboard = () => get<Dashboard>('/api/dashboard')
@@ -172,3 +183,60 @@ export const fetchTrades = (params: URLSearchParams) =>
 export const fetchTradeDetail = (id: string) => get<TradeDetail>(`/api/trades/${id}`)
 export const fetchAccounts = () => get<{ accounts: AccountSummary[] }>('/api/accounts')
 export const fetchAccountDetail = (id: string) => get<AccountDetail>(`/api/accounts/${id}`)
+
+// The Entry screen's write path. Money and quantities stay STRINGS end to end.
+export interface FillLegIn {
+  symbol: string
+  side: 'buy' | 'sell'
+  quantity: string
+  price: string
+  fee: string
+  fee_currency: string
+  executed_at: string
+}
+
+export interface CreatedFills {
+  fill_ids: string[]
+  trades_regrouped: number
+}
+
+// FastAPI error bodies are JSON ({"detail": ...}), not plain text. Rendering
+// that raw shows the user literal braces and quotes for the single most
+// common mistake a write form invites (e.g. a bad quantity). `detail` is a
+// string for most 4xx errors; pydantic validation failures instead carry an
+// array of {loc, msg, ...} objects. Fall back to the raw text only when the
+// body isn't JSON at all (e.g. a proxy error page).
+async function errorMessage(r: Response, path: string): Promise<string> {
+  const text = await r.text()
+  try {
+    const body = JSON.parse(text) as { detail?: unknown }
+    if (typeof body.detail === 'string') return body.detail
+    if (Array.isArray(body.detail)) {
+      return body.detail
+        .map((d) =>
+          d && typeof d === 'object' && 'msg' in d
+            ? String((d as { msg: unknown }).msg)
+            : JSON.stringify(d),
+        )
+        .join('; ')
+    }
+  } catch {
+    // not JSON -- fall through to the raw text below
+  }
+  return text || `${path}: ${r.status}`
+}
+
+async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method,
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (r.status === 404) throw new NotFound()
+  if (!r.ok) throw new Error(await errorMessage(r, path))
+  return r.status === 204 ? (undefined as T) : ((await r.json()) as T)
+}
+
+export const createFills = (body: { account_id: string; fills: FillLegIn[] }) =>
+  send<CreatedFills>('/api/fills', 'POST', body)
+export const deleteFill = (id: string) => send<void>(`/api/fills/${id}`, 'DELETE')

@@ -8,7 +8,7 @@ import pathlib
 import sys
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from db.accounts import UnknownAccountError, create_account, get_account, list_accounts
 from db.cash import MixedCurrencyError, account_cash
@@ -20,7 +20,9 @@ from db.corporate import (
     preview_effect,
     remove_action,
 )
+from db.fills import add_manual_fills, delete_manual_fill
 from db.importing import commit_batch, probe_duplicates, route_batch
+from db.instruments import upsert_instrument
 from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
@@ -33,6 +35,7 @@ from importers.registry import get_importer, list_importers
 from ledger.corporate import ActionType, CorporateAction
 from ledger.pnl import unrealized_pnl
 from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef, reconcile
+from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
 
@@ -1577,6 +1580,156 @@ async def cmd_marks_set(args) -> int:
     return 0
 
 
+# --- hand-entered fills (Task 3, entry-import write path) ------------------
+#
+# `fills add`/`fills rm` are the CLI's own record-and-undo pair for a fill
+# nobody's export ever produced -- a broker phoning in a manual correction,
+# a private-loan repayment, whatever doesn't arrive as a file. A later task
+# adds HTTP endpoints that call add_manual_fills/delete_manual_fill directly;
+# this is the first, and remains a real, caller of them.
+
+
+async def cmd_fills_add(args) -> int:
+    # Issue #27: an instrument was minted with symbol='' and became an
+    # unnamed position that renders as a blank row in every position/P&L
+    # view. Manual entry is a second way to reach upsert_instrument with a
+    # caller-supplied symbol -- importers/ never pass one this raw, unvalidated
+    # -- so it needs its own guard. Checked before the pool even opens:
+    # whether the symbol is blank depends only on the argument, never on the
+    # database, and the failing test for this asserts create_pool is never
+    # called at all.
+    symbol = (args.symbol or "").strip()
+    if not symbol:
+        print("error: --symbol must not be blank", file=sys.stderr)
+        return 2
+
+    # Decimal("abc") raises InvalidOperation, not ValueError -- see
+    # cmd_marks_set's identical comment. Decimal("NaN") and
+    # Decimal("Infinity") construct fine and slip past that catch entirely;
+    # is_finite() is this codebase's established second check (importers/
+    # fidelity.py, importers/coinbase_api.py, cmd_marks_set above). All three
+    # numbers are parsed before the pool opens, for the same reason as the
+    # symbol check above.
+    try:
+        quantity = Decimal(args.quantity)
+        price = Decimal(args.price)
+        fee = Decimal(args.fee)
+    except InvalidOperation as exc:
+        print(f"error: not a valid number: {exc}", file=sys.stderr)
+        return 2
+    if not all(v.is_finite() for v in (quantity, price, fee)):
+        print("error: quantity, price and fee must be finite numbers", file=sys.stderr)
+        return 2
+    # fill.quantity's only CHECK is `quantity > 0` (db/schema.sql) -- a
+    # negative or zero hand-entered quantity would either be rejected by
+    # Postgres with an opaque CheckViolationError or, for a manual entry
+    # relying on --side to carry direction, silently invert it. Refused here,
+    # before the pool opens, same reasoning as every other argument check
+    # above.
+    if quantity <= 0:
+        print("error: --quantity must be positive", file=sys.stderr)
+        return 2
+
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            account_id = UUID(args.account)
+            if await get_account(conn, account_id) is None:
+                print(f"error: no account {account_id}", file=sys.stderr)
+                return 2
+            async with conn.transaction():
+                # EQUITY is a placeholder asset class for a hand-entered
+                # symbol this command has no other way to classify -- upsert_
+                # instrument keys on natural_key, so a symbol that already
+                # exists under a different asset class resolves to THAT
+                # instrument rather than minting a second, conflicting one.
+                instrument_id = await upsert_instrument(
+                    conn,
+                    Instrument(
+                        id=None,
+                        asset_class=AssetClass.EQUITY,
+                        symbol=symbol.upper(),
+                        quote_currency="USD",
+                    ),
+                )
+                fill = Fill(
+                    id=uuid4(),
+                    account_id=account_id,
+                    instrument_id=instrument_id,
+                    executed_at=datetime.fromisoformat(args.executed_at),
+                    side=Side(args.side),
+                    quantity=quantity,
+                    price=price,
+                    fee=fee,
+                    fee_currency=args.fee_currency,
+                    source=FillSource.MANUAL,
+                    # Neither dedupe key applies to a hand-entered fill: no
+                    # venue issued a venue_fill_id, and content_hash's
+                    # (executed_at, symbol, side, quantity, price)-plus-index
+                    # shape would collapse two genuinely separate manual
+                    # entries into one. add_manual_fills (db/fills.py)
+                    # enforces both as a precondition, not just a convention.
+                    venue_fill_id=None,
+                    is_estimated=False,
+                )
+                (fill_id,) = await add_manual_fills(conn, [fill])
+                # A fill with no trade behind it is invisible to every
+                # position/P&L view that reads from trade rather than fill --
+                # regroup_account is what turns this one insert into
+                # something the rest of the system can see.
+                await regroup_account(conn, account_id)
+            print(fill_id)
+            return 0
+    finally:
+        # See cmd_marks_set's identical comment: pool.close() must run after
+        # the `async with pool.acquire()` block has exited, never from
+        # inside it, or close() deadlocks waiting for a release that will
+        # never come.
+        await pool.close()
+
+
+async def cmd_fills_rm(args) -> int:
+    try:
+        fill_id = UUID(args.id)
+    except ValueError:
+        print(f"error: --id {args.id!r} is not a UUID", file=sys.stderr)
+        return 2
+    pool = await create_pool()
+    try:
+        async with pool.acquire() as conn:
+            account_id = await conn.fetchval(
+                "SELECT account_id FROM fill WHERE id = $1", fill_id
+            )
+            if account_id is None:
+                print(f"error: no fill {fill_id}", file=sys.stderr)
+                return 1
+            async with conn.transaction():
+                # delete_manual_fill's own WHERE clause carries the
+                # source='manual' check -- it returns False for a fill that
+                # exists but was imported, same as for one that doesn't exist
+                # at all. The account_id lookup just above is what lets this
+                # branch tell the two apart and print the right message for
+                # each.
+                if not await delete_manual_fill(conn, fill_id):
+                    print(
+                        f"error: fill {fill_id} was imported, not hand-entered; "
+                        "imported fills are immutable",
+                        file=sys.stderr,
+                    )
+                    return 1
+                # Deleting a fill without regrouping would leave stale trade
+                # rows behind -- the account's position/P&L would still
+                # reflect a fill that's gone.
+                await regroup_account(conn, account_id)
+            return 0
+    finally:
+        # See cmd_fills_add's identical comment: pool.close() must run after
+        # the `async with pool.acquire()` block has exited, never from
+        # inside it, or close() deadlocks waiting for a release that will
+        # never come.
+        await pool.close()
+
+
 def _parse_as_of(raw: str) -> datetime | None:
     """Parse `--as-of` for `snapshot add` and `reconcile`: a bare date becomes
     midnight UTC, a timestamp is taken as written, and anything else -- or a
@@ -2524,6 +2677,22 @@ def main() -> int:
         "--as-of", default=None, help="ISO-8601 timestamp; defaults to now (UTC)"
     )
     p_marks_set.set_defaults(fn=cmd_marks_set)
+
+    p_fills = sub.add_parser("fills", help="hand-entered fills")
+    fills_sub = p_fills.add_subparsers(dest="fills_cmd", required=True)
+    p_fills_add = fills_sub.add_parser("add", help="record a fill by hand")
+    p_fills_add.add_argument("--account", required=True)
+    p_fills_add.add_argument("--symbol", required=True)
+    p_fills_add.add_argument("--side", required=True, choices=["buy", "sell"])
+    p_fills_add.add_argument("--quantity", required=True)
+    p_fills_add.add_argument("--price", required=True)
+    p_fills_add.add_argument("--fee", default="0")
+    p_fills_add.add_argument("--fee-currency", default="USD")
+    p_fills_add.add_argument("--executed-at", required=True, help="ISO-8601 instant")
+    p_fills_add.set_defaults(fn=cmd_fills_add)
+    p_fills_rm = fills_sub.add_parser("rm", help="delete a hand-entered fill")
+    p_fills_rm.add_argument("--id", required=True)
+    p_fills_rm.set_defaults(fn=cmd_fills_rm)
 
     p_snapshot = sub.add_parser("snapshot", help="broker statement figures")
     snap_sub = p_snapshot.add_subparsers(dest="snapshot_command", required=True)

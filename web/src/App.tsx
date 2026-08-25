@@ -4,6 +4,7 @@ import { fetchHealth, type Health } from './api'
 import AccountDetailScreen from './screens/AccountDetail'
 import Accounts from './screens/Accounts'
 import Dashboard from './screens/Dashboard'
+import Entry from './screens/Entry'
 import TradeDetailScreen from './screens/TradeDetail'
 import Trades from './screens/Trades'
 
@@ -25,6 +26,7 @@ export default function App() {
         </NavLink>
         <NavLink to="/accounts">Accounts</NavLink>
         <NavLink to="/trades">Trades</NavLink>
+        <NavLink to="/entry">Entry</NavLink>
         <div className="health">
           {health === null ? (
             <span className="bad">api unreachable</span>
@@ -44,6 +46,7 @@ export default function App() {
           <Route path="/accounts/:id" element={<AccountDetailScreen />} />
           <Route path="/trades" element={<Trades />} />
           <Route path="/trades/:id" element={<TradeDetailScreen />} />
+          <Route path="/entry" element={<Entry />} />
         </Routes>
       </main>
     </div>
