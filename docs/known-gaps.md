@@ -732,3 +732,27 @@ Also: synthetic fixtures cannot catch defects that live in a file format's real-
 packaging. A UTF-8 BOM would have made a real Coinbase export import at 0%, and preamble
 lines would have broken a real Fidelity export wholesale — neither was visible against
 hand-written fixtures.
+
+---
+
+## Found while building the entry & import write path (2026-08-24)
+
+The first writes reachable from the UI: a second, write-enabled pool beside the
+read-only one (`api/deps.py`), `db/fills.py`'s `add_manual_fills` /
+`delete_manual_fill`, `fills add` / `fills rm` on the CLI, `POST /api/fills` /
+`DELETE /api/fills/{id}`, and the Entry screen (single fill and multi-leg).
+Verified: the pure suite (437 passed), `tests/db` (320 passed), `tests/api` (38
+passed, 0 skipped — including the write-gating test below), and `tsc -b && vite
+build`, all green. Full design:
+[`docs/superpowers/specs/2026-08-24-entry-import-design.md`](superpowers/specs/2026-08-24-entry-import-design.md).
+Its own §9 names three of the four gaps below; the fourth was found while
+reviewing `add_manual_fills` itself.
+
+| # | Gap | Why it matters |
+|---|---|---|
+| 60 | **The write instance has no health check.** | The deploy script health-checks the published port only. It should learn to check the write port too, or a broken write instance stays invisible until someone tries to type a fill and it fails. |
+| 61 | **`DEADBAND_ENABLE_WRITES` is a single point of failure.** | `create_app()` (`api/app.py`) registers the write routers only when this variable is set, and that one flag is what stands between a shared network and an unauthenticated write surface — §6 of the design spells out why a source-address check can't substitute for it (the proxy is the client, so a proxied request already presents as `127.0.0.1`). `tests/api/test_write_gating.py` pins the default — write routes are absent unless the flag is set — but nothing pins the deployed unit file itself; a unit that sets the variable by mistake fails silently, the same way #37 (corporate-action uniqueness) and #28 (unrecognised cash kinds) are silent by omission rather than by error. **The footgun inside the footgun:** the check is `bool(os.environ.get("DEADBAND_ENABLE_WRITES"))`, so any non-empty string reads as enabled — `DEADBAND_ENABLE_WRITES=0` and `DEADBAND_ENABLE_WRITES=false` both turn writes ON, not off. Whoever writes the second unit file needs to know that unsetting the variable, not zeroing it, is the only way to disable it. |
+| 62 | **Manual fills carry no dedupe key, by design.** | `add_manual_fills`'s own docstring (`db/fills.py:56-66`) explains why: the import path's `content_hash` is computed from `(executed_at, symbol, side, quantity, price)` plus an occurrence index that only disambiguates fills *within a single import batch*, so two genuinely identical manual entries made in separate submissions would hash the same, and the second would be silently dropped by `insert_fills`'s `ON CONFLICT DO NOTHING` (`db/fills.py:20-34`). Silent loss is the worse failure of the two available, so both `content_hash` and `venue_fill_id` are left `NULL` on every manual fill instead — both partial unique indexes skip `NULL`s, so nothing is deduped and every submission lands. **The accepted cost:** a double-submitted form creates a visible duplicate fill, which the user can see and delete (`delete_manual_fill`, `db/fills.py:76-83`) rather than a fill that vanishes with no record it ever existed. The Entry screen guards against the double-click case with an in-flight `disabled={busy || ...}` on its submit buttons (`web/src/screens/Entry.tsx:236,318`) — but that is a UI convenience, not a backend guarantee: `POST /api/fills` itself has no idempotency key and will happily insert a genuine duplicate from two concurrent requests, or from a retried request after a dropped response. |
+| 63 | **`add_manual_fills` does not verify what actually landed.** | It returns `[f.id for f in fills]` (`db/fills.py:73`) unconditionally, without inspecting `insert_fills`'s own `InsertResult` (`inserted`/`skipped` counts, `db/fills.py:15-17`) — so if a duplicate primary key were ever passed in, `ON CONFLICT DO NOTHING` would skip that insert while the function still reported the id as written, the same silent-loss shape gap #62 above accepts deliberately for the *dedupe key* but this function would produce *by accident* for the *id* itself. **Not reachable today** — both callers (the CLI's `fills add` and the API's `POST /api/fills`) mint a fresh `uuid4()` per fill, so no caller can pass a colliding id — but it is a trap for whoever adds a third caller, or a retry path that re-sends the same id expecting idempotence. A one-line assertion that `result.inserted == len(fills)` would close it, converting the silent mismatch into a loud one. |
+
+---
