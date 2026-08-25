@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
         openapi_url=None,
     )
     app.state.pool = None
+    app.state.write_pool = None
     app.include_router(health_router)
     app.include_router(trades_router)
     app.include_router(dashboard_router)
