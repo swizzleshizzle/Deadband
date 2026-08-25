@@ -329,3 +329,23 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 .config { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin-top: 10px; }
 .config dt { font-size: 11px; color: var(--muted); text-transform: lowercase; }
 .config dd { margin: 0; font-size: 13px; }
+
+/* ---- entry form ---- */
+
+.entry { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 16px; }
+.entry select, .entry input {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+.entry input::placeholder { color: var(--muted); }
+.entry button {
+  background: var(--surface); border: 1px solid var(--line); color: var(--text);
+  font-family: var(--mono); font-size: 12px; padding: 5px 12px; border-radius: 4px;
+  cursor: pointer;
+}
+.entry button:disabled { color: var(--muted); cursor: default; }

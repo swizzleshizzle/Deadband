@@ -172,3 +172,34 @@ export const fetchTrades = (params: URLSearchParams) =>
 export const fetchTradeDetail = (id: string) => get<TradeDetail>(`/api/trades/${id}`)
 export const fetchAccounts = () => get<{ accounts: AccountSummary[] }>('/api/accounts')
 export const fetchAccountDetail = (id: string) => get<AccountDetail>(`/api/accounts/${id}`)
+
+// The Entry screen's write path. Money and quantities stay STRINGS end to end.
+export interface FillLegIn {
+  symbol: string
+  side: 'buy' | 'sell'
+  quantity: string
+  price: string
+  fee: string
+  fee_currency: string
+  executed_at: string
+}
+
+export interface CreatedFills {
+  fill_ids: string[]
+  trades_regrouped: number
+}
+
+async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method,
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (r.status === 404) throw new NotFound()
+  if (!r.ok) throw new Error((await r.text()) || `${path}: ${r.status}`)
+  return r.status === 204 ? (undefined as T) : ((await r.json()) as T)
+}
+
+export const createFills = (body: { account_id: string; fills: FillLegIn[] }) =>
+  send<CreatedFills>('/api/fills', 'POST', body)
+export const deleteFill = (id: string) => send<void>(`/api/fills/${id}`, 'DELETE')
