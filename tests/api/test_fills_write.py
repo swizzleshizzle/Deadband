@@ -3,6 +3,8 @@
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from db.accounts import create_account
 from tests.api.conftest import assert_no_json_floats
 from tests.conftest import requires_db
@@ -83,3 +85,57 @@ async def test_delete_fill_409s_on_an_imported_fill(client, conn):
     )
     await insert_fills(conn, [imported])
     assert (await client.delete(f"/api/fills/{imported.id}")).status_code == 409
+
+
+async def test_post_fills_quote_currency_is_always_usd_regardless_of_fee_currency(client, conn):
+    """Review finding 1: quote_currency is part of the instrument NATURAL KEY
+    (db/instruments.py) and is a different concept from a fill's fee_currency.
+    The CLI's cmd_fills_add always mints with quote_currency="USD" no matter
+    what --fee-currency is; posting the same symbol here with a non-USD
+    fee_currency must NOT mint a second instrument row for it."""
+    acc = await create_account(conn, name="ApiQuoteCcy", venue="manual", account_type="cash")
+    r1 = await client.post(
+        "/api/fills",
+        json={"account_id": str(acc), "fills": [_leg(symbol="ZZQ", side="buy")]},
+    )
+    assert r1.status_code == 201
+    leg2 = _leg(symbol="ZZQ", side="sell")
+    leg2["fee_currency"] = "EUR"
+    r2 = await client.post("/api/fills", json={"account_id": str(acc), "fills": [leg2]})
+    assert r2.status_code == 201
+    assert await conn.fetchval("SELECT count(*) FROM instrument WHERE symbol = 'ZZQ'") == 1
+
+
+async def test_post_fills_rolls_back_when_regroup_fails_inside_the_transaction(
+    client, conn, monkeypatch
+):
+    """Review finding 2: the earlier atomicity test only proved the
+    pre-transaction validation loop short-circuits before any DB call -- it
+    would still pass with `async with conn.transaction():` deleted from the
+    multi-leg path. Force a failure INSIDE the transaction (after
+    add_manual_fills has already run) and assert the whole batch rolls back."""
+    import api.fills as fills_module
+
+    async def _boom(_conn, _account_id):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fills_module, "regroup_account", _boom)
+
+    acc = await create_account(conn, name="ApiTxFailure", venue="manual", account_type="cash")
+    legs = [_leg(symbol=f"ZZT{i}") for i in range(3)]
+    with pytest.raises(RuntimeError):
+        await client.post("/api/fills", json={"account_id": str(acc), "fills": legs})
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+
+
+async def test_post_fills_422s_on_an_invalid_side(client, conn):
+    """Review finding 3: the API has no argparse `choices=` to lean on the way
+    the CLI does, so an invalid side must be refused as a clean 422 rather
+    than raising Side(...)'s ValueError uncaught into a 500."""
+    acc = await create_account(conn, name="ApiBadSide", venue="manual", account_type="cash")
+    r = await client.post(
+        "/api/fills",
+        json={"account_id": str(acc), "fills": [_leg(side="sideways")]},
+    )
+    assert r.status_code == 422
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0

@@ -89,18 +89,25 @@ async def create_fills(
 
     async with conn.transaction():
         fills = []
-        for symbol, side, quantity, price, fee, currency, executed_at in parsed:
+        for symbol, side, quantity, price, fee, fee_currency, executed_at in parsed:
+            # quote_currency is part of the instrument NATURAL KEY (see
+            # db/instruments.py, instrument_natural_key) and is a different
+            # concept from a fill's fee_currency. The CLI's cmd_fills_add
+            # always mints with quote_currency="USD" regardless of
+            # --fee-currency (cli.py); this must match exactly, or posting
+            # the same symbol with a non-USD fee_currency mints a second
+            # instrument row and silently splits the position in two.
             instrument_id = await upsert_instrument(
                 conn,
                 Instrument(
-                    id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency=currency
+                    id=None, asset_class=AssetClass.EQUITY, symbol=symbol, quote_currency="USD"
                 ),
             )
             fills.append(
                 Fill(
                     id=uuid4(), account_id=body.account_id, instrument_id=instrument_id,
                     executed_at=executed_at, side=side, quantity=quantity, price=price,
-                    fee=fee, fee_currency=currency, source=FillSource.MANUAL,
+                    fee=fee, fee_currency=fee_currency, source=FillSource.MANUAL,
                     venue_fill_id=None, is_estimated=False,
                 )
             )
