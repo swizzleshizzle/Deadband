@@ -14,14 +14,17 @@ interface LegState {
 
 const EMPTY: LegState = { symbol: '', side: 'buy', quantity: '', price: '', fee: '0' }
 
-// datetime-local yields "2026-06-01T15:30" with no zone -- the server's
-// datetime.fromisoformat happily accepts that and produces a NAIVE datetime.
-// The column is TIMESTAMPTZ, so a naive value would be read against the
-// server's zone instead of the browser's. Append seconds (if missing) and Z
-// so the instant sent is unambiguous.
+// datetime-local yields the browser's LOCAL wall-clock time with no offset,
+// e.g. "2026-06-01T15:30" for 3:30pm in whatever zone the user is sitting
+// in. The column is TIMESTAMPTZ. The trap: stamping a bare "Z" onto that
+// string is unambiguous but WRONG -- it reinterprets "15:30 local" as
+// "15:30 UTC", silently shifting every hand-entered fill by the browser's
+// UTC offset (4-5 hours for US Eastern), which can reorder which fill opens
+// a position once trades are grouped by executed_at. `new Date(local)`
+// parses an offset-less string as LOCAL time (this also handles the
+// with-seconds form), so `.toISOString()` yields the true UTC instant.
 function toInstant(local: string): string {
-  const withSeconds = local.length === 16 ? `${local}:00` : local
-  return `${withSeconds}Z`
+  return new Date(local).toISOString()
 }
 
 export default function Entry() {
@@ -42,7 +45,8 @@ export default function Entry() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
-    if (busy) return              // a double-click must not create two fills
+    if (busy || !account) return  // a double-click must not create two fills,
+                                   // nor a submit before accounts have loaded
     setBusy(true)
     setError(null)
     const body: FillLegIn = {
@@ -82,9 +86,17 @@ export default function Entry() {
       {error && <div className="error">{error}</div>}
 
       <form className="entry" onSubmit={submit}>
-        <select value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
-          {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-        </select>
+        {accounts.length === 0 ? (
+          // Rendering the select before fetchAccounts() resolves would leave
+          // `account` at its '' default; submitting in that window sends
+          // account_id: "" and fails UUID parsing server-side. Hold the slot
+          // with a placeholder instead (same gate Trades.tsx uses).
+          <span className="muted">loading accounts…</span>
+        ) : (
+          <select value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        )}
         <input
           ref={symbolRef} value={leg.symbol} aria-label="Symbol" placeholder="symbol" size={8}
           onChange={(e) => setLeg({ ...leg, symbol: e.target.value })}
@@ -118,7 +130,7 @@ export default function Entry() {
           type="datetime-local" value={executedAt} aria-label="Executed at"
           onChange={(e) => setExecutedAt(e.target.value)}
         />
-        <button type="submit" disabled={busy}>{busy ? 'saving…' : 'add fill'}</button>
+        <button type="submit" disabled={busy || !account}>{busy ? 'saving…' : 'add fill'}</button>
       </form>
 
       {added.length > 0 && (

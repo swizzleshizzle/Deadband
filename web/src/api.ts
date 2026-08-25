@@ -189,6 +189,32 @@ export interface CreatedFills {
   trades_regrouped: number
 }
 
+// FastAPI error bodies are JSON ({"detail": ...}), not plain text. Rendering
+// that raw shows the user literal braces and quotes for the single most
+// common mistake a write form invites (e.g. a bad quantity). `detail` is a
+// string for most 4xx errors; pydantic validation failures instead carry an
+// array of {loc, msg, ...} objects. Fall back to the raw text only when the
+// body isn't JSON at all (e.g. a proxy error page).
+async function errorMessage(r: Response, path: string): Promise<string> {
+  const text = await r.text()
+  try {
+    const body = JSON.parse(text) as { detail?: unknown }
+    if (typeof body.detail === 'string') return body.detail
+    if (Array.isArray(body.detail)) {
+      return body.detail
+        .map((d) =>
+          d && typeof d === 'object' && 'msg' in d
+            ? String((d as { msg: unknown }).msg)
+            : JSON.stringify(d),
+        )
+        .join('; ')
+    }
+  } catch {
+    // not JSON -- fall through to the raw text below
+  }
+  return text || `${path}: ${r.status}`
+}
+
 async function send<T>(path: string, method: string, body?: unknown): Promise<T> {
   const r = await fetch(path, {
     method,
@@ -196,7 +222,7 @@ async function send<T>(path: string, method: string, body?: unknown): Promise<T>
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (r.status === 404) throw new NotFound()
-  if (!r.ok) throw new Error((await r.text()) || `${path}: ${r.status}`)
+  if (!r.ok) throw new Error(await errorMessage(r, path))
   return r.status === 204 ? (undefined as T) : ((await r.json()) as T)
 }
 
