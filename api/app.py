@@ -9,12 +9,12 @@ whole app; in dev the Vite server proxies /api here instead."""
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 from fastapi import FastAPI
 
 from api.accounts import router as accounts_router
-from api.fills import router as fills_router
 from api.health import router as health_router
 from api.dashboard import router as dashboard_router
 from api.trades import router as trades_router
@@ -23,7 +23,9 @@ from api.serialization import DeadbandJSONResponse
 _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
 
 
-def create_app() -> FastAPI:
+def create_app(enable_writes: bool | None = None) -> FastAPI:
+    if enable_writes is None:
+        enable_writes = bool(os.environ.get("DEADBAND_ENABLE_WRITES"))
     app = FastAPI(
         title="deadband",
         default_response_class=DeadbandJSONResponse,
@@ -40,7 +42,14 @@ def create_app() -> FastAPI:
     app.include_router(trades_router)
     app.include_router(dashboard_router)
     app.include_router(accounts_router)
-    app.include_router(fills_router)
+    # Write routes exist ONLY when explicitly enabled. The published unit does
+    # not set the flag, so these endpoints are absent there and return 404 to
+    # every proxied request -- nothing is trusted, not a header and not a
+    # source address (spec section 6). Registered before the SPA catch-all.
+    if enable_writes:
+        from api.fills import router as fills_router
+
+        app.include_router(fills_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse

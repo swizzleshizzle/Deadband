@@ -39,7 +39,7 @@ class _Acquire:
 
 @pytest_asyncio.fixture
 async def api_app(conn):
-    app = create_app()
+    app = create_app(enable_writes=True)
     app.state.pool = _FixturePool(conn)
     # Same rollback-per-test connection backs both pools, so a write
     # endpoint's changes are visible to a read endpoint in the same test and
