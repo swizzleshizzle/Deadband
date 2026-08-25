@@ -163,7 +163,18 @@ async function get<T>(path: string): Promise<T> {
   return (await r.json()) as T
 }
 
-export class NotFound extends Error {}
+// A message is required, not optional: some callers deliberately catch this
+// by `instanceof` and substitute their own copy ("no such account"), but
+// others (Entry.tsx) surface `err.message` straight to the user, and a bare
+// `new NotFound()` gives Error's default empty string there -- `{error && ...}`
+// then renders nothing at all, so a 404 looks like the form silently did
+// nothing rather than reporting what happened.
+export class NotFound extends Error {
+  constructor(message = 'not found') {
+    super(message)
+    this.name = 'NotFound'
+  }
+}
 
 export const fetchHealth = () => get<Health>('/api/health')
 export const fetchDashboard = () => get<Dashboard>('/api/dashboard')

@@ -44,8 +44,10 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     app.include_router(accounts_router)
     # Write routes exist ONLY when explicitly enabled. The published unit does
     # not set the flag, so these endpoints are absent there and return 404 to
-    # every proxied request -- nothing is trusted, not a header and not a
-    # source address (spec section 6). Registered before the SPA catch-all.
+    # every proxied request -- or 405 when web/dist is mounted below, because
+    # the SPA catch-all is GET-only and still path-matches a write verb.
+    # Either way nothing is trusted, not a header and not a source address
+    # (spec section 6). Registered before the SPA catch-all.
     if enable_writes:
         from api.fills import router as fills_router
 

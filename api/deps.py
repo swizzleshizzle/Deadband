@@ -1,10 +1,15 @@
-"""Connection plumbing for the read-only API.
+"""Connection plumbing for the API's two pools: read and write.
 
-Handlers draw connections through the app's pool, which is created lazily on
-first use with `default_transaction_read_only = on` (spec D3): the read-only
-milestone is a Postgres guarantee, not a review convention. Tests replace
-`app.state.pool` with a wrapper around their rollback-per-test connection, so
-the pool is never created there (see tests/api/conftest.py)."""
+`get_conn` draws from a pool created lazily with
+`default_transaction_read_only = on` (spec D3) -- for that pool specifically,
+the read-only guarantee is a Postgres property of the connection, not a review
+convention, and no handler using it can write regardless of what the code
+above it does. `get_write_conn` draws from a second pool with no such
+setting, used only by routes that need to write (tests/api/test_write_pool.py
+checks mechanically that each route uses the pool its HTTP method implies).
+Tests replace `app.state.pool` and `app.state.write_pool` with wrappers around
+their rollback-per-test connection, so neither pool is actually created there
+(see tests/api/conftest.py)."""
 
 from __future__ import annotations
 
