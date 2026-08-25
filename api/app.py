@@ -14,6 +14,7 @@ import pathlib
 from fastapi import FastAPI
 
 from api.accounts import router as accounts_router
+from api.fills import router as fills_router
 from api.health import router as health_router
 from api.dashboard import router as dashboard_router
 from api.trades import router as trades_router
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(trades_router)
     app.include_router(dashboard_router)
     app.include_router(accounts_router)
+    app.include_router(fills_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse
