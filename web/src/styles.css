@@ -235,7 +235,7 @@ tbody tr.rowlink:hover td { background: var(--surface); }
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
   margin: 14px 0 18px;
 }
-.filters select, .filters input {
+.filters select, .filters input, .entry select, .entry input {
   background: var(--surface);
   border: 1px solid var(--line);
   color: var(--text);
@@ -244,8 +244,9 @@ tbody tr.rowlink:hover td { background: var(--surface); }
   padding: 5px 8px;
   border-radius: 4px;
 }
-.filters input::placeholder { color: var(--muted); }
+.filters input::placeholder, .entry input::placeholder { color: var(--muted); }
 .filters select:focus-visible, .filters input:focus-visible,
+.entry select:focus-visible, .entry input:focus-visible,
 .rail a:focus-visible, tbody tr.rowlink:focus-visible, button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -253,12 +254,12 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 .filters .count { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
 
 .pager { display: flex; gap: 8px; margin-top: 14px; align-items: center; }
-.pager button {
+.pager button, .entry button {
   background: var(--surface); border: 1px solid var(--line); color: var(--text);
   font-family: var(--mono); font-size: 12px; padding: 4px 12px; border-radius: 4px;
   cursor: pointer;
 }
-.pager button:disabled { color: var(--muted); cursor: default; }
+.pager button:disabled, .entry button:disabled { color: var(--muted); cursor: default; }
 
 /* ---- expanded row / detail ---- */
 
@@ -333,19 +334,28 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 /* ---- entry form ---- */
 
 .entry { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 16px; }
-.entry select, .entry input {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 12px;
-  padding: 5px 8px;
-  border-radius: 4px;
+
+/* the mode switch above the form -- fixed two-way toggle, not a tab strip
+   that could grow more panes (D11). */
+.segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin-top: 16px; }
+.segmented button {
+  background: var(--surface); border: none; color: var(--muted);
+  font-family: var(--mono); font-size: 12px; padding: 6px 14px; cursor: pointer;
 }
-.entry input::placeholder { color: var(--muted); }
-.entry button {
-  background: var(--surface); border: 1px solid var(--line); color: var(--text);
-  font-family: var(--mono); font-size: 12px; padding: 5px 12px; border-radius: 4px;
-  cursor: pointer;
+.segmented button + button { border-left: 1px solid var(--line); }
+.segmented button.active { background: var(--surface-2); color: var(--text); }
+
+/* multi-leg mode: shared header row above a fixed leg table, not the single
+   flex row the plain .entry form uses. */
+.entry-multileg { display: block; }
+.entry-multileg .entry-header {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px;
 }
-.entry button:disabled { color: var(--muted); cursor: default; }
+.entry-multileg .legs-table { margin-bottom: 10px; }
+.entry-multileg .legs-table td { padding: 4px 6px; }
+.entry-multileg .entry-actions { display: flex; gap: 8px; align-items: center; }
+
+/* a leg named in a 422 (e.g. "fills[2].symbol: ...") -- highlighting the
+   row is enough to point at it without parsing which field. */
+.legs-table tr.leg-error td { background: color-mix(in srgb, var(--loss) 14%, transparent); }
+.legs-table tr.leg-error input, .legs-table tr.leg-error select { border-color: var(--loss); }
