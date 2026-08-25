@@ -23,8 +23,13 @@ const EMPTY: LegState = { symbol: '', side: 'buy', quantity: '', price: '', fee:
 // a position once trades are grouped by executed_at. `new Date(local)`
 // parses an offset-less string as LOCAL time (this also handles the
 // with-seconds form), so `.toISOString()` yields the true UTC instant.
+// An empty or unparseable value must throw HERE rather than produce
+// `Invalid Date` silently -- the caller relies on this landing in its own
+// try/catch so a bad date can never wedge the busy flag.
 function toInstant(local: string): string {
-  return new Date(local).toISOString()
+  const d = new Date(local)
+  if (Number.isNaN(d.getTime())) throw new Error('executed at: enter a date and time')
+  return d.toISOString()
 }
 
 export default function Entry() {
@@ -45,16 +50,20 @@ export default function Entry() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
-    if (busy || !account) return  // a double-click must not create two fills,
-                                   // nor a submit before accounts have loaded
+    // a double-click must not create two fills; nor a submit before accounts
+    // have loaded, nor one with no date entered
+    if (busy || !account || !executedAt) return
     setBusy(true)
     setError(null)
-    const body: FillLegIn = {
-      symbol: leg.symbol.trim(), side: leg.side,
-      quantity: leg.quantity, price: leg.price, fee: leg.fee || '0',
-      fee_currency: 'USD', executed_at: toInstant(executedAt),
-    }
     try {
+      // toInstant can throw (empty/unparseable date) -- it MUST run inside
+      // this try, or an uncaught throw here skips `finally` and leaves the
+      // button stuck on "saving…" forever with no error shown.
+      const body: FillLegIn = {
+        symbol: leg.symbol.trim(), side: leg.side,
+        quantity: leg.quantity, price: leg.price, fee: leg.fee || '0',
+        fee_currency: 'USD', executed_at: toInstant(executedAt),
+      }
       const r = await createFills({ account_id: account, fills: [body] })
       // account and date are RETAINED: entering N fills is N passes.
       setAdded((prev) => [
@@ -127,10 +136,12 @@ export default function Entry() {
           onChange={(e) => setLeg({ ...leg, fee: e.target.value })}
         />
         <input
-          type="datetime-local" value={executedAt} aria-label="Executed at"
+          type="datetime-local" value={executedAt} aria-label="Executed at" required
           onChange={(e) => setExecutedAt(e.target.value)}
         />
-        <button type="submit" disabled={busy || !account}>{busy ? 'saving…' : 'add fill'}</button>
+        <button type="submit" disabled={busy || !account || !executedAt}>
+          {busy ? 'saving…' : 'add fill'}
+        </button>
       </form>
 
       {added.length > 0 && (
