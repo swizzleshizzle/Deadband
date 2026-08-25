@@ -5075,3 +5075,77 @@ async def _seed_fill(conn, acc, inst, *, qty, price, at):
             )
         ],
     )
+
+
+# --- Task 3: `deadband fills add` / `deadband fills rm` ---------------------
+#
+# Hand entry and its undo, at the command line first -- a later task adds
+# HTTP endpoints that call the exact same db/fills.py functions, so this is
+# not a throwaway CLI. `add` wraps add_manual_fills (db/fills.py), which
+# raises ValueError if the fill it's given isn't source=MANUAL or carries a
+# non-None venue_fill_id/content_hash; `rm` wraps delete_manual_fill, which
+# returns False for an imported fill (the source='manual' check lives in its
+# own WHERE clause, so it can't be bypassed by a caller that forgets it).
+
+from types import SimpleNamespace
+
+
+def _fills_add_args(*, account, symbol, side="buy", quantity="5", price="20",
+                    fee="0", fee_currency="USD", executed_at="2026-06-01T15:30:00+00:00"):
+    return SimpleNamespace(
+        account=str(account), symbol=symbol, side=side, quantity=quantity,
+        price=price, fee=fee, fee_currency=fee_currency, executed_at=executed_at,
+    )
+
+
+async def test_fills_add_creates_a_fill_and_regroups(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    acc = await create_account(conn, name="CliEntry", venue="manual", account_type="cash")
+
+    rc = await cli.cmd_fills_add(_fills_add_args(account=acc, symbol="ZZC"))
+    assert rc == 0, capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 1
+    assert await conn.fetchval("SELECT count(*) FROM trade WHERE account_id = $1", acc) == 1
+
+
+async def test_fills_add_rejects_a_blank_symbol(conn, monkeypatch):
+    """Issue #27: an instrument was minted with symbol='' and became an unnamed
+    position that renders as a blank row. Manual entry must not be a second way
+    to create one. Rejected before the pool opens -- whether the symbol is blank
+    depends only on the argument."""
+    async def fake_create_pool(*_a, **_kw):
+        raise AssertionError("must not open a pool for an invalid symbol")
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    acc = await create_account(conn, name="CliBlank", venue="manual", account_type="cash")
+
+    rc = await cli.cmd_fills_add(_fills_add_args(account=acc, symbol="   "))
+    assert rc == 2
+    assert await conn.fetchval("SELECT count(*) FROM instrument WHERE btrim(symbol) = ''") == 0
+
+
+async def test_fills_rm_refuses_an_imported_fill(conn, monkeypatch, capsys):
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    acc = await create_account(conn, name="CliRm", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn,
+        Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZZD", quote_currency="USD"),
+    )
+    imported = Fill(
+        id=uuid4(), account_id=acc, instrument_id=inst,
+        executed_at=datetime(2026, 6, 1, 15, 30, tzinfo=UTC),
+        side=Side.BUY, quantity=Decimal("1"), price=Decimal("1"), fee=Decimal("0"),
+        fee_currency="USD", source=FillSource.CSV, venue_fill_id="v9", is_estimated=False,
+    )
+    await insert_fills(conn, [imported])
+
+    rc = await cli.cmd_fills_rm(SimpleNamespace(id=str(imported.id)))
+    assert rc == 1
+    assert "immutable" in capsys.readouterr().err
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE id = $1", imported.id) == 1
