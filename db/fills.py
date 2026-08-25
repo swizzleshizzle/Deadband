@@ -53,6 +53,36 @@ async def insert_fills(conn: asyncpg.Connection, fills: list[Fill]) -> InsertRes
     return InsertResult(inserted=inserted, skipped=len(fills) - inserted)
 
 
+async def add_manual_fills(conn: asyncpg.Connection, fills: list[Fill]) -> list[UUID]:
+    """Insert hand-entered fills and return their ids, in order.
+
+    Manual fills deliberately carry NEITHER dedupe key. venue_fill_id is None
+    because no venue issued them, and content_hash is None because the import
+    hash -- (executed_at, symbol, side, quantity, price) plus a within-batch
+    occurrence index -- cannot distinguish two genuinely identical manual
+    entries made in separate submissions. Hashing them would silently drop the
+    second, which is worse than a visible duplicate the user can delete: both
+    partial unique indexes skip NULLs, so every fill here lands.
+    """
+    for f in fills:
+        if f.source is not FillSource.MANUAL:
+            raise ValueError(f"add_manual_fills got a {f.source.value} fill; expected manual")
+        if f.content_hash is not None or f.venue_fill_id is not None:
+            raise ValueError("manual fills must carry neither venue_fill_id nor content_hash")
+    await insert_fills(conn, fills)
+    return [f.id for f in fills]
+
+
+async def delete_manual_fill(conn: asyncpg.Connection, fill_id: UUID) -> bool:
+    """Delete a hand-entered fill. Returns False if no such fill exists OR it
+    was imported -- the source check lives in the WHERE clause so it cannot be
+    bypassed by a caller that forgets to make it."""
+    result = await conn.execute(
+        "DELETE FROM fill WHERE id = $1 AND source = 'manual'", fill_id
+    )
+    return result != "DELETE 0"
+
+
 def _to_fill(r: asyncpg.Record) -> Fill:
     return Fill(
         id=r["id"],
