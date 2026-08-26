@@ -449,6 +449,40 @@ export default function Entry() {
                 )}
               </section>
 
+              {/* The positive case: where rows actually land when nothing is
+                  wrong. Every other section below this point is about a
+                  problem (blocking, unregistered refs) or a deliberate
+                  no-op (ignored refs) -- without this, a clean multi-account
+                  file previews as silence about the one question a preview
+                  exists to answer: is this going where I think it's going. */}
+              {report.routing && report.routing.mapped.length > 0 && (
+                <section className="section">
+                  <p className="eyebrow">will import to</p>
+                  <table>
+                    <tbody>
+                      {report.routing.mapped.map(([accountId, count]) => (
+                        <tr key={accountId}>
+                          <td>{accounts.find((a) => a.id === accountId)?.name ?? accountId}</td>
+                          <td className="right num">{count} row{count === 1 ? '' : 's'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {report.routing.unclassified_refs.length > 0 && (
+                    // Distinct from "unknown" (unregistered): these accounts
+                    // ARE registered, route_batch reached them, and they
+                    // simply produced nothing committable -- an empty
+                    // statement period, say. Named so the account isn't
+                    // silently dropped from the report just because it has
+                    // nothing to show.
+                    <p className="why">
+                      registered, but nothing on this file for them to import (no fills, cash
+                      movements, or blocking rows): {report.routing.unclassified_refs.join(', ')}
+                    </p>
+                  )}
+                </section>
+              )}
+
               {report.needs_account && (
                 <section className="section">
                   <p className="eyebrow">this file has no per-row account column</p>
