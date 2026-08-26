@@ -1,8 +1,40 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  createFills, deleteFill, fetchAccounts,
-  type AccountSummary, type FillLegIn,
+  createFills, deleteFill, fetchAccounts, previewImport,
+  type AccountSummary, type FillLegIn, type PreviewReport,
 } from '../api'
+
+// The importer registry (importers/registry.py) also lists "coinbase-api",
+// but that importer takes a JSON fills export from the Advanced Trade API,
+// not a broker CSV -- it has no place in a file-picker built for uploads.
+// No endpoint exposes "which venues take a CSV upload" as its own list, so
+// this is hardcoded to the two the repo actually ships CSV importers for.
+// GAP: if a third CSV venue is ever added, this array silently misses it
+// until someone remembers to update it here too -- worth an API-exposed
+// list (e.g. importers/registry.py's own CSV/API distinction) instead.
+const IMPORT_VENUES = ['coinbase', 'fidelity']
+
+// blocking is (account_ref | null, message) pairs, precisely so *this*
+// account's rows can be shown blocking while *that* account's are fine.
+// Grouped here rather than at render time so the render stays a plain map.
+function groupBlocking(pairs: readonly (readonly [string | null, string])[]): [string | null, string[]][] {
+  const order: (string | null)[] = []
+  const byRef = new Map<string | null, string[]>()
+  for (const [ref, msg] of pairs) {
+    if (!byRef.has(ref)) {
+      byRef.set(ref, [])
+      order.push(ref)
+    }
+    byRef.get(ref)!.push(msg)
+  }
+  return order.map((ref) => [ref, byRef.get(ref)!])
+}
+
+const DUPLICATE_SKIP_TEXT: Record<string, string> = {
+  no_connection: 'this preview ran with no database connection to check against.',
+  needs_account: 'rows carry no account column, and no account has been chosen yet.',
+  unknown_refs: 'a money-carrying row references an account that is not registered yet.',
+}
 
 interface LegState {
   symbol: string
@@ -41,7 +73,7 @@ function legIndexFromError(msg: string): number | null {
 }
 
 export default function Entry() {
-  const [mode, setMode] = useState<'fill' | 'multileg'>('fill')
+  const [mode, setMode] = useState<'fill' | 'multileg' | 'import'>('fill')
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [account, setAccount] = useState('')
   const [executedAt, setExecutedAt] = useState('')
@@ -54,13 +86,23 @@ export default function Entry() {
   const symbolRef = useRef<HTMLInputElement>(null)
   const firstLegRef = useRef<HTMLInputElement>(null)
 
+  // Import wizard (steps 1-2 only -- commit is a later task). `report` is
+  // cleared whenever the file or venue changes so a stale preview can never
+  // be mistaken for a description of the currently-selected upload.
+  const [importFile, setImportFile] = useState<File | null>(null)
+  const [importVenue, setImportVenue] = useState(IMPORT_VENUES[0])
+  const [importAccount, setImportAccount] = useState('')
+  const [importBusy, setImportBusy] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [report, setReport] = useState<PreviewReport | null>(null)
+
   useEffect(() => {
     fetchAccounts()
       .then((r) => { setAccounts(r.accounts); setAccount((a) => a || r.accounts[0]?.id || '') })
       .catch(() => setAccounts([]))
   }, [])
 
-  function switchMode(m: 'fill' | 'multileg') {
+  function switchMode(m: 'fill' | 'multileg' | 'import') {
     // Switching mid-typing shouldn't leave a stale error from the other
     // form's last attempt pointing at a row that no longer applies.
     setMode(m)
@@ -160,13 +202,33 @@ export default function Entry() {
     }
   }
 
+  // Read-only: this never writes anything, so unlike submit()/submitMultileg()
+  // there is nothing here that must not double-fire -- only the busy guard so
+  // two clicks don't race two previews. `accountId` is passed once the
+  // needs_account selector has been used; omitted on the first call, since
+  // whether it is even needed is exactly what this call finds out.
+  async function runPreview(accountId?: string) {
+    if (importBusy || !importFile) return
+    setImportBusy(true)
+    setImportError(null)
+    try {
+      const r = await previewImport(importFile, importVenue, accountId)
+      setReport(r)
+    } catch (err) {
+      setImportError(String(err instanceof Error ? err.message : err))
+      setReport(null)
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
   return (
     <>
       <p className="eyebrow">by hand</p>
       <h1>Entry</h1>
 
-      {/* Fixed two-way switch -- D11: no rearrangeable or configurable
-          panes. This is the only way to change modes; the layout of either
+      {/* Fixed three-way switch -- D11: no rearrangeable or configurable
+          panes. This is the only way to change modes; the layout of any
           mode itself is likewise fixed. */}
       <div className="segmented" role="tablist" aria-label="Entry mode">
         <button
@@ -182,6 +244,13 @@ export default function Entry() {
           onClick={() => switchMode('multileg')}
         >
           multi-leg
+        </button>
+        <button
+          type="button" role="tab" aria-selected={mode === 'import'}
+          className={mode === 'import' ? 'active' : undefined}
+          onClick={() => switchMode('import')}
+        >
+          import
         </button>
       </div>
 
@@ -237,7 +306,7 @@ export default function Entry() {
             {busy ? 'saving…' : 'add fill'}
           </button>
         </form>
-      ) : (
+      ) : mode === 'multileg' ? (
         <form className="entry entry-multileg" onSubmit={submitMultileg}>
           <div className="entry-header">
             {accounts.length === 0 ? (
@@ -320,6 +389,166 @@ export default function Entry() {
             </button>
           </div>
         </form>
+      ) : (
+        <>
+          {/* Step 1: pick. No form/onSubmit -- "preview" is a read GET-like
+              action, not a write, so there is nothing here for Enter to
+              submit and nothing that needs the busy-wedge discipline the two
+              write forms above require (see runPreview: everything that can
+              throw is already inside its own try/finally). */}
+          <div className="entry">
+            <input
+              type="file" aria-label="Import file" accept=".csv,.txt"
+              onChange={(e) => {
+                setImportFile(e.target.files?.[0] ?? null)
+                setReport(null)
+                setImportError(null)
+              }}
+            />
+            <select
+              value={importVenue} aria-label="Venue"
+              onChange={(e) => { setImportVenue(e.target.value); setReport(null) }}
+            >
+              {IMPORT_VENUES.map((v) => <option key={v} value={v}>{v}</option>)}
+            </select>
+            <button type="button" onClick={() => runPreview()} disabled={importBusy || !importFile}>
+              {importBusy ? 'reading…' : 'preview'}
+            </button>
+          </div>
+
+          {importError && <div className="error">{importError}</div>}
+
+          {/* Step 2: an honest preview. Nothing here is invented -- every
+              value below is a field PreviewReport actually returned. */}
+          {report && (
+            <>
+              <section className="section">
+                <p className="eyebrow">preview</p>
+                <div className="statgrid">
+                  <div>
+                    <span className="lbl">fills</span>
+                    <span className="val num">{report.fill_count}</span>
+                  </div>
+                  <div>
+                    <span className="lbl">cash movements</span>
+                    <span className="val num">{report.cash_count}</span>
+                  </div>
+                  <div>
+                    <span className="lbl">transfers</span>
+                    <span className="val num">{report.transfer_count}</span>
+                  </div>
+                  <div>
+                    <span className="lbl">unmapped rows</span>
+                    <span className="val num">{report.unmapped_row_count}</span>
+                  </div>
+                </div>
+                {report.warnings.length > 0 && (
+                  <ul className="warnings">
+                    {report.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                )}
+              </section>
+
+              {report.needs_account && (
+                <section className="section">
+                  <p className="eyebrow">this file has no per-row account column</p>
+                  <div className="entry">
+                    <span className="muted">choose one account for the whole file, then preview again</span>
+                    {accounts.length === 0 ? (
+                      <span className="muted">loading accounts…</span>
+                    ) : (
+                      <select
+                        value={importAccount || accounts[0]?.id || ''} aria-label="Import account"
+                        onChange={(e) => setImportAccount(e.target.value)}
+                      >
+                        {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                      </select>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => runPreview(importAccount || accounts[0]?.id)}
+                      disabled={importBusy || accounts.length === 0}
+                    >
+                      {importBusy ? 'reading…' : 'preview with this account'}
+                    </button>
+                  </div>
+                </section>
+              )}
+
+              {report.blocking.length > 0 && (
+                <section className="section">
+                  <p className="eyebrow">blocking -- must be resolved before this can commit</p>
+                  {groupBlocking(report.blocking).map(([ref, msgs]) => (
+                    <div key={ref ?? '·unassigned·'}>
+                      <p className="eyebrow">{ref ?? 'rows with no account ref'}</p>
+                      <ul className="warnings">
+                        {msgs.map((m, i) => <li key={i}>{m}</li>)}
+                      </ul>
+                    </div>
+                  ))}
+                </section>
+              )}
+
+              {(report.unknown_money_refs.length > 0 ||
+                report.unknown_refs.length > report.unknown_money_refs.length) && (
+                <section className="section">
+                  <p className="eyebrow">accounts not registered</p>
+                  {report.unknown_money_refs.length > 0 && (
+                    <div className="error">
+                      carrying money -- blocks a commit: {report.unknown_money_refs.join(', ')}.
+                      There is no per-account selector here; the fix is to register
+                      an account with this external ref first (<span className="num">deadband accounts add --venue {importVenue} --external-ref &lt;ref&gt; --name &lt;name&gt;</span>),
+                      then preview again.
+                    </div>
+                  )}
+                  {report.unknown_refs
+                    .filter((r) => !report.unknown_money_refs.includes(r))
+                    .length > 0 && (
+                    <p className="why">
+                      also seen, not registered, but carry no money on these rows so they
+                      will not block a commit -- still worth registering:{' '}
+                      {report.unknown_refs
+                        .filter((r) => !report.unknown_money_refs.includes(r))
+                        .join(', ')}
+                    </p>
+                  )}
+                </section>
+              )}
+
+              {report.ignored_refs.length > 0 && (
+                <p className="why">
+                  dropped on purpose (registered ignore-on-import), not a failure:{' '}
+                  {report.ignored_refs.join(', ')}
+                </p>
+              )}
+
+              {report.corporate_proposals.length > 0 && (
+                <section className="section">
+                  <p className="eyebrow">corporate actions detected</p>
+                  <ul className="warnings">
+                    {report.corporate_proposals.map((p, i) => <li key={i}>{p}</li>)}
+                  </ul>
+                </section>
+              )}
+
+              <section className="section">
+                <p className="eyebrow">duplicates</p>
+                {report.duplicates ? (
+                  <p className="muted">
+                    already on file, will be skipped rather than re-inserted on commit:{' '}
+                    <span className="num">{report.duplicates.fill_dupes}</span> fill(s),{' '}
+                    <span className="num">{report.duplicates.cash_dupes}</span> cash movement(s),{' '}
+                    <span className="num">{report.duplicates.transfer_dupes}</span> transfer(s).
+                  </p>
+                ) : (
+                  <p className="muted">
+                    not checked -- {DUPLICATE_SKIP_TEXT[report.duplicates_skipped_reason ?? 'no_connection']}
+                  </p>
+                )}
+              </section>
+            </>
+          )}
+        </>
       )}
 
       {added.length > 0 && (
