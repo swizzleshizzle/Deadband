@@ -105,6 +105,19 @@ export default function Entry() {
   const [previewAccountId, setPreviewAccountId] = useState<string | undefined>(undefined)
   const [commitBusy, setCommitBusy] = useState(false)
   const [commitReport, setCommitReport] = useState<ImportCommitReport | null>(null)
+  // Whether THIS FILE, on THIS VENUE, has no per-row account column -- tracked
+  // separately from `report` on purpose. `report` is invalidated the moment
+  // the chosen account changes (it described routing for the OLD account),
+  // but "does this file need an account picked at all" is a fact about the
+  // file and the venue's export format, not about which account was picked.
+  // If the account selector's own visibility depended on `report` (as it did
+  // before this was split out), changing the selector would unmount the
+  // selector itself mid-interaction -- a dead end with no way to preview the
+  // newly-chosen account. Cleared only where the underlying fact can change:
+  // a new file or a new venue. Left untouched by an account change, and left
+  // untouched on a failed preview (nothing about the file/venue changed,
+  // so the last known answer is still the best one available).
+  const [needsAccount, setNeedsAccount] = useState(false)
 
   useEffect(() => {
     fetchAccounts()
@@ -229,6 +242,7 @@ export default function Entry() {
       const r = await previewImport(importFile, importVenue, accountId)
       setReport(r)
       setPreviewAccountId(accountId)
+      setNeedsAccount(r.needs_account)
     } catch (err) {
       setImportError(String(err instanceof Error ? err.message : err))
       setReport(null)
@@ -444,6 +458,10 @@ export default function Entry() {
                 setImportError(null)
                 setCommitReport(null)
                 setPreviewAccountId(undefined)
+                // A new file may not need an account at all (or need one for
+                // a different reason) -- the old answer is stale the moment
+                // the file itself changes.
+                setNeedsAccount(false)
               }}
             />
             <select
@@ -453,6 +471,10 @@ export default function Entry() {
                 setReport(null)
                 setCommitReport(null)
                 setPreviewAccountId(undefined)
+                // Same file, different venue's importer can classify rows
+                // differently -- whether it needs an account is a fact of
+                // (file, venue) together, not of the file alone.
+                setNeedsAccount(false)
               }}
             >
               {IMPORT_VENUES.map((v) => <option key={v} value={v}>{v}</option>)}
@@ -466,6 +488,56 @@ export default function Entry() {
           </div>
 
           {importError && <div className="error">{importError}</div>}
+
+          {/* Gated on `needsAccount`, NOT on `report.needs_account` --
+              rendered here, OUTSIDE `{report && ...}`, so this selector stays
+              mounted even after picking an account clears `report` below.
+              Gating it on `report` (as an earlier round did) unmounted this
+              exact control the moment it was used: picking an account
+              cleared `report`, which hid the selector along with the routing
+              table, leaving no way to preview the newly-chosen account
+              without abandoning the selection and starting over. */}
+          {needsAccount && (
+            <section className="section">
+              <p className="eyebrow">this file has no per-row account column</p>
+              <div className="entry">
+                <span className="muted">choose one account for the whole file, then preview again</span>
+                {accounts.length === 0 ? (
+                  <span className="muted">loading accounts…</span>
+                ) : (
+                  <select
+                    value={importAccount || accounts[0]?.id || ''} aria-label="Import account"
+                    onChange={(e) => {
+                      // Changing the account invalidates the routing the
+                      // last preview computed -- "will import to" was built
+                      // from the OLD account, so leaving it on screen next to
+                      // a changed dropdown would show two different
+                      // destinations for one write. Clearing
+                      // report/commitReport/previewAccountId (same pattern as
+                      // the file and venue handlers above) forces a
+                      // re-preview before commit is possible again, so a
+                      // stale routing table can never sit beside a dropdown
+                      // it no longer describes. `needsAccount` itself is
+                      // deliberately NOT cleared here -- see its declaration.
+                      setImportAccount(e.target.value)
+                      setReport(null)
+                      setCommitReport(null)
+                      setPreviewAccountId(undefined)
+                    }}
+                  >
+                    {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  onClick={() => runPreview(importAccount || accounts[0]?.id)}
+                  disabled={importBusy || commitBusy || accounts.length === 0}
+                >
+                  {importBusy ? 'reading…' : 'preview with this account'}
+                </button>
+              </div>
+            </section>
+          )}
 
           {/* Step 2: an honest preview. Nothing here is invented -- every
               value below is a field PreviewReport actually returned. */}
@@ -529,47 +601,6 @@ export default function Entry() {
                       movements, or blocking rows): {report.routing.unclassified_refs.join(', ')}
                     </p>
                   )}
-                </section>
-              )}
-
-              {report.needs_account && (
-                <section className="section">
-                  <p className="eyebrow">this file has no per-row account column</p>
-                  <div className="entry">
-                    <span className="muted">choose one account for the whole file, then preview again</span>
-                    {accounts.length === 0 ? (
-                      <span className="muted">loading accounts…</span>
-                    ) : (
-                      <select
-                        value={importAccount || accounts[0]?.id || ''} aria-label="Import account"
-                        onChange={(e) => {
-                          // Changing the account invalidates the routing the
-                          // last preview computed -- "will import to" was
-                          // built from the OLD account, so leaving it on
-                          // screen next to a changed dropdown would show two
-                          // different destinations for one write. Clearing
-                          // report/commitReport/previewAccountId (same
-                          // pattern as the file and venue handlers above)
-                          // forces a re-preview before commit is possible
-                          // again, so a stale routing table can never sit
-                          // beside a dropdown it no longer describes.
-                          setImportAccount(e.target.value)
-                          setReport(null)
-                          setCommitReport(null)
-                          setPreviewAccountId(undefined)
-                        }}
-                      >
-                        {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-                      </select>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => runPreview(importAccount || accounts[0]?.id)}
-                      disabled={importBusy || commitBusy || accounts.length === 0}
-                    >
-                      {importBusy ? 'reading…' : 'preview with this account'}
-                    </button>
-                  </div>
                 </section>
               )}
 
