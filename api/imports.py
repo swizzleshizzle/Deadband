@@ -16,6 +16,7 @@ came in over HTTP instead of a terminal.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 from uuid import UUID
 
@@ -93,7 +94,27 @@ async def preview_import(
         # binary input.
         raise HTTPException(422, "file must be UTF-8 text") from None
 
-    batch = importer.parse(text)
+    try:
+        batch = importer.parse(text)
+    except csv.Error as exc:
+        # The ONE exception type this actually needs to catch, confirmed by
+        # exercising importers/fidelity.py directly rather than guessing:
+        # every ValueError/decimal.InvalidOperation a malformed row can
+        # produce (a bad date, a bad number, a non-finite quantity) is
+        # already caught INSIDE parse()'s own row loop and turned into a
+        # warning or a blocking reason -- see reject()'s docstring, which
+        # exists precisely so that no row-level parse failure ever escapes
+        # as an exception. What does still escape is the stdlib `csv`
+        # module's own refusal of a single field over ~128KB ("field larger
+        # than field limit"), which a genuinely wrong delimiter (or a
+        # non-CSV file with no delimiter at all) reaches before parse() ever
+        # gets a row to reject: a whole unsplit line becomes one field. This
+        # is deliberately NOT a bare `except Exception`: an AssertionError
+        # from parse()'s own "unhandled rule outcome" guard, for instance,
+        # means the importer itself has a bug, and turning that into "your
+        # file is bad" would hide a real defect behind a client-facing 422
+        # instead of surfacing it as the 500 it actually is.
+        raise HTTPException(422, f"could not parse this {venue} file: {exc}") from None
     # importer.account_venue, not importer.venue: this is the registered
     # account venue rows route/match against, and differs from the importer's
     # own identity for coinbase-api (see importers/base.py's Importer.account_venue
