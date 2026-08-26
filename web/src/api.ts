@@ -321,3 +321,6 @@ async function sendForm<T>(path: string, file: File, venue: string, accountId?: 
 
 export const previewImport = (file: File, venue: string, accountId?: string) =>
   sendForm<PreviewReport>('/api/imports/preview', file, venue, accountId)
+
+export const commitImport = (file: File, venue: string, accountId?: string) =>
+  sendForm<ImportCommitReport>('/api/imports/commit', file, venue, accountId)
