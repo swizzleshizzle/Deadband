@@ -1054,7 +1054,27 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # account: --account, the same one the unrouted-rows check above
             # already required whenever this batch has any unrouted fill or
             # cash movement.
-            ledger_notes = await _ledger_completed_notes_for(conn, account_id, batch)
+            try:
+                ledger_notes = await _ledger_completed_notes_for(
+                    conn, account_id, batch
+                )
+            except Exception:
+                # The import is already durable by this point (commit has
+                # returned) -- a DB or connection fault in this read-only
+                # follow-up read must not make a successful import look like
+                # a failure. Print the success summary now, before the
+                # traceback propagates and skips the print below entirely,
+                # so the user sees both: their data landed, AND something
+                # went wrong producing the spinoff/split note. A re-run is a
+                # safe no-op here thanks to content_hash dedupe.
+                print(
+                    f"inserted {result.fills_inserted} fills "
+                    f"({result.fills_skipped} already present), "
+                    f"{result.cash_inserted} cash movements, "
+                    f"{result.transfers_inserted} transfers, "
+                    f"{result.trades_regrouped} trades regrouped"
+                )
+                raise
             _print_corporate_action_section(
                 batch,
                 ledger_notes,

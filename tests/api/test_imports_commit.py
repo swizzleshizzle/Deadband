@@ -102,3 +102,24 @@ async def test_commit_routes_to_an_explicitly_chosen_account(client, conn):
     )
     assert r.status_code == 200
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) >= 1
+
+
+async def test_commit_records_csv_as_the_fill_source(client, conn):
+    """api/imports.py hardcodes source="csv" rather than relying on
+    commit_batch's own default -- that default is exactly the bug (I2) that
+    once made every API-synced fill claim CSV provenance. fill.source is the
+    only column that can answer "where did this row come from", so the HTTP
+    commit path needs its own assertion rather than trusting the CLI's
+    equivalent test (tests/db/test_cli.py) to cover it by proxy."""
+    acc = await create_account(
+        conn, name="Src", venue="fidelity", account_type="cash", external_ref="F3"
+    )
+    r = await client.post(
+        "/api/imports/commit",
+        files={"file": ("e.csv", _sample_fidelity_csv(ref="F3"), "text/csv")},
+        data={"venue": "fidelity"},
+    )
+    assert r.status_code == 200
+    sources = await conn.fetch("SELECT source FROM fill WHERE account_id = $1", acc)
+    assert len(sources) >= 1
+    assert all(row["source"] == "csv" for row in sources)

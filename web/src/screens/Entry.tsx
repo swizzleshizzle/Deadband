@@ -469,6 +469,7 @@ export default function Entry() {
               onChange={(e) => {
                 setImportVenue(e.target.value)
                 setReport(null)
+                setImportError(null)
                 setCommitReport(null)
                 setPreviewAccountId(undefined)
                 // Same file, different venue's importer can classify rows
@@ -576,26 +577,34 @@ export default function Entry() {
                   no-op (ignored refs) -- without this, a clean multi-account
                   file previews as silence about the one question a preview
                   exists to answer: is this going where I think it's going. */}
-              {report.routing && report.routing.mapped.length > 0 && (
+              {report.routing &&
+                (report.routing.mapped.length > 0 ||
+                  report.routing.unclassified_refs.length > 0) && (
                 <section className="section">
                   <p className="eyebrow">will import to</p>
-                  <table>
-                    <tbody>
-                      {report.routing.mapped.map(([accountId, count]) => (
-                        <tr key={accountId}>
-                          <td>{accounts.find((a) => a.id === accountId)?.name ?? accountId}</td>
-                          <td className="right num">{count} row{count === 1 ? '' : 's'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  {report.routing.mapped.length > 0 && (
+                    <table>
+                      <tbody>
+                        {report.routing.mapped.map(([accountId, count]) => (
+                          <tr key={accountId}>
+                            <td>{accounts.find((a) => a.id === accountId)?.name ?? accountId}</td>
+                            <td className="right num">{count} row{count === 1 ? '' : 's'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
                   {report.routing.unclassified_refs.length > 0 && (
                     // Distinct from "unknown" (unregistered): these accounts
                     // ARE registered, route_batch reached them, and they
                     // simply produced nothing committable -- an empty
-                    // statement period, say. Named so the account isn't
-                    // silently dropped from the report just because it has
-                    // nothing to show.
+                    // statement period, say. Independent of `mapped` on
+                    // purpose -- a file whose only ref is registered but
+                    // produced no rows has an empty `mapped`, and nesting
+                    // this under it (as an earlier round did) silently
+                    // dropped the account from the report instead of naming
+                    // it, where the CLI's equivalent path prints
+                    // "X: 0 row(s) mapped" regardless.
                     <p className="why">
                       registered, but nothing on this file for them to import (no fills, cash
                       movements, or blocking rows): {report.routing.unclassified_refs.join(', ')}

@@ -462,7 +462,7 @@ Reuse the existing error path — `send()` already extracts a readable message f
 
 - [ ] **Step 3: Build**
 
-Run: `cd /root/projects/Deadband/web && pnpm run build`
+Run: `cd web && pnpm run build`
 Expected: `tsc -b && vite build` clean.
 
 - [ ] **Step 4: Commit**
@@ -491,7 +491,7 @@ Show `fills_skipped` prominently rather than hiding it — on a re-import it wil
 
 - [ ] **Step 2: Build**
 
-Run: `cd /root/projects/Deadband/web && pnpm run build`
+Run: `cd web && pnpm run build`
 Expected: clean.
 
 - [ ] **Step 3: Commit**

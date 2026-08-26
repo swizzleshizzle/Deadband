@@ -314,7 +314,11 @@ async function sendForm<T>(path: string, file: File, venue: string, accountId?: 
   form.append('venue', venue)
   if (accountId) form.append('account_id', accountId)
   const r = await fetch(path, { method: 'POST', body: form })
-  if (r.status === 404) throw new NotFound()
+  // Unlike get()/send()'s bare NotFound(), this 404 carries a message worth
+  // keeping: api/imports.py returns it for AccountNotFoundError with the
+  // missing account id in `detail`, and without this the wizard shows the
+  // generic "not found" instead of which account was missing.
+  if (r.status === 404) throw new NotFound(await errorMessage(r, path))
   if (!r.ok) throw new Error(await errorMessage(r, path))
   return (await r.json()) as T
 }
