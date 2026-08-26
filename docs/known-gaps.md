@@ -758,3 +758,26 @@ while reviewing `add_manual_fills` itself.
 | 64 | **Manual fills wholly owned by a manual trade are never split-adjusted.** | `regroup_account`'s adjustment step (`db/trades.py:178-180`) runs after fills are reduced by any existing manual grouping, and a fill fully consumed by that reduction never reaches it — so a manual trade's fills keep their pre-split units forever, even after a corporate action that would rescale the same fills if they were still auto-grouped. Pre-existing behaviour, inherited from `regroup_account`, not introduced here; manual grouping is out of scope for this design, so nothing here makes the gap reachable — but adding manual grouping later would. |
 
 ---
+
+## Found while building the CSV import wizard (2026-08-26)
+
+`feat/import-wizard` pulls the routing/refusal decisions that used to live inline in
+`cli.py` out into `db/import_flow.py` (`route_batch`, `probe_duplicates`, `commit_batch`
+composed behind one `preview`/`commit` pair), then gives the API and the web UI a second
+front door onto the same decisions: `POST /api/imports/preview`, `POST
+/api/imports/commit`, and an Import tab on the Entry screen that picks a file, shows the
+preview, and commits it. Verified: the pure suite (444 passed) and `tests/api` (50
+passed, 0 skipped), and the web build (`tsc -b && vite build`), all green; `tests/db`
+was run separately (its runtime lands near the tool timeout) rather than re-run here.
+Four gaps below were found while extracting and wiring this path; a fifth candidate
+(`add_manual_fills` not verifying what it inserted) was already recorded as #63 on the
+previous branch and is not repeated.
+
+| # | Gap | Why it matters |
+|---|---|---|
+| 65 | **No per-ref account reassignment in the import wizard.** | An export naming an account that is not registered is *reported* clearly, with the fix named — the Entry screen's "accounts not registered" section (`web/src/screens/Entry.tsx:628`) spells out the exact `deadband accounts add` invocation — but cannot be fixed in place from the wizard itself; the API refuses the commit with a 422 (`UnknownRefsError`, `db/import_flow.py:105-121`, mapped in `api/imports.py:253-257`) and the user must register the account with that `external_ref` (`account.external_ref`, `db/schema.sql:13`) first. Doing the reassignment in the UI instead would need either a new write surface on `account.external_ref` or a routing override that `route_batch` (`db/importing.py:165`) has no concept of; the second would be a CLI/HTTP divergence, which is precisely what `db/import_flow.py` was extracted to prevent — its own module docstring names that divergence as the reason the extraction happened at all (`db/import_flow.py:3-9`). |
+| 66 | **The wizard's venue list is hardcoded in the frontend.** | No endpoint exposes the importer registry, so `web/src/screens/Entry.tsx:15` carries its own `IMPORT_VENUES = ['coinbase', 'fidelity']` array — `coinbase-api` is deliberately excluded, per the comment directly above it (`Entry.tsx:7-13`), because it takes a JSON fills export rather than a broker CSV. A venue added to `importers/registry.py`'s `_IMPORTERS` dict (`registry.py:10-21`) will silently not appear in the wizard until someone remembers to edit this second list. The fix is to expose the registry's own `list_importers()` (`registry.py:32`) from the API, which the code comment already flags as the intended direction. |
+| 67 | **`BlockingRowsError` collapses its structured reasons into one string on the commit path.** | `exc.reasons` is a tuple of `(account_ref, message)` pairs (`db/import_flow.py:76-78`), and the preview endpoint serializes that structure intact (`report.blocking`, `api/imports.py:130`) — but the commit endpoint's error handler joins every message into one semicolon-separated string before raising the 422 (`api/imports.py:240`), discarding which account each reason belongs to. Tolerable today because a refused commit rejects the file atomically, so there is no partial state to explain — but a multi-account file cannot be told "this account blocks, that one does not" on the commit path the way it can on preview. |
+| 68 | **`_amendment_plan`'s calendar guard is one call site, not a policy.** | `importers/fidelity.py:881-883` (commit `4e160e1`) guards `date.fromisoformat` against a regex-matched but calendar-invalid `AS OF` date — `_AS_OF_RE` checks digit shape only, so `AS OF 2026-02-30` used to reach `fromisoformat` unguarded and crash the whole import instead of leaving that one row unnetted. All four date parses in this module are now individually guarded the same way (`fidelity.py:696-698`, `:869-873`, `:881-883`, `:1263-1268`), but nothing enforces that as a rule — a fifth date parse added later has no guard unless whoever writes it happens to remember these four. The failure mode if it's forgotten is a raw crash on a plausible broker file, not a reported bad row through `reject()`. |
+
+---
