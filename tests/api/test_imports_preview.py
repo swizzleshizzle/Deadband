@@ -9,10 +9,20 @@ sample: a header shape the parser would never actually see in production
 proves nothing about the endpoint that has to parse real exports.
 """
 
+import pathlib
+
 from tests.api.conftest import assert_no_json_floats
 from tests.conftest import requires_db
 
 pytestmark = requires_db
+
+# Same fixture tests/test_fidelity_history.py's amendment-cluster tests use
+# (and tests/db/test_cli.py's CLI-level one) -- anchored on this file's own
+# location for the same reason those do: a path relative to "tests/..." only
+# resolves when pytest happens to be invoked from the repo root.
+_AMENDMENT_CLUSTER = (
+    pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "fidelity" / "amendment_cluster.csv"
+).read_text()
 
 _CSV = "Run Date,Action,Symbol,Quantity,Price ($),Amount ($)\n"
 
@@ -160,3 +170,24 @@ async def test_preview_parses_real_suffixed_money_headers_without_zeroing_them(c
     body = r.json()
     assert body["fill_count"] == 1
     assert not any("zero price" in w for w in body["warnings"])
+
+
+async def test_preview_survives_an_as_of_date_that_fails_the_calendar(client):
+    """Finding 3: importers/fidelity.py:_amendment_plan used to run
+    date.fromisoformat() unguarded on an "AS OF" token whose SHAPE the regex
+    validates but whose CALENDAR it does not -- "AS OF 2026-02-30" raised
+    ValueError straight out of FidelityImporter.parse(), a raw 500 through
+    this endpoint, for a file that is otherwise perfectly ordinary. Fixed at
+    the source (importers/fidelity.py), not here -- this is the wizard-level
+    proof that the fix actually closes the endpoint's exposure to it, on top
+    of tests/test_fidelity_history.py's parser-level coverage of the same
+    fix."""
+    corrupted = _AMENDMENT_CLUSTER.replace("as of 2026-01-02", "as of 2026-02-30")
+    assert corrupted != _AMENDMENT_CLUSTER, "the date edit must have applied"
+    r = await client.post(
+        "/api/imports/preview",
+        files={"file": ("export.csv", corrupted, "text/csv")},
+        data={"venue": "fidelity"},
+    )
+    assert r.status_code == 200
+    assert_no_json_floats(r.json())

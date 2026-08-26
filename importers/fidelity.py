@@ -878,7 +878,24 @@ def _amendment_plan(rows: list[tuple[int, dict[str, str]]]) -> _AmendmentPlan:
                 originals.setdefault(key, []).append(line_no)
             continue
 
-        as_of_date = date.fromisoformat(as_of.group(1))
+        try:
+            as_of_date = date.fromisoformat(as_of.group(1))
+        except ValueError:
+            # _AS_OF_RE validates the SHAPE (four digits, two digits, two
+            # digits) but not the CALENDAR -- "AS OF 2026-02-30" matches it
+            # and reached date.fromisoformat() unguarded here, raising out of
+            # parse() itself: a garbled or corrupted export date crashed the
+            # whole import instead of the file merely failing to net (D4).
+            # Same shape as the `except ValueError: continue` just above for
+            # a bad Run Date on a candidate original -- this row is simply
+            # not nettable, and the row loop's own reject() (which every
+            # other "recognised shape, unusable value" case in this module
+            # routes through) reports it: CANCELLED TRADE/CORRECTED CONFIRM
+            # match no rule in RULES, so an unnetted one already falls
+            # through to "unhandled action", named with its full text,
+            # blocking if it carries money exactly like any other unmapped
+            # row would.
+            continue
         key = (account, symbol, as_of_date, abs(qty), price)
         if _CANCEL_PHRASE in action:
             cancels.setdefault(key, []).append(line_no)
