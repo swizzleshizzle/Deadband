@@ -25,6 +25,7 @@ from db.import_flow import (
     AccountNotFoundError,
     AccountVenueMismatchError,
     BlockingRowsError,
+    DuplicateProbeSkipped,
     MixedDedupePathsError,
     RoutingReport,
     TransferRefused,
@@ -840,7 +841,11 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # dropped from the probe and it printed a count that silently
             # omitted them -- indistinguishable from "this file has no
             # duplicates" even though it was never checked.
-            if report.needs_account:
+            #
+            # The connection-free report already knows this, and says so as a
+            # named reason rather than as a condition this function would
+            # otherwise have to re-derive -- see DuplicateProbeSkipped.
+            if report.duplicates_skipped_reason is DuplicateProbeSkipped.NEEDS_ACCOUNT:
                 print(
                     "error: cannot check duplicates -- this file has row(s) "
                     "with no account ref to route by; pass --account to say "
@@ -864,12 +869,13 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     # C: mirror --commit's own refusal exactly -- a row that
                     # routes to an unknown account ref is never probed, so
                     # printing a count without checking this first would
-                    # silently omit it while looking complete.
-                    # unknown_money_refs is the money-scoped set (see
-                    # db.importing.RoutingPlan); a non-money unknown ref does
-                    # not stand behind --commit's refusal either, so it must
-                    # not stand behind this one.
-                    if probed.unknown_money_refs:
+                    # silently omit it while looking complete. That decision
+                    # is preview's, not this function's; all that is rendered
+                    # here is the reason it gave. unknown_money_refs is the
+                    # money-scoped set (see db.importing.RoutingPlan); a
+                    # non-money unknown ref does not stand behind --commit's
+                    # refusal either, so it does not stand behind this one.
+                    if probed.duplicates_skipped_reason is DuplicateProbeSkipped.UNKNOWN_REFS:
                         print(
                             "error: cannot check duplicates -- unknown "
                             f"account ref(s): {', '.join(probed.unknown_money_refs)}",
@@ -877,10 +883,11 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                         )
                         return 2
 
-                    # Not None: preview withholds the count only when it could
-                    # not have been complete, and both of those cases (no
-                    # destination for unrouted rows, unknown money-carrying
-                    # refs) have just been refused above.
+                    # Not None: preview withholds the count only when it
+                    # could not have been complete, and every reason it can
+                    # give for that (DuplicateProbeSkipped) has either been
+                    # refused above or cannot arise on a call that passed a
+                    # connection.
                     dupes = probed.duplicates
                     print(
                         f"  duplicate check: {dupes.fill_dupes} fill(s), "

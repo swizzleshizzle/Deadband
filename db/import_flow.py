@@ -23,12 +23,19 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from uuid import UUID
 
 import asyncpg
 
 from db.accounts import get_account
-from db.importing import DuplicateReport, commit_batch, probe_duplicates, route_batch
+from db.importing import (
+    DuplicateReport,
+    RoutingPlan,
+    commit_batch,
+    probe_duplicates,
+    route_batch,
+)
 from db.trades import regroup_account
 from importers.base import ImportBatch
 from ledger.grouping import TransferError
@@ -157,6 +164,29 @@ class TransferRefused(ImportRefused):
         self.routing = routing
 
 
+class DuplicateProbeSkipped(StrEnum):
+    """Why `preview` returned no duplicate count.
+
+    `duplicates=None` has three distinct causes, and a caller that has to tell
+    them apart by re-deriving them from the other fields is restating this
+    module's rule in its own words -- the CLI/HTTP divergence this module
+    exists to prevent, one level down. Naming the reason means cli.py and the
+    API each RENDER it instead.
+
+    A StrEnum so the API layer can put the reason on the wire unchanged.
+    """
+
+    # No connection was supplied, so there was nothing to probe against. The
+    # default `deadband import` run; not an error.
+    NO_CONNECTION = "no_connection"
+    # Rows carry no account ref and no destination was given, so they would
+    # have been silently omitted from the count (finding C).
+    NEEDS_ACCOUNT = "needs_account"
+    # A money-carrying ref matches no account, so those rows never land in
+    # `targets` and would likewise have been omitted.
+    UNKNOWN_REFS = "unknown_refs"
+
+
 @dataclass(frozen=True, slots=True)
 class RoutingReport:
     """Where this batch's rows landed, in the order a caller should report it.
@@ -194,9 +224,10 @@ class RoutingReport:
 class PreviewReport:
     """Everything a caller can say about a batch WITHOUT writing anything.
 
-    With `conn=None` the routing fields are all empty and `blocking` is the
-    batch's own unfiltered list -- not because nothing is wrong, but because
-    nothing about accounts can be known without a query. See `preview`.
+    With `conn=None` the routing fields are empty or None and `blocking` is
+    the batch's own unfiltered list -- not because nothing is wrong, but
+    because nothing about accounts can be known without a query. See
+    `preview`.
     """
 
     fill_count: int
@@ -231,12 +262,24 @@ class PreviewReport:
     # out of corporate_actions (D6) -- it is recognised, never applied, and
     # must never be mistaken for something `corporate add` can record.
     corporate_proposals: tuple[str, ...]
+    # Where every row WOULD land, computed by the same route_batch call the
+    # commit makes, so a caller can show the mapping before anything is
+    # written -- which is the import wizard's whole reason to exist. None when
+    # no connection was supplied, since routing is a database question. A
+    # caller that computed this mapping itself would be a second, independent
+    # answer to "which account does this row belong to", free to disagree with
+    # the one the commit then acts on.
+    routing: RoutingReport | None
     # None means the probe DID NOT RUN, never "no duplicates": with no
     # connection there is nothing to probe, and with unknown money-carrying
     # refs (or unrouted rows and no destination) any count it produced would
     # silently omit the rows it could not reach -- indistinguishable from "this
     # file is clean" even though it was never checked (finding C).
+    # duplicates_skipped_reason below says WHICH of those it was.
     duplicates: DuplicateReport | None
+    # Exactly one of these is set: a reason with no count, or a count with no
+    # reason. Never both, never neither.
+    duplicates_skipped_reason: DuplicateProbeSkipped | None
     # Rows exist that carry no account ref to route by, and no explicit
     # account was given. Depends only on the parsed batch, so a caller can act
     # on it before spending a connection.
@@ -277,6 +320,56 @@ def _rows_per_ref(batch: ImportBatch) -> tuple[tuple[str, int], ...]:
         )
         for ref in batch.refs_seen
     )
+
+
+def _targets_for(
+    plan: RoutingPlan, unrouted: ImportBatch, account_id: UUID | None
+) -> dict[UUID, ImportBatch]:
+    """Where each row lands: what route_batch resolved, plus the rows that
+    carry no ref at all merged into the caller's explicit destination.
+
+    Shared by preview and commit so the two can never disagree about the
+    mapping -- a preview that showed a different destination from the one the
+    commit then wrote to would be worse than showing nothing.
+    """
+    targets = dict(plan.by_account)
+    if unrouted.has_rows() and account_id is not None:
+        targets[account_id] = targets.get(account_id, ImportBatch()).merge_rows(unrouted)
+    return targets
+
+
+def _routing_report(
+    batch: ImportBatch, plan: RoutingPlan, targets: dict[UUID, ImportBatch]
+) -> RoutingReport:
+    return RoutingReport(
+        mapped=tuple(
+            (target_id, len(sub_batch.fills) + len(sub_batch.cash))
+            for target_id, sub_batch in targets.items()
+        ),
+        ignored_refs=plan.ignored_refs,
+        unknown_refs=plan.reported_unknown_refs,
+        unclassified_refs=_unclassified_refs(
+            batch, set(plan.ignored_refs) | set(plan.reported_unknown_refs)
+        ),
+    )
+
+
+def _probe_skipped_reason(
+    *, has_connection: bool, needs_account: bool, unknown_money_refs: tuple[str, ...]
+) -> DuplicateProbeSkipped | None:
+    """Stated once, here, rather than re-derived by each caller.
+
+    NEEDS_ACCOUNT outranks NO_CONNECTION when both hold: both are true of a
+    default preview run of a ref-less export, but only one of them is
+    something the user can act on.
+    """
+    if needs_account:
+        return DuplicateProbeSkipped.NEEDS_ACCOUNT
+    if not has_connection:
+        return DuplicateProbeSkipped.NO_CONNECTION
+    if unknown_money_refs:
+        return DuplicateProbeSkipped.UNKNOWN_REFS
+    return None
 
 
 def _unclassified_refs(batch: ImportBatch, plan_refs: set[str]) -> tuple[str, ...]:
@@ -341,7 +434,16 @@ async def preview(
             # so a caller is never told "nothing blocks this" on the strength
             # of a question that was never asked.
             blocking=batch.blocking,
+            # Routing is a database question; with nothing to ask, the honest
+            # answer is "not computed", never an empty mapping that reads like
+            # "no rows go anywhere".
+            routing=None,
             duplicates=None,
+            duplicates_skipped_reason=_probe_skipped_reason(
+                has_connection=False,
+                needs_account=needs_account,
+                unknown_money_refs=(),
+            ),
             **common,
         )
 
@@ -354,17 +456,21 @@ async def preview(
         (ref, msg) for ref, msg in batch.blocking if ref not in plan.ignored_refs
     )
 
+    targets = _targets_for(plan, unrouted, account_id)
+
+    skipped = _probe_skipped_reason(
+        has_connection=True,
+        needs_account=needs_account,
+        unknown_money_refs=plan.unknown_refs,
+    )
     duplicates: DuplicateReport | None = None
-    if not plan.unknown_refs and not needs_account:
-        # Both conditions are about COMPLETENESS, not about refusing: a row
+    if skipped is None:
+        # Every skip reason is about COMPLETENESS, not about refusing: a row
         # that routes to an unknown account, or that has no ref and no
         # explicit destination, never lands in `targets` and so is never
         # probed. Reporting a count that silently omitted it would be
         # indistinguishable from "this file has no duplicates" even though it
         # was never checked, which is worse than reporting nothing at all.
-        targets = dict(plan.by_account)
-        if unrouted.has_rows() and account_id is not None:
-            targets[account_id] = targets.get(account_id, ImportBatch()).merge_rows(unrouted)
         fill_dupes = cash_dupes = transfer_dupes = 0
         for target_id, sub_batch in targets.items():
             probed = await probe_duplicates(conn, target_id, sub_batch)
@@ -380,7 +486,9 @@ async def preview(
         unknown_money_refs=plan.unknown_refs,
         ignored_refs=plan.ignored_refs,
         blocking=effective_blocking,
+        routing=_routing_report(batch, plan, targets),
         duplicates=duplicates,
+        duplicates_skipped_reason=skipped,
         **common,
     )
 
@@ -443,27 +551,19 @@ async def commit(
     if effective_blocking:
         raise BlockingRowsError(effective_blocking)
 
-    targets: dict[UUID, ImportBatch] = dict(plan.by_account)
     if unrouted.has_rows():
         assert account_id is not None  # guaranteed by the UnroutableRowsError above
+        # Validated only on the commit path: preview describes where rows
+        # would go, and refusing there would turn "show me what this file
+        # does" into a second refusal surface.
         account = await get_account(conn, account_id)
         if account is None:
             raise AccountNotFoundError(account_id)
         if account["venue"] != venue:
             raise AccountVenueMismatchError(account_id, account["venue"], venue)
-        targets[account_id] = targets.get(account_id, ImportBatch()).merge_rows(unrouted)
 
-    routing = RoutingReport(
-        mapped=tuple(
-            (target_id, len(sub_batch.fills) + len(sub_batch.cash))
-            for target_id, sub_batch in targets.items()
-        ),
-        ignored_refs=plan.ignored_refs,
-        unknown_refs=plan.reported_unknown_refs,
-        unclassified_refs=_unclassified_refs(
-            batch, set(plan.ignored_refs) | set(plan.reported_unknown_refs)
-        ),
-    )
+    targets = _targets_for(plan, unrouted, account_id)
+    routing = _routing_report(batch, plan, targets)
 
     # Refuse the WHOLE batch on a money-carrying unknown ref, and write
     # nothing at all -- a partial commit that silently skipped one account
