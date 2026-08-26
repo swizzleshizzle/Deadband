@@ -542,7 +542,22 @@ export default function Entry() {
                     ) : (
                       <select
                         value={importAccount || accounts[0]?.id || ''} aria-label="Import account"
-                        onChange={(e) => setImportAccount(e.target.value)}
+                        onChange={(e) => {
+                          // Changing the account invalidates the routing the
+                          // last preview computed -- "will import to" was
+                          // built from the OLD account, so leaving it on
+                          // screen next to a changed dropdown would show two
+                          // different destinations for one write. Clearing
+                          // report/commitReport/previewAccountId (same
+                          // pattern as the file and venue handlers above)
+                          // forces a re-preview before commit is possible
+                          // again, so a stale routing table can never sit
+                          // beside a dropdown it no longer describes.
+                          setImportAccount(e.target.value)
+                          setReport(null)
+                          setCommitReport(null)
+                          setPreviewAccountId(undefined)
+                        }}
                       >
                         {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
                       </select>
