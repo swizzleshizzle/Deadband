@@ -268,7 +268,7 @@ All of these are gitignored — this task changes the local deployment kit only 
 
 `docs/ops/deadband.service` gains `Environment=DEADBAND_ENABLE_WRITES=1` and a comment pointing at the identity check as what now guards writes. Its existing comment says the app has no auth code — that is no longer true for writes, so correct it.
 
-The allowlist itself goes in `/home/swizz/deadband/deadband.env` (mode 600, already referenced by `EnvironmentFile=`) as `DEADBAND_TRUSTED_LOGINS=...`. **Do not put real logins in any file under `docs/ops/` that this task writes** — instead, the runbook instructs the operator to add the line themselves. Even gitignored, the kit gets copied around.
+The allowlist itself goes in the deployment's env file (see the gitignored ops kit; mode 600, already referenced by `EnvironmentFile=`) as `DEADBAND_TRUSTED_LOGINS=...`. **Do not put real logins in any file under `docs/ops/` that this task writes** — instead, the runbook instructs the operator to add the line themselves. Even gitignored, the kit gets copied around.
 
 - [ ] **Step 2: Remove the second instance from the deploy script**
 

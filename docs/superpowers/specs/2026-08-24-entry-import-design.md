@@ -185,9 +185,13 @@ the named caller against an allowlist before the handler runs at all. The
 allowlist is read from the environment, lives outside this repository
 entirely, and **fails closed**: unset or empty means every request is
 refused, never that everyone is admitted. A route that omits the dependency
-is treated as a bug, not a style choice — `tests/api/test_write_identity.py`
-walks every registered route and fails the suite if a write method exists
-anywhere in `/api/` without it, over HTTP as well as structurally.
+is treated as a bug, not a style choice — `tests/api/test_write_identity.py`'s
+structural test walks every registered route and fails the suite if a write
+method exists anywhere in `/api/` without the dependency declared. Its
+over-HTTP tests separately drive real requests through a hand-maintained set
+of routes to confirm the dependency actually refuses them; that set is not
+derived from the route walk, so a new write route is not automatically
+covered there (known-gap #70).
 
 **Why moving to this arrangement was safe, not just convenient:** the network
 path a write request travels was never the only thing standing between it and

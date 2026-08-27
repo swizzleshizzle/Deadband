@@ -1,11 +1,19 @@
-"""Spec section 6: the published instance has no write surface at all.
+"""Spec section 6: DEADBAND_ENABLE_WRITES gates whether write routes exist in
+the route table at all.
 
-This is the ONLY control standing between a shared tailnet and unauthenticated
-writes, so it is pinned here rather than left to the deployment. Note what is
-deliberately NOT tested: a source-address check. The deployment proxies every
-path to the local port, so the proxy is the client and request.client.host
-reads 127.0.0.1 for remote callers -- such a check would pass for exactly the
-requests it exists to stop.
+The published instance now serves writes, so this flag is no longer the only
+thing standing between a shared tailnet and unauthenticated writes -- every
+write route also verifies caller identity (api/identity.py), a second,
+independent layer covered by test_write_identity.py. What is pinned here is
+narrower: registration-level gating -- with the flag absent or empty, no
+write route is registered at all; with it set, the write routes appear (and
+an explicit `enable_writes` argument overrides the environment either way).
+
+Note what is deliberately NOT tested, here or anywhere in this codebase: a
+source-address check. The deployment proxies every path to the local port, so
+the proxy is the client and request.client.host reads 127.0.0.1 for remote
+callers -- such a check would pass for exactly the requests it exists to
+stop.
 """
 
 from fastapi.routing import APIRoute, iter_route_contexts
