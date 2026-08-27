@@ -11,6 +11,17 @@ import pytest_asyncio
 
 from api.app import create_app
 
+# Invented login for the test session only -- never a real tailnet identity.
+# This repo is public and a pre-commit hook enforces a deny-list on real
+# logins, so every login anywhere in this suite must use the .invalid TLD.
+# The env var name and header name are spelled out literally (matching
+# tests/api/test_identity.py) rather than imported from api.identity, since
+# those are private module constants there and this fixture only needs the
+# two strings the deployment contract already fixes.
+TEST_TRUSTED_LOGIN = "apitest@example.invalid"
+_TRUSTED_LOGINS_ENV = "DEADBAND_TRUSTED_LOGINS"
+_IDENTITY_HEADER = "Tailscale-User-Login"
+
 
 class _FixturePool:
     """Stands in for the app's asyncpg pool: acquire() hands out the test's
@@ -38,7 +49,12 @@ class _Acquire:
 
 
 @pytest_asyncio.fixture
-async def api_app(conn):
+async def api_app(conn, monkeypatch):
+    # require_trusted_identity reads this from the environment on every call
+    # (see api/identity.py), so setting it here -- rather than patching the
+    # dependency away -- exercises the real allowlist check on every write
+    # request the `client` fixture below makes.
+    monkeypatch.setenv(_TRUSTED_LOGINS_ENV, TEST_TRUSTED_LOGIN)
     app = create_app(enable_writes=True)
     app.state.pool = _FixturePool(conn)
     # Same rollback-per-test connection backs both pools, so a write
@@ -51,7 +67,16 @@ async def api_app(conn):
 @pytest_asyncio.fixture
 async def client(api_app):
     transport = httpx.ASGITransport(app=api_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    # Every request carries a trusted identity by default, matching the
+    # proxy's real behavior of injecting this header on every proxied
+    # request: existing write-route tests exercise fills/imports logic, not
+    # the identity dependency (that's tests/api/test_identity.py and
+    # tests/api/test_write_identity.py), so they should not each need to
+    # pass the header explicitly.
+    headers = {_IDENTITY_HEADER: TEST_TRUSTED_LOGIN}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as c:
         yield c
 
 

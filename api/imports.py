@@ -29,6 +29,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 
 from api.deps import get_conn, get_write_conn
+from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
 from db.import_flow import (
     AccountNotFoundError,
@@ -184,6 +185,7 @@ async def commit_import(
     venue: str = Form(...),
     account_id: UUID | None = Form(default=None),
     conn: asyncpg.Connection = Depends(get_write_conn),
+    _identity: str = Depends(require_trusted_identity),
 ) -> DeadbandJSONResponse:
     """Commit an uploaded broker export through the same db/import_flow the
     CLI's `deadband import --commit` uses.

@@ -151,49 +151,54 @@ rendered inline against the offending field rather than as a banner.
 
 ---
 
-## 6. Exposure — why writes are not registered on the served instance
+## 6. Exposure — identity on every write, defense in depth with the network ACL
 
 The app "binds 127.0.0.1 only and contains no auth code" (D1). That was a sound
-trade for a read-only service. It is not sound for writes, because in practice
-the app is **not** only on localhost.
+trade for a read-only service reached only through a trusted proxy. It is not
+sound for writes on its own, because the proxy terminates the connection and
+this process never sees the original caller directly — it sees the proxy.
 
-The deployment (details in `docs/ops/`, which is gitignored — this repo is
-public and carries no infra topology) publishes it through a Tailscale-proxied
-HTTPS endpoint. Two properties matter here, and both were verified against the
-live deployment on 2026-08-24 rather than assumed:
+**Two things a request carries are never usable as access control, and neither
+is read anywhere in this codebase for that purpose:**
 
-- **The proxy forwards `/`** — every path, with no path-scoped exclusion. Writes
-  would be exposed the moment they exist.
-- **The tailnet is shared with other accounts.** It is not a private LAN, and
-  the repo's operating notes already say to treat it as semi-trusted.
+- `request.client.host` — the proxy is the client as far as this process is
+  concerned, so this reads as the loopback address for *every* remote caller,
+  trusted or not. A check against it would pass for exactly the requests it
+  exists to stop.
+- The forwarded-for header the proxy attaches — this is just a header. Nothing
+  stops a caller from setting it to anything before the proxy ever sees the
+  request, so it carries no more assurance than any other client-supplied
+  string.
 
-**A `request.client.host == "127.0.0.1"` check does not work here, and must not
-be used.** The proxy is the client, so a proxied request already presents as
-`127.0.0.1`. Such a check would pass for exactly the requests it was written to
-stop — a guarantee that is not one.
+**What actually gates a write is caller identity, verified by the app itself.**
+The proxy authenticates every connection and injects a header naming the
+authenticated caller on ingress — a header the calling client cannot set
+directly, because the proxy's own connection is what the app receives. Every
+write route declares a dependency (`api/identity.py:require_trusted_identity`)
+that reads that header and checks the named caller against an allowlist before
+the handler runs at all. The allowlist is read from the environment, lives
+outside this repository entirely, and **fails closed**: unset or empty means
+every request is refused, never that everyone is admitted. A route that omits
+the dependency is treated as a bug, not a style choice —
+`tests/api/test_write_identity.py` walks every registered route and fails the
+suite if a write method exists anywhere in `/api/` without it.
 
-**The enforcement instead:** `create_app()` registers the write routers only
-when `DEADBAND_ENABLE_WRITES` is set. The published unit does not set it, so the
-write endpoints **do not exist** there and return `404`, or `405` when the SPA
-fallback is mounted — that catch-all is registered `GET`-only, so a write verb
-still path-matches it and Starlette answers with the wrong-method status
-instead — to every proxied request, regardless of who asks. Nothing is
-trusted — not a header, not a source address, not a hostname.
+**Why moving to this arrangement was safe, not just convenient:** the network
+path a write request travels was never the only thing standing between it and
+a shared, semi-trusted network. The reverse proxy sits behind a default-deny
+network ACL, scoped per node and per port, so a published port is reachable
+only by an explicitly admitted set of devices by construction — the same
+property the previous design leaned on entirely. That ACL has not gone away
+and is still the first layer; it is simply no longer the *only* layer, because
+the app itself now refuses any request that arrives without a recognized,
+authenticated caller. Losing either layer alone — a misconfigured ACL, or a
+misconfigured allowlist — no longer means an unauthenticated write; both would
+have to fail together.
 
-Writes are served by a second unit on a **different local port that the proxy
-does not publish**, reached over an SSH tunnel. The claim is verifiable in one
-command by anyone at any time: a `POST` to a write path on the published
-endpoint returns `404`, or `405` when `web/dist` is present (SPA fallback
-GET-only, wrong-method match — see above).
-
-**Ops consequence, called out because it is not free:** this adds a second
-systemd unit and a tunnel step to the deployment kit under `docs/ops/`.
-
-**Separately, and not solved by this design:** the runbook requires confirming
-in the Tailscale admin console that the ACL restricts this node's web serve to
-Michael's own devices, and calls that step "not optional". It is manual, its
-state cannot be read from the build host, and it governs the **read** exposure
-that is already live. Worth confirming independently of this milestone.
+One consequence follows directly: a single unit can now serve both reads and
+writes, since exposure is no longer gated by which port a route happens to
+live behind. The second unit and SSH-tunnel arrangement this section used to
+describe is gone along with the assumption that made it necessary.
 
 ---
 
