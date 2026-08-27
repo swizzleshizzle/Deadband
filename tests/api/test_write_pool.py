@@ -17,6 +17,10 @@ _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # docstring), so it declares get_conn on purpose. Keyed on the exact path
 # rather than loosening `writes` for POST generally, so a real write route
 # that forgets get_write_conn is still caught by the assertions below.
+#
+# Shared with tests/api/test_write_identity.py, which imports this same set
+# rather than keeping a second copy -- a route exempted from one guard and
+# not the other would be exactly the drift that makes either guard vacuous.
 _READ_ONLY_POST_PATHS = {"/api/imports/preview"}
 
 

@@ -19,7 +19,7 @@ milestone has to add writes without spending that guarantee.
 | E4 | The wizard supports **both Fidelity dialects, with detection**. | Both already parse, and `content_hash` dedupe makes a repeat import idempotent. The real difference is account routing, which is one branch in the flow, not two designs. Settles gap R5. |
 | E5 | A **manual** fill can be deleted, then the account regroups. Imported fills are immutable. | A hand-typed fill needs an undo or a typo is permanent. Imported fills are reproducible from the export, so deleting them invites divergence from the source of truth. |
 | E6 | **CLI first.** Write logic lives in `db/`; CLI commands wrap it; API endpoints call the same functions. | Every write in this repo is a CLI command and `tests/db/test_cli.py` is where write coverage lives. Keeps one code path and one test surface. |
-| E7 | **Write routes are not registered on the tailnet-served instance.** | See §6. This is the only enforcement that survives `tailscale serve`. |
+| E7 | **Every write route verifies the caller's identity**, on top of the network ACL that already gates the whole app. | See §6. Neither layer is trusted alone: the ACL is default-deny and admin-scoped, and the app refuses any write request that arrives without a recognized, authenticated caller. |
 
 ---
 
@@ -151,49 +151,64 @@ rendered inline against the offending field rather than as a banner.
 
 ---
 
-## 6. Exposure — why writes are not registered on the served instance
+## 6. Exposure — identity on every write, defense in depth with the network ACL
 
 The app "binds 127.0.0.1 only and contains no auth code" (D1). That was a sound
-trade for a read-only service. It is not sound for writes, because in practice
-the app is **not** only on localhost.
+trade for a read-only service reached only through a trusted proxy. It is not
+sound for writes on its own, because the proxy terminates the connection and
+this process never sees the original caller directly — it sees the proxy.
 
-The deployment (details in `docs/ops/`, which is gitignored — this repo is
-public and carries no infra topology) publishes it through a Tailscale-proxied
-HTTPS endpoint. Two properties matter here, and both were verified against the
-live deployment on 2026-08-24 rather than assumed:
+**Two things a request carries are never usable as access control, and neither
+is read anywhere in this codebase for that purpose:**
 
-- **The proxy forwards `/`** — every path, with no path-scoped exclusion. Writes
-  would be exposed the moment they exist.
-- **The tailnet is shared with other accounts.** It is not a private LAN, and
-  the repo's operating notes already say to treat it as semi-trusted.
+- `request.client.host` — the proxy is the client as far as this process is
+  concerned, so this reads as the loopback address for *every* remote caller,
+  trusted or not. A check against it would pass for exactly the requests it
+  exists to stop.
+- The forwarded-for header the proxy attaches — this is just a header. Nothing
+  stops a caller from setting it to anything before the proxy ever sees the
+  request, so it carries no more assurance than any other client-supplied
+  string.
 
-**A `request.client.host == "127.0.0.1"` check does not work here, and must not
-be used.** The proxy is the client, so a proxied request already presents as
-`127.0.0.1`. Such a check would pass for exactly the requests it was written to
-stop — a guarantee that is not one.
+**What actually gates a write is caller identity, verified by the app itself.**
+The proxy authenticates every connection and injects a header naming the
+authenticated caller on ingress. What is verified is that the proxy injects
+this header; whether the proxy *replaces* a client-supplied copy of the same
+header or merely *appends* to one is not pinned down anywhere in this
+repository, so the design does not lean on that assumption either way — if a
+caller could smuggle in their own copy, the app would see two values for the
+header rather than one, and `require_trusted_identity` refuses outright
+whenever the header does not appear exactly once, before ever comparing
+anything to the allowlist. Every write route declares a dependency
+(`api/identity.py:require_trusted_identity`) that reads that header and checks
+the named caller against an allowlist before the handler runs at all. The
+allowlist is read from the environment, lives outside this repository
+entirely, and **fails closed**: unset or empty means every request is
+refused, never that everyone is admitted. A route that omits the dependency
+is treated as a bug, not a style choice — `tests/api/test_write_identity.py`'s
+structural test walks every registered route and fails the suite if a write
+method exists anywhere in `/api/` without the dependency declared. Its
+over-HTTP tests separately drive real requests through a hand-maintained set
+of routes to confirm the dependency actually refuses them; that set is not
+derived from the route walk, so a new write route is not automatically
+covered there (known-gap #70).
 
-**The enforcement instead:** `create_app()` registers the write routers only
-when `DEADBAND_ENABLE_WRITES` is set. The published unit does not set it, so the
-write endpoints **do not exist** there and return `404`, or `405` when the SPA
-fallback is mounted — that catch-all is registered `GET`-only, so a write verb
-still path-matches it and Starlette answers with the wrong-method status
-instead — to every proxied request, regardless of who asks. Nothing is
-trusted — not a header, not a source address, not a hostname.
+**Why moving to this arrangement was safe, not just convenient:** the network
+path a write request travels was never the only thing standing between it and
+a shared, semi-trusted network. The reverse proxy sits behind a default-deny
+network ACL, scoped per node and per port, so a published port is reachable
+only by an explicitly admitted set of devices by construction — the same
+property the previous design leaned on entirely. That ACL has not gone away
+and is still the first layer; it is simply no longer the *only* layer, because
+the app itself now refuses any request that arrives without a recognized,
+authenticated caller. Losing either layer alone — a misconfigured ACL, or a
+misconfigured allowlist — no longer means an unauthenticated write; both would
+have to fail together.
 
-Writes are served by a second unit on a **different local port that the proxy
-does not publish**, reached over an SSH tunnel. The claim is verifiable in one
-command by anyone at any time: a `POST` to a write path on the published
-endpoint returns `404`, or `405` when `web/dist` is present (SPA fallback
-GET-only, wrong-method match — see above).
-
-**Ops consequence, called out because it is not free:** this adds a second
-systemd unit and a tunnel step to the deployment kit under `docs/ops/`.
-
-**Separately, and not solved by this design:** the runbook requires confirming
-in the Tailscale admin console that the ACL restricts this node's web serve to
-Michael's own devices, and calls that step "not optional". It is manual, its
-state cannot be read from the build host, and it governs the **read** exposure
-that is already live. Worth confirming independently of this milestone.
+One consequence follows directly: a single unit can now serve both reads and
+writes, since exposure is no longer gated by which port a route happens to
+live behind. The second unit and SSH-tunnel arrangement this section used to
+describe is gone along with the assumption that made it necessary.
 
 ---
 
@@ -232,5 +247,5 @@ API layer kept thin.
 | Gap | Detail |
 |---|---|
 | Manual fills are not split-adjusted if wholly owned by a manual trade | Pre-existing, inherited from `regroup_account`'s documented behaviour. Manual grouping is out of scope, so nothing here makes it reachable — but adding manual grouping later does. |
-| The write instance has no health check | The deploy script health-checks the published port only. It should learn to check the write port too, or a broken write instance stays invisible until someone tries to type a fill. |
-| `DEADBAND_ENABLE_WRITES` is a footgun if set on the served unit | A single environment variable stands between the tailnet and an unauthenticated write surface. The §7 test pins the default; nothing pins the deployed unit file. Consider asserting it in the deploy script. |
+| ~~The write instance has no health check~~ — RESOLVED (2026-08-27) | There is no longer a separate write instance to miss: the collapse to one service (§6) means the deploy script's existing health check on that single service covers both reads and writes. |
+| `DEADBAND_ENABLE_WRITES` is a silent footgun if misconfigured | The deployed unit now deliberately sets this — there is only one unit, and it serves both reads and writes (§6) — and every write route also verifies caller identity, a second, independent layer, so a stray value here is no longer the only thing standing between the tailnet and an unauthenticated write surface. The residual risk is the variable's own parsing: `bool(os.environ.get(...))` treats any non-empty string as enabled, so `DEADBAND_ENABLE_WRITES=0` or `=false` both leave writes ON (known-gap #61) — an operator trying to disable writes by zeroing it, rather than unsetting it, would not get what they expect. The §7 test pins the *default* (absent means off); nothing pins what value the deployed unit file actually carries. |

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from api.deps import get_write_conn
+from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
 from db.accounts import get_account
 from db.fills import add_manual_fills, delete_manual_fill
@@ -53,7 +54,13 @@ def _decimal(raw: str, field: str) -> Decimal:
 
 @router.post("/api/fills", status_code=201)
 async def create_fills(
-    body: FillsIn, conn: asyncpg.Connection = Depends(get_write_conn)
+    body: FillsIn,
+    # Identity is declared BEFORE get_write_conn: FastAPI resolves dependencies
+    # in declaration order, so an unauthenticated caller is refused before the
+    # write pool is ever touched. The reverse order let a 403-bound request
+    # still check out a write-pool connection on every attempt (review finding).
+    _identity: str = Depends(require_trusted_identity),
+    conn: asyncpg.Connection = Depends(get_write_conn),
 ) -> DeadbandJSONResponse:
     if not body.fills:
         raise HTTPException(422, "fills: at least one leg is required")
@@ -120,7 +127,13 @@ async def create_fills(
 
 
 @router.delete("/api/fills/{fill_id}", status_code=204)
-async def remove_fill(fill_id: UUID, conn: asyncpg.Connection = Depends(get_write_conn)):
+async def remove_fill(
+    fill_id: UUID,
+    # Identity before get_write_conn -- see create_fills above for why the
+    # order matters, not just that both are present.
+    _identity: str = Depends(require_trusted_identity),
+    conn: asyncpg.Connection = Depends(get_write_conn),
+):
     account_id = await conn.fetchval("SELECT account_id FROM fill WHERE id = $1", fill_id)
     if account_id is None:
         raise HTTPException(404, "fill not found")
