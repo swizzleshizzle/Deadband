@@ -244,4 +244,4 @@ API layer kept thin.
 |---|---|
 | Manual fills are not split-adjusted if wholly owned by a manual trade | Pre-existing, inherited from `regroup_account`'s documented behaviour. Manual grouping is out of scope, so nothing here makes it reachable — but adding manual grouping later does. |
 | The write instance has no health check | The deploy script health-checks the published port only. It should learn to check the write port too, or a broken write instance stays invisible until someone tries to type a fill. |
-| `DEADBAND_ENABLE_WRITES` is a footgun if set on the served unit | A single environment variable stands between the tailnet and an unauthenticated write surface. The §7 test pins the default; nothing pins the deployed unit file. Consider asserting it in the deploy script. |
+| `DEADBAND_ENABLE_WRITES` is a footgun if set on the served unit | Enabling it by mistake is no longer the only thing standing between the tailnet and an unauthenticated write surface — every write route also verifies caller identity (§6), a second, independent layer. The §7 test pins the default; nothing pins the deployed unit file. Consider asserting it in the deploy script. |

@@ -781,3 +781,20 @@ previous branch and is not repeated.
 | 68 | **`_amendment_plan`'s calendar guard is one call site, not a policy.** | `importers/fidelity.py:881-883` (commit `4e160e1`) guards `date.fromisoformat` against a regex-matched but calendar-invalid `AS OF` date — `_AS_OF_RE` checks digit shape only, so `AS OF 2026-02-30` used to reach `fromisoformat` unguarded and crash the whole import instead of leaving that one row unnetted. All four date parses in this module are now individually guarded the same way (`fidelity.py:696-698`, `:869-873`, `:881-883`, `:1263-1268`), but nothing enforces that as a rule — a fifth date parse added later has no guard unless whoever writes it happens to remember these four. The failure mode if it's forgotten is a raw crash on a plausible broker file, not a reported bad row through `reject()`. |
 
 ---
+
+## Found while adding tailnet identity to writes (2026-08-27)
+
+`feat/tailnet-identity` moved write authorization off the network topology (a
+second, unpublished unit reachable only through an SSH tunnel) and onto the
+app itself: every write route now depends on `require_trusted_identity`
+(`api/identity.py`), which checks the caller-identity header the reverse
+proxy injects against `DEADBAND_TRUSTED_LOGINS`. That let the deployment
+collapse back to one service. Two gaps below were found while doing the
+collapse and reviewing the identity dependency's placement.
+
+| # | Gap | Why it matters |
+|---|---|---|
+| 69 | **Unauthenticated uploads are spooled before refusal.** | `POST /api/imports/commit` declares `file: UploadFile` as a plain body parameter and `_identity: str = Depends(require_trusted_identity)` after it (`api/imports.py:182-192`) — deliberately, so identity resolves before `get_write_conn` and an unauthenticated caller never checks out a write-pool connection (the same fix `api/fills.py` applies, and the comment at `api/imports.py:187-190` names it explicitly). That fix stops write-pool churn, but not this: FastAPI reads and parses the multipart request body — spooling any uploaded file to memory or disk — before it solves any of a route's `Depends(...)` dependencies, because the body has to exist before dependency callables can run at all. So a flood of large, unauthenticated uploads at this endpoint still buffers every file in full before the identity check ever runs and returns 403; the dependency-ordering fix only moved where the *database* pool gets touched, not where the *bytes* get read. |
+| 70 | **The over-HTTP identity tests enumerate write routes by hand.** | `tests/api/test_write_identity.py:80-99`'s route-walking test is structural and automatically covers a new write route the moment it's registered — but the over-HTTP refusal tests (`test_no_identity_header_refuses_over_http` and its siblings) drive requests built from `_WRITE_REQUESTS` (`test_write_identity.py:73-77`), a hand-maintained list of three request builders. A fourth write route added later gets the structural guarantee that the dependency is *declared*, with no accompanying guarantee that a real ASGI request without an identity header is actually *refused* — exactly the enforced-but-unpinned gap this file's own docstring (`test_write_identity.py:1-12`) says the over-HTTP tests exist to close, and the shape that produced the earlier Critical this branch fixed. Whoever adds a route must remember to add it to `_WRITE_REQUESTS` too; nothing fails loudly if they don't. |
+
+---

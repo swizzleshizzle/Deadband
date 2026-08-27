@@ -2,9 +2,12 @@
 
 This app sits behind a reverse proxy that authenticates every caller and,
 on ingress, injects a `Tailscale-User-Login` header naming the authenticated
-user. Because the proxy sets that header rather than relaying one supplied
-by the client, a caller can neither strip it nor forge it -- it is the one
-signal on the request that is actually trustworthy identity.
+user. What is verified is that the proxy injects this header on every
+proxied request; whether it REPLACES a client-supplied copy of the same
+header or merely APPENDS to one is not pinned down anywhere in this
+repository. This file does not lean on either assumption -- the
+duplicate-header guard described below is what makes the design safe
+regardless of which the proxy actually does.
 
 `X-Forwarded-For` and `request.client.host` are NOT identity, even though
 both are present on every request. The proxy is the client as far as this
@@ -20,14 +23,12 @@ never "permit everyone". This is deliberately the opposite of
 .get(...))` treats `=0` as enabled (known-gap #61) -- that shape must not be
 repeated here.
 
-This file does not simply trust that the proxy behaves as observed. Whether
-the proxy REPLACES a client-sent identity header or APPENDS to one is not
-pinned by anything in this repository, so if a caller could sneak in their
-own copy and have the proxy's copy sort second, `Headers.get` would silently
-return the attacker's value. Rather than depend on an assumption about
-upstream behavior, this dependency reads ALL values for the header and
-refuses outright if there is more than one -- a legitimate proxied request
-only ever carries exactly one.
+Concretely: if a caller could sneak in their own copy of the header and have
+the proxy's copy sort second, `Headers.get` would silently return the
+attacker's value instead. Rather than depend on an assumption about upstream
+behavior, this dependency reads ALL values for the header and refuses
+outright if there is more than one -- a legitimate proxied request only ever
+carries exactly one.
 
 The returned login is normalized (stripped, lower-cased) rather than the raw
 header value, because it becomes an actor string recorded on ledger writes.
