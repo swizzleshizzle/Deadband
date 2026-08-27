@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.27",
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.52.4",
+    "python-multipart>=0.0.32",
 ]
 
 [project.optional-dependencies]

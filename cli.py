@@ -21,7 +21,18 @@ from db.corporate import (
     remove_action,
 )
 from db.fills import add_manual_fills, delete_manual_fill
-from db.importing import commit_batch, probe_duplicates, route_batch
+from db.import_flow import (
+    AccountNotFoundError,
+    AccountVenueMismatchError,
+    BlockingRowsError,
+    DuplicateProbeSkipped,
+    MixedDedupePathsError,
+    RoutingReport,
+    TransferRefused,
+    UnknownRefsError,
+    commit,
+    preview,
+)
 from db.instruments import upsert_instrument
 from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
@@ -742,43 +753,42 @@ async def cmd_import(args) -> int:
 
 
 async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: str) -> int:
-    """The three-phase body every entry point (`import`, `sync`) shares.
+    """Render the import decisions db/import_flow.py makes, and map them to an
+    exit code. The three-phase body every entry point (`import`, `sync`)
+    shares.
 
-    `source` is the provenance recorded on every fill this call writes
-    (`fill.source`): "csv" from `cmd_import`, "api" from `cmd_sync`. It is
-    keyword-only and has NO default on purpose. commit_batch's own
-    `source: str = "csv"` default is what made every API-synced fill claim it
-    came from a CSV (I2) -- silently, since nothing downstream reads the
-    column yet. `fill.source` is the only column that can answer "which of my
-    Coinbase fills came from the retired CSV path?", which is exactly the
-    question the mixed-provenance refusal below and any future reconciliation
-    have to ask. A default here would let the next entry point reintroduce the
-    same lie by omission; requiring the argument makes the caller state it.
+    Every DECISION this function used to make inline -- routing, each refusal,
+    what a commit wrote -- now lives in db.import_flow.preview/commit. What is
+    left here is printing and `return 2`, which is precisely the part no other
+    caller can reuse: the HTTP import wizard consumes the same two functions
+    and renders them its own way, rather than restating routing and refusal
+    rules that would then be free to drift out of agreement with these. A
+    second statement of a rule is a second place for it to be wrong.
 
-    `venue` is always an importer's `.account_venue` (see the Importer
-    Protocol in importers/base.py), never its `.venue` identity -- those
-    two differ for `coinbase-api`, whose own identity is a TRANSPORT
-    ("coinbase-api" vs. the CSV importer) rather than the venue accounts are
-    registered under (every real account is "coinbase"). This function only
-    ever needs "which registered account venue does this batch route/match
-    against", so taking `account_venue` directly (rather than `venue` plus a
-    caller-side literal) makes it structurally impossible for a caller to
-    pass the wrong one -- which is exactly the shape of the bug that
-    motivated adding `account_venue` at all: `cmd_sync` used to pass the
-    literal "coinbase" here itself, alongside `get_importer("coinbase-api")`
-    a few lines away, with nothing forcing the two to agree as venues were
-    added. Keeping this one function (rather than a second copy of the
-    preview/commit body for `sync`) is what the plan's "no second, parallel
-    write path" constraint requires.
+    `venue` (always an importer's `.account_venue`, never its `.venue`
+    identity) and `source` (the provenance stamped on every fill written here;
+    keyword-only, no default) are passed straight through -- see
+    db.import_flow.commit's docstring for why each is shaped that way, and
+    what went wrong before it was. Keeping this one function (rather than a
+    second copy of the preview/commit body for `sync`) is what the plan's "no
+    second, parallel write path" constraint requires.
     """
+    # main() has already rejected a malformed --account with a clean message,
+    # so this parse cannot be the thing that raises here.
+    account_id = UUID(args.account) if getattr(args, "account", None) else None
+
+    # conn=None: the connection-free report. This is the ONLY thing a default
+    # `deadband import` run ever asks for, and db.import_flow.preview cannot
+    # open a connection of its own (it never imports create_pool).
+    report = await preview(batch, venue=venue, conn=None, account_id=account_id)
     print(
-        f"parsed {len(batch.fills)} fills, {len(batch.cash)} cash movements, "
-        f"{len(batch.transfers)} transfers"
+        f"parsed {report.fill_count} fills, {report.cash_count} cash movements, "
+        f"{report.transfer_count} transfers"
     )
-    for w in batch.warnings:
+    for w in report.warnings:
         print(f"  warning: {w}", file=sys.stderr)
-    if batch.unmapped_rows:
-        print(f"  {len(batch.unmapped_rows)} row(s) not mapped", file=sys.stderr)
+    if report.unmapped_row_count:
+        print(f"  {report.unmapped_row_count} row(s) not mapped", file=sys.stderr)
 
     if not args.commit:
         # Corporate-action proposals print here, before any other preview
@@ -799,22 +809,15 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
         # this preview-only warning is the pure, DB-free heads-up for the same
         # situation, since preview deliberately never opens a connection.
         #
-        # Derived from batch.refs_seen -- every account ref seen in the RAW
-        # rows -- rather than from batch.fills/batch.cash. An account whose
-        # rows are ENTIRELY unmapped (every action is one the classifier
-        # doesn't know) contributes nothing to fills or cash, so a report
-        # built from those would never name it -- exactly the account most in
-        # need of being flagged. Printing its row count (0, in that case) is
-        # itself the signal that something is wrong with that account.
-        if len(batch.refs_seen) > 1:
-            for ref in batch.refs_seen:
-                n = sum(1 for f in batch.fills if f.external_ref == ref) + sum(
-                    1 for c in batch.cash if c.external_ref == ref
-                )
+        # Derived from refs_seen -- every account ref seen in the RAW rows --
+        # rather than from fills/cash; see PreviewReport.rows_per_ref for why
+        # a count of 0 here is the signal, not an omission.
+        if len(report.refs_seen) > 1:
+            for ref, n in report.rows_per_ref:
                 print(f"    {ref}: {n} row(s)", file=sys.stderr)
             print(
                 "  warning: this file mixes multiple account refs "
-                f"({', '.join(batch.refs_seen)}); --commit routes each row to "
+                f"({', '.join(report.refs_seen)}); --commit routes each row to "
                 "its own account automatically",
                 file=sys.stderr,
             )
@@ -830,16 +833,19 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
         # cannot answer that without an explicit ask.
         if getattr(args, "check_duplicates", False):
             # C: rows with no external_ref (e.g. Coinbase) need --account to
-            # be probed at all -- identical to --commit's own `unrouted`
+            # be probed at all -- identical to --commit's own `needs_account`
             # check below. Checked here, before any connection is opened,
             # for the same reason --commit's version runs before its pool:
             # whether it's a problem depends only on the parsed file, not on
             # the database. Before this check existed, such rows were simply
-            # dropped from `targets` below and the probe printed a count
-            # that silently omitted them -- indistinguishable from "this
-            # file has no duplicates" even though it was never checked.
-            unrouted = batch.unrouted()
-            if unrouted.has_rows() and not args.account:
+            # dropped from the probe and it printed a count that silently
+            # omitted them -- indistinguishable from "this file has no
+            # duplicates" even though it was never checked.
+            #
+            # The connection-free report already knows this, and says so as a
+            # named reason rather than as a condition this function would
+            # otherwise have to re-derive -- see DuplicateProbeSkipped.
+            if report.duplicates_skipped_reason is DuplicateProbeSkipped.NEEDS_ACCOUNT:
                 print(
                     "error: cannot check duplicates -- this file has row(s) "
                     "with no account ref to route by; pass --account to say "
@@ -851,52 +857,48 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             pool = await create_pool()
             try:
                 async with pool.acquire() as conn:
-                    # Read-only routing (route_batch issues only SELECTs) to
-                    # find which account(s) each row belongs to -- same
-                    # mechanism --commit uses, reused rather than reinvented so
-                    # the probe never disagrees with --commit about where a row
-                    # lands.
-                    plan = await route_batch(conn, venue, batch)
-                    targets: dict[UUID, ImportBatch] = dict(plan.by_account)
+                    # Passing a connection is what turns the probe on. It
+                    # routes read-only (route_batch and probe_duplicates issue
+                    # only SELECTs) using the SAME mechanism --commit uses,
+                    # reused rather than reinvented so the probe can never
+                    # disagree with --commit about where a row lands.
+                    probed = await preview(
+                        batch, venue=venue, conn=conn, account_id=account_id
+                    )
 
-                    if unrouted.has_rows() and args.account:
-                        account_id = UUID(args.account)
-                        existing = targets.get(account_id, ImportBatch())
-                        targets[account_id] = existing.merge_rows(unrouted)
-
-                    # C: mirror --commit's own refusal exactly (see the
-                    # identical check further below) -- a row that routes to
-                    # an unknown account ref is never probed (it never lands
-                    # in `targets`), so printing a count without checking
-                    # this first would silently omit it while looking
-                    # complete. plan.unknown_refs is money-scoped (see
-                    # db.importing.RoutingPlan's docstring); a non-money
-                    # unknown ref does not stand behind --commit's refusal
-                    # either, so it must not stand behind this one.
-                    if plan.unknown_refs:
+                    # C: mirror --commit's own refusal exactly -- a row that
+                    # routes to an unknown account ref is never probed, so
+                    # printing a count without checking this first would
+                    # silently omit it while looking complete. That decision
+                    # is preview's, not this function's; all that is rendered
+                    # here is the reason it gave. unknown_money_refs is the
+                    # money-scoped set (see db.importing.RoutingPlan); a
+                    # non-money unknown ref does not stand behind --commit's
+                    # refusal either, so it does not stand behind this one.
+                    if probed.duplicates_skipped_reason is DuplicateProbeSkipped.UNKNOWN_REFS:
                         print(
                             "error: cannot check duplicates -- unknown "
-                            f"account ref(s): {', '.join(plan.unknown_refs)}",
+                            f"account ref(s): {', '.join(probed.unknown_money_refs)}",
                             file=sys.stderr,
                         )
                         return 2
 
-                    fill_dupes = cash_dupes = transfer_dupes = 0
-                    for account_id, sub_batch in targets.items():
-                        report = await probe_duplicates(conn, account_id, sub_batch)
-                        fill_dupes += report.fill_dupes
-                        cash_dupes += report.cash_dupes
-                        transfer_dupes += report.transfer_dupes
+                    # Not None: preview withholds the count only when it
+                    # could not have been complete, and every reason it can
+                    # give for that (DuplicateProbeSkipped) has either been
+                    # refused above or cannot arise on a call that passed a
+                    # connection.
+                    dupes = probed.duplicates
                     print(
-                        f"  duplicate check: {fill_dupes} fill(s), "
-                        f"{cash_dupes} cash movement(s), "
-                        f"{transfer_dupes} transfer(s) already present"
+                        f"  duplicate check: {dupes.fill_dupes} fill(s), "
+                        f"{dupes.cash_dupes} cash movement(s), "
+                        f"{dupes.transfer_dupes} transfer(s) already present"
                     )
             finally:
-                # See cmd_import's identical comment further below: pool.close()
-                # must run after the `async with pool.acquire()` block has
-                # exited, never from inside it, or close() deadlocks waiting for
-                # a release that will never come.
+                # See the identical comment on the commit path below:
+                # pool.close() must run after the `async with pool.acquire()`
+                # block has exited, never from inside it, or close() deadlocks
+                # waiting for a release that will never come.
                 await pool.close()
 
         print("\npreview only — rerun with --commit to write")
@@ -906,9 +908,10 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
     # identifier, e.g. Coinbase) are never routed by route_batch -- they need
     # an explicit destination. Whether that's a problem depends only on the
     # parsed file, not on the database, so this check runs before the pool is
-    # ever opened.
-    unrouted = batch.unrouted()
-    if unrouted.has_rows() and not args.account:
+    # ever opened. db.import_flow.commit raises UnroutableRowsError on the
+    # same condition for callers that skip this pre-check; the point of doing
+    # it here is to not pay for a connection to learn it.
+    if report.needs_account:
         print(
             "error: this file has row(s) with no account ref to route by "
             "(e.g. this venue's export carries no per-row account number); "
@@ -924,7 +927,7 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # import's own fills to have been committed (their ratio is
             # either already on the proposal from importers/, or -- merger
             # -- structurally absent regardless of ledger state), so they
-            # are printed here, before route_batch and every refusal below
+            # are printed here, before routing and every refusal below
             # can return 2. A refused commit writes nothing, but these three
             # kinds' proposals do not depend on anything having been
             # written, so there is no reason to withhold them from a user
@@ -935,155 +938,71 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
             # looks one up here.
             _print_corporate_action_section(batch, {}, kinds=_NON_LEDGER_KINDS)
 
-            plan = await route_batch(conn, venue, batch)
-
-            # Same "refuse the whole batch, write nothing" shape as the
-            # unknown-ref refusal below. See ImportBatch.blocking's
-            # docstring for why this is neither "block on every unmapped
-            # row" nor "block on none": an unmapped row that also carries
-            # money (a non-zero quantity or amount) is exactly the shape of
-            # the defect that motivated this whole task -- committing
-            # everything else and silently dropping that row's money would
-            # look like a successful import.
-            #
-            # C1: this check must run AFTER route_batch, not before, and
-            # must drop any reason whose row belongs to an account
-            # registered ignore_on_import (plan.ignored_refs) -- otherwise a
-            # money-carrying unmapped row on an account the user has
-            # explicitly said to skip (e.g. a retirement plan with no
-            # instrument identity) refuses the ENTIRE import, permanently,
-            # with no escape. route_batch issues only SELECTs, so this still
-            # returns before `async with conn.transaction():` below --
-            # "refuses and writes nothing" is preserved.
-            effective_blocking = [
-                (ref, msg) for ref, msg in batch.blocking if ref not in plan.ignored_refs
-            ]
-            if effective_blocking:
+            try:
+                # regroup=regroup_account looks redundant -- it is
+                # db.import_flow.commit's own default -- but passing THIS
+                # module's binding is what keeps the insert-and-regroup
+                # transaction provable from the outside:
+                # tests/db/test_cli.py::test_a_crash_during_regroup_leaves_no_
+                # fills_through_the_real_cli patches cli.regroup_account to
+                # raise, and a proof that points at a function the code no
+                # longer calls proves nothing.
+                result = await commit(
+                    conn,
+                    venue=venue,
+                    batch=batch,
+                    account_id=account_id,
+                    source=source,
+                    regroup=regroup_account,
+                )
+            except BlockingRowsError as exc:
+                # Refuse the whole batch and write nothing -- see
+                # ImportBatch.blocking for why this is neither "block on every
+                # unmapped row" nor "block on none".
                 print(
                     "error: refusing to commit -- row(s) below block the commit "
                     "(see each reason):",
                     file=sys.stderr,
                 )
-                for _ref, msg in effective_blocking:
+                for _ref, msg in exc.reasons:
                     print(f"  {msg}", file=sys.stderr)
                 return 2
-
-            targets: dict[UUID, ImportBatch] = dict(plan.by_account)
-
-            if unrouted.has_rows():
-                account_id = UUID(args.account)
-                account = await get_account(conn, account_id)
-                if account is None:
-                    print(f"error: no account with id {account_id}", file=sys.stderr)
-                    return 2
-                # A file parsed by one venue's importer must never be committed to an
-                # account belonging to a different venue — that would permanently
-                # attribute (e.g.) Coinbase fills to a Fidelity account, with no CLI
-                # path to undo it.
-                if account["venue"] != venue:
-                    print(
-                        f"error: account {account_id} is a {account['venue']!r} account; "
-                        f"refusing to commit a {venue!r} import to it",
-                        file=sys.stderr,
-                    )
-                    return 2
-                existing = targets.get(account_id, ImportBatch())
-                targets[account_id] = existing.merge_rows(unrouted)
-
-            for account_id, sub_batch in targets.items():
-                n = len(sub_batch.fills) + len(sub_batch.cash)
-                print(f"  {account_id}: mapped, {n} row(s)")
-            for ref in plan.ignored_refs:
-                print(f"  {ref}: ignored (ignore_on_import), skipped")
-            # F: plan.reported_unknown_refs is a superset of plan.unknown_refs
-            # -- it also includes a ref that appears ONLY in batch.refs_seen
-            # (an account whose rows are ALL unmapped and non-financial),
-            # which route_batch used to be unable to see at all since it only
-            # looked at fills/cash/blocking. Reporting the fuller set here
-            # does not change what refuses the commit -- that stays keyed on
-            # plan.unknown_refs alone, checked below, unaffected by this.
-            for ref in plan.reported_unknown_refs:
-                print(f"  {ref}: no matching account", file=sys.stderr)
-
-            # route_batch only ever sees refs that appear on a fill, cash
-            # movement, or blocking reason -- a REGISTERED account whose rows
-            # all warned but produced none of those (an edge route_batch's
-            # own classification doesn't reach) can still fall out here.
-            # batch.refs_seen (every ref seen in the raw rows) is the only
-            # place such an account is visible; report it explicitly rather
-            # than let a real account silently vanish from the report while
-            # the commit still reports success. Refs already reported above
-            # (ignored, or unknown -- F) are excluded so each ref is reported
-            # exactly once.
-            covered_refs = (
-                {f.external_ref for f in batch.fills if f.external_ref}
-                | {c.external_ref for c in batch.cash if c.external_ref}
-            )
-            already_reported = set(plan.ignored_refs) | set(plan.reported_unknown_refs)
-            for ref in sorted(set(batch.refs_seen) - covered_refs - already_reported):
+            except AccountNotFoundError as exc:
+                print(f"error: no account with id {exc.account_id}", file=sys.stderr)
+                return 2
+            except AccountVenueMismatchError as exc:
+                # A file parsed by one venue's importer must never be committed
+                # to an account belonging to a different venue — that would
+                # permanently attribute (e.g.) Coinbase fills to a Fidelity
+                # account, with no CLI path to undo it.
                 print(
-                    f"  {ref}: 0 row(s) mapped -- every row for this account "
-                    "failed to classify; see warnings above",
-                    file=sys.stderr,
-                )
-
-            # Partial commits are not acceptable -- a silently-skipped account
-            # looks like a successful import. Refuse the WHOLE batch, and write
-            # nothing at all, if any row routes to an account that doesn't exist.
-            if plan.unknown_refs:
-                print(
-                    "error: refusing to commit -- unknown account ref(s): "
-                    f"{', '.join(plan.unknown_refs)}",
+                    f"error: account {exc.account_id} is a {exc.account_venue!r} "
+                    f"account; refusing to commit a {exc.batch_venue!r} import to it",
                     file=sys.stderr,
                 )
                 return 2
-
-            # I3: refuse a batch that would make an account's fills reachable
-            # by two mutually-blind dedupe paths.
-            #
-            # The two partial unique indexes are disjoint BY CONSTRUCTION:
-            # fill_venue_id_uniq is WHERE venue_fill_id IS NOT NULL,
-            # fill_content_hash_uniq is WHERE content_hash IS NOT NULL, and
-            # db/importing.py gives a fill exactly one of the two keys, never
-            # both. A pre-cut-over CSV Coinbase fill therefore has
-            # (venue_fill_id NULL, content_hash SET); the SAME trade arriving
-            # via `sync` has (venue_fill_id SET, content_hash NULL). Neither
-            # index can see the other. Both rows land, both feed
-            # regroup_account, and the account's position and realized P&L
-            # silently DOUBLE. Nothing else in the system would notice.
-            #
-            # Deliberately generic, not Coinbase-specific: any venue that ever
-            # cuts a CSV path over to an API one has this exact hazard, and
-            # the check costs one SELECT count(*) per target account, on the
-            # commit path only. It runs here -- after route_batch, before
-            # `async with conn.transaction():` -- so it refuses and writes
-            # nothing, and it is unreachable from preview, which opens no
-            # connection at all (a tested invariant).
-            mixed = []
-            for account_id, sub_batch in targets.items():
-                if not any(f.venue_fill_id for f in sub_batch.fills):
-                    continue
-                legacy = await conn.fetchval(
-                    """
-                    SELECT count(*) FROM fill
-                     WHERE account_id = $1
-                       AND content_hash IS NOT NULL
-                       AND venue_fill_id IS NULL
-                    """,
-                    account_id,
+            except UnknownRefsError as exc:
+                # The state report comes first even on this refusal: the user
+                # has to fix the unknown ref and re-run, and knowing where
+                # everything else would have gone is what makes that possible.
+                _print_routing_report(exc.routing)
+                print(
+                    "error: refusing to commit -- unknown account ref(s): "
+                    f"{', '.join(exc.refs)}",
+                    file=sys.stderr,
                 )
-                if legacy:
-                    mixed.append((account_id, legacy))
-            if mixed:
+                return 2
+            except MixedDedupePathsError as exc:
+                _print_routing_report(exc.routing)
                 print(
                     "error: refusing to commit -- this batch's fills carry a venue "
                     "fill id, but the target account already holds fill(s) that "
                     "dedupe on content_hash instead:",
                     file=sys.stderr,
                 )
-                for account_id, legacy in mixed:
+                for mixed_account_id, legacy in exc.accounts:
                     print(
-                        f"  {account_id}: {legacy} existing fill(s) with "
+                        f"  {mixed_account_id}: {legacy} existing fill(s) with "
                         "content_hash set and venue_fill_id null",
                         file=sys.stderr,
                     )
@@ -1097,80 +1016,75 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
                     file=sys.stderr,
                 )
                 return 2
-
-            fills_inserted = fills_skipped = cash_inserted = trades_regrouped = 0
-            transfers_inserted = 0
-            try:
-                async with conn.transaction():
-                    for account_id, sub_batch in targets.items():
-                        result = await commit_batch(conn, account_id, sub_batch, source=source)
-                        fills_inserted += result.fills_inserted
-                        fills_skipped += result.fills_skipped
-                        cash_inserted += result.cash_inserted
-                        transfers_inserted += result.transfers_inserted
-                        trades_regrouped += await regroup_account(conn, account_id)
-
-                    # LATE: spinoff and split, printed here inside the same
-                    # transaction as the commit above and after it -- the one
-                    # point in this function where either's ratio can be
-                    # completed against BOTH pre-existing fills and this
-                    # import's own. A real multi-year History export commonly
-                    # carries the original purchase and a later corporate action
-                    # in the SAME file (see
-                    # tests/fixtures/fidelity/real_shape_history.csv); reading
-                    # the ledger before commit_batch runs would miss that
-                    # purchase entirely and report "no holding" for a ratio
-                    # that is, in fact, determinable. Postgres sees a
-                    # transaction's own uncommitted writes from within that same
-                    # transaction (read-your-own-writes), so this placement --
-                    # after the INSERTs, still inside `async with
-                    # conn.transaction():` -- picks them up without waiting for
-                    # the transaction to actually commit.
-                    #
-                    # A refused commit (any of the early `return 2`s above, all
-                    # of which run before this transaction even opens) never
-                    # reaches this section -- nothing has been written in that
-                    # case, so a ledger read would be no more complete here than
-                    # it was at the EARLY point above. reverse_split,
-                    # name_change and merger do not have this problem (see the
-                    # EARLY call above, before route_batch) -- only spinoff's and
-                    # split's correctness trades away reporting on a refusal,
-                    # and on refusal the user sees the refusal's own error and
-                    # re-runs; the proposal reaches them on that next,
-                    # successful attempt.
-                    #
-                    # History-dialect rows (the only dialect with corporate
-                    # actions) carry no per-row account ref, so the ENTIRE file
-                    # routes to one account: args.account, the same one the
-                    # unrouted-rows check above already required whenever this
-                    # batch has any unrouted fill or cash movement. getattr, not
-                    # args.account: several existing tests build a bare
-                    # Namespace without this attribute, same reasoning as
-                    # cmd_accounts_add's ignore_on_import getattr.
-                    account_id_for_corporate = (
-                        UUID(args.account) if getattr(args, "account", None) else None
-                    )
-                    ledger_notes = await _ledger_completed_notes_for(
-                        conn, account_id_for_corporate, batch
-                    )
-                    _print_corporate_action_section(
-                        batch,
-                        ledger_notes,
-                        kinds=frozenset({"spinoff", "split"}),
-                        include_cash_in_lieu=False,
-                        header=(
-                            "\n=== Spinoff/split ratio(s) completed against the "
-                            "committed ledger ==="
-                        ),
-                    )
-            except TransferError as exc:
+            except TransferRefused as exc:
+                _print_routing_report(exc.routing)
                 print(
-                    f"refusing import: {exc} -- an outbound transfer that the "
-                    "account's ledger cannot honour (importing years out of "
+                    f"refusing import: {exc.cause} -- an outbound transfer that "
+                    "the account's ledger cannot honour (importing years out of "
                     "order?); nothing was committed",
                     file=sys.stderr,
                 )
                 return 2
+
+            _print_routing_report(result.routing)
+
+            # LATE: spinoff and split, printed here after the commit above --
+            # the one point in this function where either's ratio can be
+            # completed against BOTH pre-existing fills and this import's own.
+            # A real multi-year History export commonly carries the original
+            # purchase and a later corporate action in the SAME file (see
+            # tests/fixtures/fidelity/real_shape_history.csv); reading the
+            # ledger before the batch was written would miss that purchase
+            # entirely and report "no holding" for a ratio that is, in fact,
+            # determinable. The read runs on the same connection the commit's
+            # transaction has just been released on, so it sees those writes.
+            #
+            # A refused commit (every `return 2` above, all of which happen
+            # before or inside a transaction that rolled back) never reaches
+            # this section -- nothing has been written in that case, so a
+            # ledger read would be no more complete here than it was at the
+            # EARLY point above. reverse_split, name_change and merger do not
+            # have this problem (see the EARLY call above) -- only spinoff's
+            # and split's correctness trades away reporting on a refusal, and
+            # on refusal the user sees the refusal's own error and re-runs; the
+            # proposal reaches them on that next, successful attempt.
+            #
+            # History-dialect rows (the only dialect with corporate actions)
+            # carry no per-row account ref, so the ENTIRE file routes to one
+            # account: --account, the same one the unrouted-rows check above
+            # already required whenever this batch has any unrouted fill or
+            # cash movement.
+            try:
+                ledger_notes = await _ledger_completed_notes_for(
+                    conn, account_id, batch
+                )
+            except Exception:
+                # The import is already durable by this point (commit has
+                # returned) -- a DB or connection fault in this read-only
+                # follow-up read must not make a successful import look like
+                # a failure. Print the success summary now, before the
+                # traceback propagates and skips the print below entirely,
+                # so the user sees both: their data landed, AND something
+                # went wrong producing the spinoff/split note. A re-run is a
+                # safe no-op here thanks to content_hash dedupe.
+                print(
+                    f"inserted {result.fills_inserted} fills "
+                    f"({result.fills_skipped} already present), "
+                    f"{result.cash_inserted} cash movements, "
+                    f"{result.transfers_inserted} transfers, "
+                    f"{result.trades_regrouped} trades regrouped"
+                )
+                raise
+            _print_corporate_action_section(
+                batch,
+                ledger_notes,
+                kinds=frozenset({"spinoff", "split"}),
+                include_cash_in_lieu=False,
+                header=(
+                    "\n=== Spinoff/split ratio(s) completed against the "
+                    "committed ledger ==="
+                ),
+            )
     finally:
         # pool.close() waits for every checked-out connection to be released.
         # It must run after the `async with pool.acquire()` block has exited
@@ -1181,11 +1095,48 @@ async def _preview_or_commit(venue: str, batch: ImportBatch, args, *, source: st
         await pool.close()
 
     print(
-        f"inserted {fills_inserted} fills ({fills_skipped} already present), "
-        f"{cash_inserted} cash movements, {transfers_inserted} transfers, "
-        f"{trades_regrouped} trades regrouped"
+        f"inserted {result.fills_inserted} fills ({result.fills_skipped} already "
+        f"present), {result.cash_inserted} cash movements, "
+        f"{result.transfers_inserted} transfers, "
+        f"{result.trades_regrouped} trades regrouped"
     )
     return 0
+
+
+def _print_routing_report(routing: RoutingReport) -> None:
+    """The commit path's state report: one line per account this batch reached,
+    however it reached it. Printed on success AND on the refusals that happen
+    after routing, since a user who has to fix a refusal and re-run needs to
+    know where everything else would have gone.
+
+    Every ref appears exactly once across the four groups -- an account that
+    silently vanished from this report while the commit still reported success
+    is the defect the last three groups exist to prevent.
+    """
+    for account_id, n in routing.mapped:
+        print(f"  {account_id}: mapped, {n} row(s)")
+    # These routed SUCCESSFULLY: their rows are dropped on purpose (the user
+    # registered the account ignore_on_import), and this is not a failure path.
+    for ref in routing.ignored_refs:
+        print(f"  {ref}: ignored (ignore_on_import), skipped")
+    # F: routing.unknown_refs is a superset of the money-scoped set that
+    # refuses the commit -- it also includes a ref that appears ONLY in
+    # refs_seen (an account whose rows are ALL unmapped and non-financial),
+    # which routing used to be unable to see at all since it only looked at
+    # fills/cash/blocking. Reporting the fuller set here does not change what
+    # refuses the commit; that stays keyed on the money-scoped set alone.
+    for ref in routing.unknown_refs:
+        print(f"  {ref}: no matching account", file=sys.stderr)
+    # A REGISTERED account whose rows all warned but produced no fill, cash
+    # movement or blocking reason (an edge route_batch's own classification
+    # doesn't reach). Named explicitly rather than let a real account silently
+    # vanish from the report while the commit still reports success.
+    for ref in routing.unclassified_refs:
+        print(
+            f"  {ref}: 0 row(s) mapped -- every row for this account "
+            "failed to classify; see warnings above",
+            file=sys.stderr,
+        )
 
 
 def _parse_sync_bound(raw: str | None) -> datetime | None:

@@ -858,3 +858,57 @@ def test_a_correction_with_no_cancel_blocks_instead_of_duplicating():
         "the surviving buy is the ORIGINAL, at its own fee -- not the "
         "correction masquerading as one"
     )
+
+
+# --- Fix round 2 (Finding 3): an AS OF date that isn't a real calendar date -
+#
+# _AS_OF_RE (importers/fidelity.py) validates the SHAPE of the as-of token --
+# four digits, two digits, two digits -- but not the calendar: "AS OF
+# 2026-02-30" matches it. date.fromisoformat() used to run on that match
+# unguarded, raising ValueError out of parse() itself -- a crash, where D4's
+# posture is "degrade to blocking, never to guessing" for every other
+# malformed value this module encounters. A corrupted or hand-edited export
+# date is exactly the malformed-but-plausible shape this whole task exists to
+# survive.
+
+
+def test_an_as_of_date_that_fails_the_calendar_does_not_crash_the_parser():
+    """The fix treats this exactly like the sibling `except ValueError:
+    continue` a few lines above it (a candidate original's unparsable Run
+    Date): the row is simply not nettable, and falls through to the ordinary
+    row loop. CANCELLED TRADE matches no rule in RULES, so an un-netted one
+    already takes the "unhandled action" path there -- reject() -- which
+    names the row's own action text (so the bad date is visible to a human)
+    and blocks it, since it carries a real (nonzero) quantity.
+    """
+    header, correction, cancel, sell, original = _cluster_rows()
+    bad_cancel = cancel.replace("as of 2026-01-02", "as of 2026-02-30")
+    assert bad_cancel != cancel, "the date edit must have applied"
+    text = "\n".join([header, correction, bad_cancel, sell, original]) + "\n"
+
+    batch = FidelityImporter().parse(text)  # must not raise
+
+    assert not [w for w in batch.warnings if w.startswith("netted an amendment cluster")], (
+        "an unparseable as-of date must not net -- there is no valid date to "
+        "key the match on"
+    )
+    assert any("2026-02-30" in message for _, message in batch.blocking), (
+        "the malformed row must be named, not merely dropped"
+    )
+
+
+def test_a_valid_as_of_date_still_nets_after_the_calendar_guard():
+    """Regression guard for the fix above: catching an invalid calendar date
+    must not quietly disable amendment handling for every OTHER, valid one.
+    Same fixture and same assertions as test_an_amendment_cluster_nets_to_one_fill,
+    kept as a second, independent check tied specifically to this fix."""
+    header, correction, cancel, sell, original = _cluster_rows()
+    text = "\n".join([header, correction, cancel, sell, original]) + "\n"
+
+    batch = FidelityImporter().parse(text)
+
+    buys = [f for f in batch.fills if f.side is Side.BUY]
+    assert len(buys) == 1, "the cancelled original and its cancel both vanish"
+    assert buys[0].executed_at.date() == date(2026, 1, 2), "dated to the as-of, not the run date"
+    assert any("netted" in w.lower() for w in batch.warnings)
+    assert not batch.blocking

@@ -15,10 +15,10 @@ import pathlib
 from fastapi import FastAPI
 
 from api.accounts import router as accounts_router
-from api.health import router as health_router
 from api.dashboard import router as dashboard_router
-from api.trades import router as trades_router
+from api.health import router as health_router
 from api.serialization import DeadbandJSONResponse
+from api.trades import router as trades_router
 
 _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
 
@@ -50,8 +50,15 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     # (spec section 6). Registered before the SPA catch-all.
     if enable_writes:
         from api.fills import router as fills_router
+        from api.imports import router as imports_router
 
         app.include_router(fills_router)
+        # POST /api/imports/preview writes nothing (db/import_flow.py's
+        # `preview` never opens a transaction), but it belongs to the same
+        # import feature as the write routes above and is gated with them
+        # rather than being reachable on the published read-only instance --
+        # the published unit has no legitimate use for an import wizard at all.
+        app.include_router(imports_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse

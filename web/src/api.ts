@@ -240,3 +240,91 @@ async function send<T>(path: string, method: string, body?: unknown): Promise<T>
 export const createFills = (body: { account_id: string; fills: FillLegIn[] }) =>
   send<CreatedFills>('/api/fills', 'POST', body)
 export const deleteFill = (id: string) => send<void>(`/api/fills/${id}`, 'DELETE')
+
+// The CSV import wizard (api/imports.py). Mirrors db/import_flow.py's
+// dataclasses field-for-field -- see that module's docstrings for what each
+// field means and why it exists; restating the reasoning here would be a
+// second place for it to drift out of agreement.
+
+// Every ref in a batch lands in exactly one of these four (RoutingReport).
+export interface RoutingReport {
+  mapped: [string, number][]
+  ignored_refs: string[]
+  unknown_refs: string[]
+  unclassified_refs: string[]
+}
+
+export interface DuplicateReport {
+  fill_dupes: number
+  cash_dupes: number
+  transfer_dupes: number
+}
+
+// Why `duplicates` is null instead of a zero count -- see PreviewReport.
+export type DuplicateProbeSkippedReason = 'no_connection' | 'needs_account' | 'unknown_refs'
+
+export interface PreviewReport {
+  fill_count: number
+  cash_count: number
+  transfer_count: number
+  warnings: string[]
+  unmapped_row_count: number
+  refs_seen: string[]
+  rows_per_ref: [string, number][]
+  // REPORT ONLY -- the strict superset. Never use this to decide what blocks.
+  unknown_refs: string[]
+  // The money-scoped subset -- the only one of the two that can refuse a commit.
+  unknown_money_refs: string[]
+  ignored_refs: string[]
+  // (account_ref | null, message) pairs -- group by ref before rendering, so
+  // one account's rows can be shown blocking while another's are clean.
+  blocking: [string | null, string][]
+  corporate_proposals: string[]
+  routing: RoutingReport | null
+  duplicates: DuplicateReport | null
+  duplicates_skipped_reason: DuplicateProbeSkippedReason | null
+  needs_account: boolean
+}
+
+export interface ImportCommitReport {
+  fills_inserted: number
+  fills_skipped: number
+  cash_inserted: number
+  transfers_inserted: number
+  transfers_skipped: number
+  trades_regrouped: number
+  warnings: string[]
+  ignored_refs: string[]
+  routing: RoutingReport
+}
+
+// FormData, not JSON -- and deliberately NOT routed through send(), which
+// always sets `content-type: application/json`. A hand-set content-type on a
+// multipart body omits the boundary the server needs to split fields from
+// the file, so the browser must be left to set it. errorMessage() is reused
+// so a bad venue or an unparseable file still surfaces the same readable
+// `detail` text as every other write path.
+//
+// Shared with commitImport (task 5), which posts the same three fields to
+// /api/imports/commit -- kept as one function rather than two copies of this
+// FormData/boundary reasoning.
+async function sendForm<T>(path: string, file: File, venue: string, accountId?: string): Promise<T> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('venue', venue)
+  if (accountId) form.append('account_id', accountId)
+  const r = await fetch(path, { method: 'POST', body: form })
+  // Unlike get()/send()'s bare NotFound(), this 404 carries a message worth
+  // keeping: api/imports.py returns it for AccountNotFoundError with the
+  // missing account id in `detail`, and without this the wizard shows the
+  // generic "not found" instead of which account was missing.
+  if (r.status === 404) throw new NotFound(await errorMessage(r, path))
+  if (!r.ok) throw new Error(await errorMessage(r, path))
+  return (await r.json()) as T
+}
+
+export const previewImport = (file: File, venue: string, accountId?: string) =>
+  sendForm<PreviewReport>('/api/imports/preview', file, venue, accountId)
+
+export const commitImport = (file: File, venue: string, accountId?: string) =>
+  sendForm<ImportCommitReport>('/api/imports/commit', file, venue, accountId)

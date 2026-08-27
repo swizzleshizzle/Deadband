@@ -11,6 +11,14 @@ pytestmark = requires_db
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# POST /api/imports/preview is a narrow, explicit exception to "POST implies
+# get_write_conn": it takes an upload (so it must be POST -- GET cannot carry
+# a multipart body) but db/import_flow.py's `preview` never writes (see its
+# docstring), so it declares get_conn on purpose. Keyed on the exact path
+# rather than loosening `writes` for POST generally, so a real write route
+# that forgets get_write_conn is still caught by the assertions below.
+_READ_ONLY_POST_PATHS = {"/api/imports/preview"}
+
 
 def _dependency_names(dependant) -> set[str]:
     return {d.call.__name__ for d in dependant.dependencies if d.call is not None}
@@ -48,7 +56,10 @@ def test_every_route_uses_the_pool_its_method_implies():
         deps = _dependency_names(route_context.dependant)
         if not deps & {get_conn.__name__, get_write_conn.__name__}:
             continue
-        writes = bool(route_context.methods & _WRITE_METHODS)
+        writes = (
+            bool(route_context.methods & _WRITE_METHODS)
+            and route_context.path not in _READ_ONLY_POST_PATHS
+        )
         expected = get_write_conn.__name__ if writes else get_conn.__name__
         forbidden = get_conn.__name__ if writes else get_write_conn.__name__
         path = route_context.path
