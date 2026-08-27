@@ -77,9 +77,24 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         # rather than 404. Registered last -- every /api route wins first.
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str) -> FileResponse:
-            candidate = _WEB_DIST / path
-            if path and ".." not in path and candidate.is_file():
-                return FileResponse(candidate)
+            # Containment is structural, not a substring check. pathlib's `/`
+            # operator DISCARDS the left side when the right is absolute, so
+            # a request for `//etc/hostname` used to make `path` the string
+            # "/etc/hostname" and `_WEB_DIST / path` silently become
+            # `/etc/hostname` -- the `".." not in path` guard never saw a
+            # `..` and .is_file() was true, so the file was served over the
+            # network (any file readable by the service account, including
+            # the deployment's env file). Rejecting a leading "/" up front
+            # closes that specific hole; the real defence is .resolve() +
+            # is_relative_to() below, which also collapses symlinks -- a
+            # symlink placed inside dist that points outside it is caught
+            # the same way an absolute path is, because both produce a
+            # resolved path outside `root`.
+            if path and not path.startswith("/"):
+                candidate = (_WEB_DIST / path).resolve()
+                root = _WEB_DIST.resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    return FileResponse(candidate)
             return FileResponse(_WEB_DIST / "index.html")
 
     return app
