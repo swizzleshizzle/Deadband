@@ -80,6 +80,25 @@ async def client(api_app):
         yield c
 
 
+@pytest_asyncio.fixture
+async def anonymous_client(api_app):
+    """Like `client`, but carries NO identity header -- the shape of a request
+    that reached this process without going through the authenticating proxy
+    at all.
+
+    A dedicated fixture rather than a one-off `httpx.AsyncClient` inside a
+    single test: `client`'s default header made every existing write test
+    identity-blind (a swallowed exception or a duplicate route registration
+    would have passed just as well as real enforcement), and the fix is an
+    opt-out fixture, not a one-off workaround -- its absence is exactly what
+    left that gap open. Shares `api_app`, so it sees the same
+    DEADBAND_TRUSTED_LOGINS value and the same rollback-per-test connection
+    as `client`."""
+    transport = httpx.ASGITransport(app=api_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
 def assert_no_json_floats(payload, path="$"):
     """Spec D4 structurally: NUMERIC never becomes a JSON float. Counts are
     ints and money is strings; a float anywhere is a serialization bug."""

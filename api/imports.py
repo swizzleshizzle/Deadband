@@ -184,8 +184,12 @@ async def commit_import(
     file: UploadFile,
     venue: str = Form(...),
     account_id: UUID | None = Form(default=None),
-    conn: asyncpg.Connection = Depends(get_write_conn),
+    # Identity before get_write_conn: FastAPI resolves dependencies in
+    # declaration order, so this ordering refuses an unauthenticated caller
+    # before the write pool is ever touched (see api/fills.py for the same
+    # fix and why the reverse order leaked pool checkouts to every 403).
     _identity: str = Depends(require_trusted_identity),
+    conn: asyncpg.Connection = Depends(get_write_conn),
 ) -> DeadbandJSONResponse:
     """Commit an uploaded broker export through the same db/import_flow the
     CLI's `deadband import --commit` uses.

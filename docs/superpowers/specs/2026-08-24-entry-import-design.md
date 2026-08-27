@@ -19,7 +19,7 @@ milestone has to add writes without spending that guarantee.
 | E4 | The wizard supports **both Fidelity dialects, with detection**. | Both already parse, and `content_hash` dedupe makes a repeat import idempotent. The real difference is account routing, which is one branch in the flow, not two designs. Settles gap R5. |
 | E5 | A **manual** fill can be deleted, then the account regroups. Imported fills are immutable. | A hand-typed fill needs an undo or a typo is permanent. Imported fills are reproducible from the export, so deleting them invites divergence from the source of truth. |
 | E6 | **CLI first.** Write logic lives in `db/`; CLI commands wrap it; API endpoints call the same functions. | Every write in this repo is a CLI command and `tests/db/test_cli.py` is where write coverage lives. Keeps one code path and one test surface. |
-| E7 | **Write routes are not registered on the tailnet-served instance.** | See §6. This is the only enforcement that survives `tailscale serve`. |
+| E7 | **Every write route verifies the caller's identity**, on top of the network ACL that already gates the whole app. | See §6. Neither layer is trusted alone: the ACL is default-deny and admin-scoped, and the app refuses any write request that arrives without a recognized, authenticated caller. |
 
 ---
 
@@ -172,16 +172,22 @@ is read anywhere in this codebase for that purpose:**
 
 **What actually gates a write is caller identity, verified by the app itself.**
 The proxy authenticates every connection and injects a header naming the
-authenticated caller on ingress — a header the calling client cannot set
-directly, because the proxy's own connection is what the app receives. Every
-write route declares a dependency (`api/identity.py:require_trusted_identity`)
-that reads that header and checks the named caller against an allowlist before
-the handler runs at all. The allowlist is read from the environment, lives
-outside this repository entirely, and **fails closed**: unset or empty means
-every request is refused, never that everyone is admitted. A route that omits
-the dependency is treated as a bug, not a style choice —
-`tests/api/test_write_identity.py` walks every registered route and fails the
-suite if a write method exists anywhere in `/api/` without it.
+authenticated caller on ingress. What is verified is that the proxy injects
+this header; whether the proxy *replaces* a client-supplied copy of the same
+header or merely *appends* to one is not pinned down anywhere in this
+repository, so the design does not lean on that assumption either way — if a
+caller could smuggle in their own copy, the app would see two values for the
+header rather than one, and `require_trusted_identity` refuses outright
+whenever the header does not appear exactly once, before ever comparing
+anything to the allowlist. Every write route declares a dependency
+(`api/identity.py:require_trusted_identity`) that reads that header and checks
+the named caller against an allowlist before the handler runs at all. The
+allowlist is read from the environment, lives outside this repository
+entirely, and **fails closed**: unset or empty means every request is
+refused, never that everyone is admitted. A route that omits the dependency
+is treated as a bug, not a style choice — `tests/api/test_write_identity.py`
+walks every registered route and fails the suite if a write method exists
+anywhere in `/api/` without it, over HTTP as well as structurally.
 
 **Why moving to this arrangement was safe, not just convenient:** the network
 path a write request travels was never the only thing standing between it and

@@ -1,6 +1,10 @@
 """The Deadband read-only API (spec 2026-08-19-read-only-api-design).
 
-Binds 127.0.0.1 only and contains no auth code (spec D1) -- run it with:
+Binds 127.0.0.1 only, and the READ routes carry no auth code of their own
+(spec D1) -- the network path in front of them is what gates them, same as
+always. That is no longer true of the app as a whole: when write routes are
+enabled (below), every one of them requires a verified caller identity (spec
+2026-08-24-entry-import-design.md §6, api/identity.py). Run it with:
 
     uv run uvicorn api.app:app --host 127.0.0.1 --port 8000
 
@@ -42,12 +46,14 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     app.include_router(trades_router)
     app.include_router(dashboard_router)
     app.include_router(accounts_router)
-    # Write routes exist ONLY when explicitly enabled. The published unit does
-    # not set the flag, so these endpoints are absent there and return 404 to
-    # every proxied request -- or 405 when web/dist is mounted below, because
-    # the SPA catch-all is GET-only and still path-matches a write verb.
-    # Either way nothing is trusted, not a header and not a source address
-    # (spec section 6). Registered before the SPA catch-all.
+    # Write routes exist ONLY when explicitly enabled. When the flag is unset
+    # these endpoints are absent and return 404 to every request -- or 405
+    # when web/dist is mounted below, because the SPA catch-all is GET-only
+    # and still path-matches a write verb. When the flag IS set, every write
+    # route additionally requires a verified caller identity (api/identity.py,
+    # spec 2026-08-24-entry-import-design.md §6) -- the flag alone is no
+    # longer the only thing standing between this app and an unauthenticated
+    # write. Registered before the SPA catch-all.
     if enable_writes:
         from api.fills import router as fills_router
         from api.imports import router as imports_router
