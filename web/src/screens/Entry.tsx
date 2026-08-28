@@ -5,6 +5,7 @@ import {
 } from '../api'
 import { toInstant } from '../datetime'
 import Marks from './Marks'
+import Snapshot from './Snapshot'
 
 // The importer registry (importers/registry.py) also lists "coinbase-api",
 // but that importer takes a JSON fills export from the Advanced Trade API,
@@ -264,7 +265,7 @@ export default function Entry() {
       <p className="eyebrow">by hand</p>
       <h1>Entry</h1>
 
-      {/* Fixed three-way switch -- D11: no rearrangeable or configurable
+      {/* Fixed five-way switch -- D11: no rearrangeable or configurable
           panes. This is the only way to change modes; the layout of any
           mode itself is likewise fixed. */}
       <div className="segmented" role="tablist" aria-label="Entry mode">
@@ -294,7 +295,14 @@ export default function Entry() {
           className={mode === 'marks' ? 'active' : undefined}
           onClick={() => switchMode('marks')}
         >
-          Marks
+          marks
+        </button>
+        <button
+          type="button" role="tab" aria-selected={mode === 'snapshot'}
+          className={mode === 'snapshot' ? 'active' : undefined}
+          onClick={() => switchMode('snapshot')}
+        >
+          snapshot
         </button>
       </div>
 
@@ -779,8 +787,10 @@ export default function Entry() {
             </>
           )}
         </>
-      ) : (
+      ) : mode === 'marks' ? (
         <Marks />
+      ) : (
+        <Snapshot />
       )}
 
       {added.length > 0 && (

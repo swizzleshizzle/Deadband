@@ -365,3 +365,9 @@ tbody tr.rowlink:hover td { background: var(--surface); }
    than a second copy -- see the selectors just above this block. */
 .marks .asof { display: block; margin-bottom: 1rem; }
 .marks .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
+
+/* Snapshot screen: statement entry with a ledger comparison. */
+.snapshot label { display: block; margin-bottom: 0.75rem; }
+.compare { width: 100%; margin: 1rem 0; }
+.compare th[scope='row'] { text-align: left; font-weight: normal; }
+.warn { border-left: 3px solid var(--warn, #b8860b); padding-left: 0.75rem; margin: 0.75rem 0; }
