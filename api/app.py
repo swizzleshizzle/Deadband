@@ -58,6 +58,7 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         from api.fills import router as fills_router
         from api.imports import router as imports_router
         from api.marks import router as marks_router
+        from api.snapshots import router as snapshots_router
 
         app.include_router(fills_router)
         # POST /api/imports/preview writes nothing (db/import_flow.py's
@@ -71,6 +72,7 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         # reasoning applied to POST /api/imports/preview above. It declares
         # get_conn, so the read-pool guarantee is unaffected.
         app.include_router(marks_router)
+        app.include_router(snapshots_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse
