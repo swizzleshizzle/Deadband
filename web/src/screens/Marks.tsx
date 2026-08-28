@@ -141,7 +141,7 @@ export default function Marks() {
                   onChange={(e) =>
                     setPrices((p) => ({ ...p, [row.instrument_id]: e.target.value }))
                   }
-                  aria-label={`price for ${row.symbol}`}
+                  aria-label={`price for ${row.symbol} (${row.natural_key})`}
                 />
               </td>
             </tr>

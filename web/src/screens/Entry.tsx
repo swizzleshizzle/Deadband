@@ -109,7 +109,7 @@ export default function Entry() {
       .catch(() => setAccounts([]))
   }, [])
 
-  function switchMode(m: 'fill' | 'multileg' | 'import') {
+  function switchMode(m: 'fill' | 'multileg' | 'import' | 'marks' | 'snapshot') {
     // Switching mid-typing shouldn't leave a stale error from the other
     // form's last attempt pointing at a row that no longer applies.
     setMode(m)
@@ -292,7 +292,7 @@ export default function Entry() {
         <button
           type="button" role="tab" aria-selected={mode === 'marks'}
           className={mode === 'marks' ? 'active' : undefined}
-          onClick={() => setMode('marks')}
+          onClick={() => switchMode('marks')}
         >
           Marks
         </button>
