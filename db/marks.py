@@ -9,9 +9,19 @@ from uuid import UUID
 
 import asyncpg
 
-# How far ahead of "now" a mark's as_of may sit before it is refused. Lives
-# here rather than in cli.py because api/marks.py needs the same value and two
-# copies of a policy constant drifting apart is precisely the failure
+# How far ahead of "now" a mark's as_of may sit before it is refused.
+#
+# latest_marks (below) treats the newest as_of as "the current price", with
+# nothing else checking plausibility -- a fat-fingered year or a bad backfill
+# would otherwise silently become today's price and produce a wrong
+# unrealized figure with no signal at all. The tolerance absorbs clock skew
+# between this box and the database, and the fact that "now" isn't identically
+# defined on two machines, without opening the door to a meaningfully wrong
+# future date. Two minutes comfortably covers ordinary clock drift for a
+# command that is typed by hand, not fired in a tight loop.
+#
+# Lives here rather than in cli.py because api/marks.py needs the same value
+# and two copies of a policy constant drifting apart is precisely the failure
 # cli.py's _parse_as_of docstring records for its own duplicated parser.
 # A timedelta is a duration, not a clock -- this file stays clock-free.
 MARK_FUTURE_TOLERANCE = timedelta(minutes=2)

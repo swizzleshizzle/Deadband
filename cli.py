@@ -1767,12 +1767,12 @@ async def cmd_snapshot_add(args) -> int:
     if as_of is None:
         return 2
 
-    # Same reasoning as cmd_marks_set's identical guard: latest_snapshot
-    # treats the newest as_of as current, so a fat-fingered year would
-    # silently become the figure every reconciliation compares against.
-    # Reuses cmd_marks_set's tolerance constant rather than defining a
-    # second one -- both commands are typed by hand, not fired in a loop,
-    # and absorb the same clock skew for the same reason.
+    # Same reasoning as MARK_FUTURE_TOLERANCE's docstring in db/marks.py:
+    # latest_snapshot treats the newest as_of as current, so a fat-fingered
+    # year would silently become the figure every reconciliation compares
+    # against. Uses db/marks.py's MARK_FUTURE_TOLERANCE rather than defining
+    # a second constant -- both commands are typed by hand, not fired in a
+    # loop, and absorb the same clock skew for the same reason.
     if as_of > now + MARK_FUTURE_TOLERANCE:
         print(
             f"error: --as-of {as_of.isoformat()} is in the future "
