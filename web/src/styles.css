@@ -351,11 +351,17 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 .entry-multileg .entry-header {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px;
 }
-.entry-multileg .legs-table { margin-bottom: 10px; }
-.entry-multileg .legs-table td { padding: 4px 6px; }
+.entry-multileg .legs-table, .marks .marks-table { margin-bottom: 10px; }
+.entry-multileg .legs-table td, .marks .marks-table td { padding: 4px 6px; }
 .entry-multileg .entry-actions { display: flex; gap: 8px; align-items: center; }
 
 /* a leg named in a 422 (e.g. "fills[2].symbol: ...") -- highlighting the
    row is enough to point at it without parsing which field. */
-.legs-table tr.leg-error td { background: color-mix(in srgb, var(--loss) 14%, transparent); }
-.legs-table tr.leg-error input, .legs-table tr.leg-error select { border-color: var(--loss); }
+.legs-table tr.leg-error td, .marks-table tr.leg-error td { background: color-mix(in srgb, var(--loss) 14%, transparent); }
+.legs-table tr.leg-error input, .legs-table tr.leg-error select,
+.marks-table tr.leg-error input, .marks-table tr.leg-error select { border-color: var(--loss); }
+
+/* Marks screen: bulk price entry. Shares .legs-table's rules above rather
+   than a second copy -- see the selectors just above this block. */
+.marks .asof { display: block; margin-bottom: 1rem; }
+.marks .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }

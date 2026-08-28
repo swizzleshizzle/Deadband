@@ -4,6 +4,7 @@ import {
   type AccountSummary, type FillLegIn, type ImportCommitReport, type PreviewReport,
 } from '../api'
 import { toInstant } from '../datetime'
+import Marks from './Marks'
 
 // The importer registry (importers/registry.py) also lists "coinbase-api",
 // but that importer takes a JSON fills export from the Advanced Trade API,
@@ -56,7 +57,7 @@ function legIndexFromError(msg: string): number | null {
 }
 
 export default function Entry() {
-  const [mode, setMode] = useState<'fill' | 'multileg' | 'import'>('fill')
+  const [mode, setMode] = useState<'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'>('fill')
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [account, setAccount] = useState('')
   const [executedAt, setExecutedAt] = useState('')
@@ -288,6 +289,13 @@ export default function Entry() {
         >
           import
         </button>
+        <button
+          type="button" role="tab" aria-selected={mode === 'marks'}
+          className={mode === 'marks' ? 'active' : undefined}
+          onClick={() => setMode('marks')}
+        >
+          Marks
+        </button>
       </div>
 
       {error && <div className="error">{error}</div>}
@@ -425,7 +433,7 @@ export default function Entry() {
             </button>
           </div>
         </form>
-      ) : (
+      ) : mode === 'import' ? (
         <>
           {/* Step 1: pick. No form/onSubmit -- "preview" is a read GET-like
               action, not a write, so there is nothing here for Enter to
@@ -771,6 +779,8 @@ export default function Entry() {
             </>
           )}
         </>
+      ) : (
+        <Marks />
       )}
 
       {added.length > 0 && (
