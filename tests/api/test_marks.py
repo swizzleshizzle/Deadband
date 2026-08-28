@@ -1,4 +1,4 @@
-"""GET /api/marks (spec section 4). All symbols and values invented."""
+"""GET /api/marks and POST /api/marks (spec section 4). All symbols and values invented."""
 
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -214,7 +214,14 @@ async def test_post_marks_refuses_a_negative_price(client, conn):
     ) == 0
 
 
-async def test_post_marks_rolls_back_every_row_when_one_is_invalid(client, conn):
+async def test_post_marks_writes_nothing_when_one_row_is_invalid(client, conn):
+    """Not a rollback test: every reachable failure here (a malformed price)
+    completes validation before `async with conn.transaction()` ever opens,
+    so only `set_mark` for the good row would run inside it, and nothing
+    forces that path to fail. This proves the narrower, real guarantee --
+    validation runs for every row before any row is written -- so a future
+    reader doesn't cite it as evidence of true rollback under a DB-layer
+    failure, which nothing here exercises."""
     acc = await create_account(conn, name="MarksAtomic", venue="manual", account_type="cash")
     good = await _held(conn, acc, "ZZM8")
     bad = await _held(conn, acc, "ZZM9")

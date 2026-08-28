@@ -72,6 +72,10 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         # reasoning applied to POST /api/imports/preview above. It declares
         # get_conn, so the read-pool guarantee is unaffected.
         app.include_router(marks_router)
+        # GET /api/accounts/{account_id}/snapshot is the identical case: a
+        # read, but one that exists only to serve the Snapshot entry screen's
+        # "already exists for this date" warning, so it is gated with the
+        # write it feeds rather than published on the read-only instance.
         app.include_router(snapshots_router)
 
     if _WEB_DIST.exists():
