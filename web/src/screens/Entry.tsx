@@ -3,6 +3,7 @@ import {
   commitImport, createFills, deleteFill, fetchAccounts, previewImport,
   type AccountSummary, type FillLegIn, type ImportCommitReport, type PreviewReport,
 } from '../api'
+import { toInstant } from '../datetime'
 
 // The importer registry (importers/registry.py) also lists "coinbase-api",
 // but that importer takes a JSON fills export from the Advanced Trade API,
@@ -45,24 +46,6 @@ interface LegState {
 }
 
 const EMPTY: LegState = { symbol: '', side: 'buy', quantity: '', price: '', fee: '0' }
-
-// datetime-local yields the browser's LOCAL wall-clock time with no offset,
-// e.g. "2026-06-01T15:30" for 3:30pm in whatever zone the user is sitting
-// in. The column is TIMESTAMPTZ. The trap: stamping a bare "Z" onto that
-// string is unambiguous but WRONG -- it reinterprets "15:30 local" as
-// "15:30 UTC", silently shifting every hand-entered fill by the browser's
-// UTC offset (4-5 hours for US Eastern), which can reorder which fill opens
-// a position once trades are grouped by executed_at. `new Date(local)`
-// parses an offset-less string as LOCAL time (this also handles the
-// with-seconds form), so `.toISOString()` yields the true UTC instant.
-// An empty or unparseable value must throw HERE rather than produce
-// `Invalid Date` silently -- the caller relies on this landing in its own
-// try/catch so a bad date can never wedge the busy flag.
-function toInstant(local: string): string {
-  const d = new Date(local)
-  if (Number.isNaN(d.getTime())) throw new Error('executed at: enter a date and time')
-  return d.toISOString()
-}
 
 // The 422 for a bad leg names it positionally, e.g. "fills[2].symbol: must
 // not be blank" (api/fills.py). Pulling the index back out is enough to
