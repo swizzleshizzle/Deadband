@@ -65,6 +65,14 @@ async def _post_marks(client):
     )
 
 
+async def _post_snapshot(client):
+    return await client.post(
+        "/api/snapshots",
+        json={"account_id": str(uuid4()), "as_of": "2026-06-01",
+              "cash_balance": "1", "total_equity": "2"},
+    )
+
+
 async def _commit_import(client):
     return await client.post(
         "/api/imports/commit",
@@ -86,6 +94,7 @@ _WRITE_REQUESTS = [
     pytest.param(_delete_fill, id="delete-fill"),
     pytest.param(_commit_import, id="commit-import"),
     pytest.param(_post_marks, id="post-marks"),
+    pytest.param(_post_snapshot, id="post-snapshot"),
 ]
 
 
