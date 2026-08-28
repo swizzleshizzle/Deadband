@@ -17,12 +17,23 @@ function ageDays(asOf: string): number {
   return Math.floor((Date.now() - new Date(asOf).getTime()) / 86_400_000)
 }
 
+// Maps a 422's `marks[i].price` back to an instrument. `i` indexes the
+// SUBMITTED array -- built from `filled` below, the sparse subset of rows
+// the user actually typed a price into -- not the full holdings table, so on
+// a 39-row table with 3 filled, "marks[2]" names nothing the user can see
+// without this. Same shape as Entry.tsx's `legIndexFromError`.
+function markIndexFromError(msg: string): number | null {
+  const m = msg.match(/marks\[(\d+)\]/)
+  return m ? Number(m[1]) : null
+}
+
 export default function Marks() {
   const [rows, setRows] = useState<MarkRow[] | null>(null)
   const [prices, setPrices] = useState<Record<string, string>>({})
   const [asOf, setAsOf] = useState(localNow)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [errorRow, setErrorRow] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
 
   // Not `async`/`await`: oxlint's react(set-state-in-effect) rule traces into
@@ -53,6 +64,7 @@ export default function Marks() {
     if (busy || filled.length === 0) return
     setBusy(true)
     setError(null)
+    setErrorRow(null)
     setSaved(null)
     try {
       // Inside the try: toInstant throws on an unparseable value, and it must
@@ -71,7 +83,10 @@ export default function Marks() {
       // (latest_marks orders by as_of, not by insertion).
       await load()
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err))
+      const msg = String(err instanceof Error ? err.message : err)
+      setError(msg)
+      const i = markIndexFromError(msg)
+      setErrorRow(i !== null ? (filled[i]?.[0] ?? null) : null)
     } finally {
       setBusy(false)
     }
@@ -112,7 +127,10 @@ export default function Marks() {
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.instrument_id}>
+            <tr
+              key={row.instrument_id}
+              className={errorRow === row.instrument_id ? 'leg-error' : undefined}
+            >
               <td>
                 {row.symbol}
                 {/* instrument.symbol is NOT unique -- two instruments can

@@ -17,11 +17,16 @@ function todayLocal(): string {
 }
 
 // The difference the panel reports, or null when either side is unavailable.
+// Returns the RAW difference, not a pre-rounded one: money() (format.ts)
+// already applies this codebase's sub-cent display policy -- rounding here
+// first (`.toFixed(2)`) would flatten a genuine sub-cent difference to
+// "0.00" before money() ever sees it, reporting agreement on the one input
+// where the two sides actually disagree.
 function diff(typed: string, ledger: string | null): string | null {
   if (ledger == null || typed.trim() === '') return null
   const d = Number(ledger) - Number(typed)
   if (!Number.isFinite(d)) return null
-  return d.toFixed(2)
+  return String(d)
 }
 
 export default function Snapshot() {
@@ -74,11 +79,12 @@ export default function Snapshot() {
 
   const tile = tiles.find((t) => t.id === account) ?? null
   // The ledger side is computed as of NOW -- account_cash and open_positions
-  // take no as_of. A tick against a past statement date would assert an
-  // agreement nobody checked, so the verdict is shown only when the statement
-  // date IS today. The raw difference is always shown: a transposed
-  // cash/equity pair appears as two large offsetting differences either way,
-  // which is what this panel is for.
+  // take no as_of. The raw difference is ALWAYS shown, for both dates: a
+  // transposed cash/equity pair appears as two large offsetting differences
+  // either way, which is what this panel is for. No verdict or tick is ever
+  // rendered -- this flag only gates the caveat below, which explains that a
+  // difference against a past statement date is not a reconciliation, since
+  // the ledger column would be today's position, not the statement's.
   const comparable = asOf === todayLocal()
 
   async function submit(e: React.FormEvent) {

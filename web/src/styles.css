@@ -313,6 +313,7 @@ tbody tr.rowlink:hover td { background: var(--surface); }
   font-family: var(--mono); color: var(--muted); padding: 40px 0; text-align: center;
 }
 .error { color: var(--loss); }
+.ok { color: var(--gain); }
 
 @media (max-width: 760px) {
   .frame { flex-direction: column; }
@@ -359,7 +360,7 @@ tbody tr.rowlink:hover td { background: var(--surface); }
    row is enough to point at it without parsing which field. */
 .legs-table tr.leg-error td, .marks-table tr.leg-error td { background: color-mix(in srgb, var(--loss) 14%, transparent); }
 .legs-table tr.leg-error input, .legs-table tr.leg-error select,
-.marks-table tr.leg-error input, .marks-table tr.leg-error select { border-color: var(--loss); }
+.marks-table tr.leg-error input { border-color: var(--loss); }
 
 /* Marks screen: bulk price entry. Shares .legs-table's rules above rather
    than a second copy -- see the selectors just above this block. */
