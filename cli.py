@@ -34,7 +34,7 @@ from db.import_flow import (
     preview,
 )
 from db.instruments import upsert_instrument
-from db.marks import latest_marks, resolve_instrument_by_symbol, set_mark
+from db.marks import MARK_FUTURE_TOLERANCE, latest_marks, resolve_instrument_by_symbol, set_mark
 from db.migrate import apply as apply_migrations
 from db.pool import create_pool
 from db.positions import open_positions
@@ -1429,17 +1429,6 @@ async def cmd_positions(args) -> int:
     return 0
 
 
-# latest_marks (db/marks.py) treats the newest as_of as "the current price"
-# with nothing else checking plausibility -- a fat-fingered year or a bad
-# backfill would otherwise silently become today's price and produce a wrong
-# unrealized figure with no signal at all. The tolerance absorbs clock skew
-# between this box and the database, and the fact that "now" isn't identically
-# defined on two machines, without opening the door to a meaningfully wrong
-# future date. Two minutes comfortably covers ordinary clock drift for a
-# command that is typed by hand, not fired in a tight loop.
-_MARK_FUTURE_TOLERANCE = timedelta(minutes=2)
-
-
 async def cmd_marks_set(args) -> int:
     # The clock lives here, in the I/O layer -- db/marks.py and everything
     # under ledger/ are clock-free by design. This single `now` anchors both
@@ -1514,10 +1503,10 @@ async def cmd_marks_set(args) -> int:
             # (above), or a future-dated as_of (below) must never half-apply.
             # All of resolution and validation happens before set_mark is
             # ever called.
-            if as_of > now + _MARK_FUTURE_TOLERANCE:
+            if as_of > now + MARK_FUTURE_TOLERANCE:
                 print(
                     f"error: --as-of {as_of.isoformat()} is in the future "
-                    f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+                    f"(tolerance: {MARK_FUTURE_TOLERANCE})",
                     file=sys.stderr,
                 )
                 return 2
@@ -1784,10 +1773,10 @@ async def cmd_snapshot_add(args) -> int:
     # Reuses cmd_marks_set's tolerance constant rather than defining a
     # second one -- both commands are typed by hand, not fired in a loop,
     # and absorb the same clock skew for the same reason.
-    if as_of > now + _MARK_FUTURE_TOLERANCE:
+    if as_of > now + MARK_FUTURE_TOLERANCE:
         print(
             f"error: --as-of {as_of.isoformat()} is in the future "
-            f"(tolerance: {_MARK_FUTURE_TOLERANCE})",
+            f"(tolerance: {MARK_FUTURE_TOLERANCE})",
             file=sys.stderr,
         )
         return 2

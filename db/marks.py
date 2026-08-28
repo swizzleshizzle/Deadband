@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
 import asyncpg
+
+# How far ahead of "now" a mark's as_of may sit before it is refused. Lives
+# here rather than in cli.py because api/marks.py needs the same value and two
+# copies of a policy constant drifting apart is precisely the failure
+# cli.py's _parse_as_of docstring records for its own duplicated parser.
+# A timedelta is a duration, not a clock -- this file stays clock-free.
+MARK_FUTURE_TOLERANCE = timedelta(minutes=2)
 
 
 async def set_mark(
