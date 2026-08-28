@@ -57,6 +57,7 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     if enable_writes:
         from api.fills import router as fills_router
         from api.imports import router as imports_router
+        from api.marks import router as marks_router
 
         app.include_router(fills_router)
         # POST /api/imports/preview writes nothing (db/import_flow.py's
@@ -65,6 +66,11 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         # rather than being reachable on the published read-only instance --
         # the published unit has no legitimate use for an import wizard at all.
         app.include_router(imports_router)
+        # GET /api/marks is a read, but it exists to serve the entry screen's
+        # marks table and is gated with the writes it feeds -- the same
+        # reasoning applied to POST /api/imports/preview above. It declares
+        # get_conn, so the read-pool guarantee is unaffected.
+        app.include_router(marks_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse
