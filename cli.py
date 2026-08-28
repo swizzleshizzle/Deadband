@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import pathlib
 import sys
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
 
