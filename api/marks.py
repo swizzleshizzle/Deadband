@@ -15,17 +15,15 @@ from decimal import Decimal
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
-from api.deps import get_conn
+from api.deps import get_conn, get_write_conn
+from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
-from db.marks import latest_marks
+from api.validation import parse_decimal, parse_instant, refuse_future
+from db.marks import latest_marks, set_mark
 from db.positions import open_positions
-
-# NOTE: this block imports only what the GET below uses. Task 3 adds the POST
-# and the imports it needs (BaseModel, get_write_conn, require_trusted_identity,
-# set_mark, the validation helpers) at that point — not here, where they would
-# sit unused.
 
 router = APIRouter()
 
@@ -91,3 +89,86 @@ async def marks(conn: asyncpg.Connection = Depends(get_conn)) -> DeadbandJSONRes
     return DeadbandJSONResponse(
         {"marks": list(rolled.values()), "generated_at": datetime.now(UTC)}
     )
+
+
+class MarkIn(BaseModel):
+    instrument_id: UUID
+    price: str
+
+
+class MarksIn(BaseModel):
+    as_of: str
+    marks: list[MarkIn]
+
+
+@router.post("/api/marks", status_code=201)
+async def create_marks(
+    body: MarksIn,
+    # Identity is declared BEFORE get_write_conn: FastAPI resolves
+    # dependencies in declaration order, so an unauthenticated caller is
+    # refused before the write pool is ever touched. See api/fills.py's
+    # identical comment -- the reverse order let a 403-bound request check
+    # out a write-pool connection on every attempt.
+    _identity: str = Depends(require_trusted_identity),
+    conn: asyncpg.Connection = Depends(get_write_conn),
+) -> DeadbandJSONResponse:
+    """Set one price per instrument, all at one as_of, in one transaction.
+
+    No regroup_account, unlike POST /api/fills: a mark is a valuation input,
+    not a ledger event, so no trade grouping changes. The transaction is here
+    so a batch lands whole, nothing more.
+    """
+    if not body.marks:
+        raise HTTPException(422, "marks: at least one mark is required")
+
+    # The clock is taken ONCE, here in the I/O layer, so the future-date
+    # guard measures against a single instant -- cmd_marks_set does the same
+    # for the same reason.
+    now = datetime.now(UTC)
+    as_of = parse_instant(body.as_of, "as_of")
+    refuse_future(as_of, now, "as_of")
+
+    # Refused, not merged: two entries for one instrument at one as_of would
+    # ON CONFLICT DO UPDATE each other inside the transaction below, and the
+    # second would win with nothing reported. That is the same silent
+    # last-one-wins the GET's dedupe exists to prevent, arriving by another
+    # door.
+    seen: set[UUID] = set()
+    for i, m in enumerate(body.marks):
+        if m.instrument_id in seen:
+            raise HTTPException(
+                422, f"marks[{i}].instrument_id: duplicate instrument in one submission"
+            )
+        seen.add(m.instrument_id)
+
+    # Validate EVERY row before opening the transaction: a bad price on row 4
+    # must not leave rows 1-3 written. The transaction makes that true anyway,
+    # but failing early keeps the error clean -- api/fills.py's identical
+    # comment.
+    parsed: list[tuple[UUID, Decimal]] = []
+    for i, m in enumerate(body.marks):
+        price = parse_decimal(m.price, f"marks[{i}].price")
+        # mark_price_chk is `price >= 0 AND price < 'Infinity'`. Zero is a
+        # LEGAL mark -- an expired option is worth zero, and that is not the
+        # same as having no mark at all. Negative is not, and reaching the
+        # database with one produces an uncaught CheckViolationError, i.e. a
+        # 500 for what is plainly a bad request.
+        if price < 0:
+            raise HTTPException(422, f"marks[{i}].price: {m.price!r} must not be negative")
+        parsed.append((m.instrument_id, price))
+
+    known = {
+        r["id"]
+        for r in await conn.fetch(
+            "SELECT id FROM instrument WHERE id = ANY($1::uuid[])", list(seen)
+        )
+    }
+    missing = seen - known
+    if missing:
+        raise HTTPException(404, f"instrument not found: {sorted(str(m) for m in missing)[0]}")
+
+    async with conn.transaction():
+        for instrument_id, price in parsed:
+            await set_mark(conn, instrument_id, price, as_of)
+
+    return DeadbandJSONResponse({"marks_set": len(parsed), "as_of": as_of}, status_code=201)

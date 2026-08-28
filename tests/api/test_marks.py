@@ -151,3 +151,145 @@ async def test_get_marks_excludes_a_position_that_cannot_be_valued(client, conn)
     body = (await client.get("/api/marks")).json()
     ids = {m["instrument_id"] for m in body["marks"]}
     assert str(trade_id) not in ids
+
+
+async def test_post_marks_writes_every_row_in_one_call(client, conn):
+    acc = await create_account(conn, name="MarksPost", venue="manual", account_type="cash")
+    one = await _held(conn, acc, "ZZM4")
+    two = await _held(conn, acc, "ZZM5")
+
+    r = await client.post(
+        "/api/marks",
+        json={
+            "as_of": "2026-08-01T20:00:00Z",
+            "marks": [
+                {"instrument_id": str(one), "price": "238.90"},
+                {"instrument_id": str(two), "price": "12.05"},
+            ],
+        },
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert_no_json_floats(body)
+    assert body["marks_set"] == 2
+    assert await conn.fetchval("SELECT count(*) FROM mark") >= 2
+    assert await conn.fetchval(
+        "SELECT price FROM mark WHERE instrument_id = $1", one
+    ) == Decimal("238.90")
+
+
+async def test_post_marks_accepts_a_genuine_zero(client, conn):
+    """mark_price_chk is `price >= 0`, so 0 is a legal mark -- an expired
+    option is worth zero, and that is not the same as having no mark. The
+    frontend's blank-means-skip rule depends on this being writable."""
+    acc = await create_account(conn, name="MarksZero", venue="manual", account_type="cash")
+    instrument_id = await _held(conn, acc, "ZZM6")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-08-01T20:00:00Z",
+              "marks": [{"instrument_id": str(instrument_id), "price": "0"}]},
+    )
+    assert r.status_code == 201
+    assert await conn.fetchval(
+        "SELECT price FROM mark WHERE instrument_id = $1", instrument_id
+    ) == Decimal("0")
+
+
+async def test_post_marks_refuses_a_negative_price(client, conn):
+    """mark_price_chk would refuse this in the database as an uncaught
+    CheckViolationError -- a 500. It must be a 422 named to the row."""
+    acc = await create_account(conn, name="MarksNeg", venue="manual", account_type="cash")
+    instrument_id = await _held(conn, acc, "ZZM7")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-08-01T20:00:00Z",
+              "marks": [{"instrument_id": str(instrument_id), "price": "-1"}]},
+    )
+    assert r.status_code == 422
+    assert "marks[0].price" in r.json()["detail"]
+    assert await conn.fetchval(
+        "SELECT count(*) FROM mark WHERE instrument_id = $1", instrument_id
+    ) == 0
+
+
+async def test_post_marks_rolls_back_every_row_when_one_is_invalid(client, conn):
+    acc = await create_account(conn, name="MarksAtomic", venue="manual", account_type="cash")
+    good = await _held(conn, acc, "ZZM8")
+    bad = await _held(conn, acc, "ZZM9")
+
+    r = await client.post(
+        "/api/marks",
+        json={
+            "as_of": "2026-08-01T20:00:00Z",
+            "marks": [
+                {"instrument_id": str(good), "price": "10"},
+                {"instrument_id": str(bad), "price": "not-a-number"},
+            ],
+        },
+    )
+    assert r.status_code == 422
+    assert await conn.fetchval("SELECT count(*) FROM mark WHERE instrument_id = $1", good) == 0
+
+
+async def test_post_marks_refuses_an_empty_list(client):
+    r = await client.post("/api/marks", json={"as_of": "2026-08-01T20:00:00Z", "marks": []})
+    assert r.status_code == 422
+
+
+async def test_post_marks_refuses_a_duplicate_instrument(client, conn):
+    """Two rows for one instrument at one as_of would ON CONFLICT DO UPDATE
+    each other inside the transaction -- last one wins, silently. Refuse."""
+    acc = await create_account(conn, name="MarksDup", venue="manual", account_type="cash")
+    instrument_id = await _held(conn, acc, "ZZMA")
+
+    r = await client.post(
+        "/api/marks",
+        json={
+            "as_of": "2026-08-01T20:00:00Z",
+            "marks": [
+                {"instrument_id": str(instrument_id), "price": "10"},
+                {"instrument_id": str(instrument_id), "price": "20"},
+            ],
+        },
+    )
+    assert r.status_code == 422
+    assert "duplicate" in r.json()["detail"].lower()
+
+
+async def test_post_marks_refuses_a_future_as_of(client, conn):
+    acc = await create_account(conn, name="MarksFuture", venue="manual", account_type="cash")
+    instrument_id = await _held(conn, acc, "ZZMB")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2099-01-01T00:00:00Z",
+              "marks": [{"instrument_id": str(instrument_id), "price": "10"}]},
+    )
+    assert r.status_code == 422
+    assert "future" in r.json()["detail"]
+
+
+async def test_post_marks_refuses_an_as_of_without_an_offset(client, conn):
+    acc = await create_account(conn, name="MarksNaive", venue="manual", account_type="cash")
+    instrument_id = await _held(conn, acc, "ZZMC")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-08-01T20:00:00",
+              "marks": [{"instrument_id": str(instrument_id), "price": "10"}]},
+    )
+    assert r.status_code == 422
+    assert "offset" in r.json()["detail"]
+
+
+async def test_post_marks_404s_on_an_unknown_instrument(client):
+    from uuid import uuid4
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-08-01T20:00:00Z",
+              "marks": [{"instrument_id": str(uuid4()), "price": "10"}]},
+    )
+    assert r.status_code == 404

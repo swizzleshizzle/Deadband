@@ -54,6 +54,17 @@ async def _delete_fill(client):
     return await client.delete(f"/api/fills/{uuid4()}")
 
 
+async def _post_marks(client):
+    # A syntactically valid, never-created instrument id: identity is checked
+    # before the handler queries for it, so a 403/503 here cannot be confused
+    # with the 404 a real-but-missing instrument would produce.
+    return await client.post(
+        "/api/marks",
+        json={"as_of": "2026-06-01T15:30:00Z",
+              "marks": [{"instrument_id": str(uuid4()), "price": "1"}]},
+    )
+
+
 async def _commit_import(client):
     return await client.post(
         "/api/imports/commit",
@@ -74,6 +85,7 @@ _WRITE_REQUESTS = [
     pytest.param(_post_fills, id="post-fills"),
     pytest.param(_delete_fill, id="delete-fill"),
     pytest.param(_commit_import, id="commit-import"),
+    pytest.param(_post_marks, id="post-marks"),
 ]
 
 
