@@ -12,10 +12,10 @@ from tests.conftest import requires_db
 pytestmark = requires_db
 
 
-def _leg(symbol="ZZF", side="buy", qty="4", price="12.50"):
+def _leg(symbol="ZZF", side="buy", qty="4", price="12.50", executed_at="2026-06-01T15:30:00Z"):
     return {
         "symbol": symbol, "side": side, "quantity": qty, "price": price,
-        "fee": "0", "fee_currency": "USD", "executed_at": "2026-06-01T15:30:00Z",
+        "fee": "0", "fee_currency": "USD", "executed_at": executed_at,
     }
 
 
@@ -139,3 +139,51 @@ async def test_post_fills_422s_on_an_invalid_side(client, conn):
     )
     assert r.status_code == 422
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+
+
+async def test_post_fills_422s_on_an_unparseable_executed_at(client, conn):
+    """Gap #75. `datetime.fromisoformat` raises ValueError -- which, unlike the
+    Side(...) case above, nothing was catching -- so a fat-fingered timestamp
+    left the handler as an uncaught 500 for what is plainly a bad request."""
+    acc = await create_account(conn, name="ApiBadWhen", venue="manual", account_type="cash")
+    r = await client.post(
+        "/api/fills",
+        json={"account_id": str(acc), "fills": [_leg(executed_at="yesterday-ish")]},
+    )
+    assert r.status_code == 422
+    assert "fills[0].executed_at" in r.json()["detail"]
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+
+
+async def test_post_fills_422s_on_an_executed_at_with_no_offset(client, conn):
+    """The half of gap #75 that was silent rather than loud: a naive timestamp
+    parsed fine and was written into a TIMESTAMPTZ column, which stamps it as
+    though the wall-clock reading were UTC. Trades are grouped by executed_at,
+    so a fill shifted by the sender's offset can reorder a trade -- and no
+    error is raised at any layer. Refusing it is the only way it stays
+    visible; web/src/datetime.ts documents the browser-side twin of this.
+
+    Note this box runs UTC, so a naive timestamp happens to land correctly
+    here -- that is exactly why the guard cannot be verified by observing
+    stored values and has to be a refusal."""
+    acc = await create_account(conn, name="ApiNaiveWhen", venue="manual", account_type="cash")
+    r = await client.post(
+        "/api/fills",
+        json={"account_id": str(acc), "fills": [_leg(executed_at="2026-06-01T15:30:00")]},
+    )
+    assert r.status_code == 422
+    assert "offset" in r.json()["detail"]
+    assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
+
+
+async def test_post_fills_still_accepts_the_offset_forms_the_frontend_sends(client, conn):
+    """The tightening must not break the only two real callers. The frontend
+    sends toInstant()'s output (a Z-suffixed instant) and the CLI-shaped
+    tests send explicit offsets; both must still work."""
+    acc = await create_account(conn, name="ApiGoodWhen", venue="manual", account_type="cash")
+    for when in ("2026-06-01T15:30:00Z", "2026-06-01T15:30:00+00:00", "2026-06-01T11:30:00-04:00"):
+        r = await client.post(
+            "/api/fills",
+            json={"account_id": str(acc), "fills": [_leg(symbol="ZZW", executed_at=when)]},
+        )
+        assert r.status_code == 201, f"{when} was refused: {r.json()}"

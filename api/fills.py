@@ -7,7 +7,6 @@ Decimal -- never through float (spec section 5).
 
 from __future__ import annotations
 
-from datetime import datetime
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -17,7 +16,7 @@ from pydantic import BaseModel
 from api.deps import get_write_conn
 from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
-from api.validation import parse_decimal
+from api.validation import parse_decimal, parse_instant
 from db.accounts import get_account
 from db.fills import add_manual_fills, delete_manual_fill
 from db.instruments import upsert_instrument
@@ -80,7 +79,14 @@ async def create_fills(
                 parse_decimal(leg.price, f"fills[{i}].price"),
                 parse_decimal(leg.fee, f"fills[{i}].fee"),
                 leg.fee_currency,
-                datetime.fromisoformat(leg.executed_at),
+                # Not a bare `datetime.fromisoformat`: that raises ValueError on a
+                # malformed string, and nothing here caught it, so a fat-fingered
+                # timestamp left as an uncaught 500 for what is plainly a bad
+                # request. A naive one was refused too, but only downstream by
+                # Fill.__post_init__ (ledger/types.py) and likewise as a 500 --
+                # correct outcome, unusable message. parse_instant refuses both
+                # as a 422 naming the leg, before the transaction opens. Gap #75.
+                parse_instant(leg.executed_at, f"fills[{i}].executed_at"),
             )
         )
 
