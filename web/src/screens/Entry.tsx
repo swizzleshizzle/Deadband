@@ -3,6 +3,9 @@ import {
   commitImport, createFills, deleteFill, fetchAccounts, previewImport,
   type AccountSummary, type FillLegIn, type ImportCommitReport, type PreviewReport,
 } from '../api'
+import { toInstant } from '../datetime'
+import Marks from './Marks'
+import Snapshot from './Snapshot'
 
 // The importer registry (importers/registry.py) also lists "coinbase-api",
 // but that importer takes a JSON fills export from the Advanced Trade API,
@@ -46,24 +49,6 @@ interface LegState {
 
 const EMPTY: LegState = { symbol: '', side: 'buy', quantity: '', price: '', fee: '0' }
 
-// datetime-local yields the browser's LOCAL wall-clock time with no offset,
-// e.g. "2026-06-01T15:30" for 3:30pm in whatever zone the user is sitting
-// in. The column is TIMESTAMPTZ. The trap: stamping a bare "Z" onto that
-// string is unambiguous but WRONG -- it reinterprets "15:30 local" as
-// "15:30 UTC", silently shifting every hand-entered fill by the browser's
-// UTC offset (4-5 hours for US Eastern), which can reorder which fill opens
-// a position once trades are grouped by executed_at. `new Date(local)`
-// parses an offset-less string as LOCAL time (this also handles the
-// with-seconds form), so `.toISOString()` yields the true UTC instant.
-// An empty or unparseable value must throw HERE rather than produce
-// `Invalid Date` silently -- the caller relies on this landing in its own
-// try/catch so a bad date can never wedge the busy flag.
-function toInstant(local: string): string {
-  const d = new Date(local)
-  if (Number.isNaN(d.getTime())) throw new Error('executed at: enter a date and time')
-  return d.toISOString()
-}
-
 // The 422 for a bad leg names it positionally, e.g. "fills[2].symbol: must
 // not be blank" (api/fills.py). Pulling the index back out is enough to
 // point the user at the right row -- no need to parse which field.
@@ -73,7 +58,7 @@ function legIndexFromError(msg: string): number | null {
 }
 
 export default function Entry() {
-  const [mode, setMode] = useState<'fill' | 'multileg' | 'import'>('fill')
+  const [mode, setMode] = useState<'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'>('fill')
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [account, setAccount] = useState('')
   const [executedAt, setExecutedAt] = useState('')
@@ -125,7 +110,7 @@ export default function Entry() {
       .catch(() => setAccounts([]))
   }, [])
 
-  function switchMode(m: 'fill' | 'multileg' | 'import') {
+  function switchMode(m: 'fill' | 'multileg' | 'import' | 'marks' | 'snapshot') {
     // Switching mid-typing shouldn't leave a stale error from the other
     // form's last attempt pointing at a row that no longer applies.
     setMode(m)
@@ -280,7 +265,7 @@ export default function Entry() {
       <p className="eyebrow">by hand</p>
       <h1>Entry</h1>
 
-      {/* Fixed three-way switch -- D11: no rearrangeable or configurable
+      {/* Fixed five-way switch -- D11: no rearrangeable or configurable
           panes. This is the only way to change modes; the layout of any
           mode itself is likewise fixed. */}
       <div className="segmented" role="tablist" aria-label="Entry mode">
@@ -304,6 +289,20 @@ export default function Entry() {
           onClick={() => switchMode('import')}
         >
           import
+        </button>
+        <button
+          type="button" role="tab" aria-selected={mode === 'marks'}
+          className={mode === 'marks' ? 'active' : undefined}
+          onClick={() => switchMode('marks')}
+        >
+          marks
+        </button>
+        <button
+          type="button" role="tab" aria-selected={mode === 'snapshot'}
+          className={mode === 'snapshot' ? 'active' : undefined}
+          onClick={() => switchMode('snapshot')}
+        >
+          snapshot
         </button>
       </div>
 
@@ -442,7 +441,7 @@ export default function Entry() {
             </button>
           </div>
         </form>
-      ) : (
+      ) : mode === 'import' ? (
         <>
           {/* Step 1: pick. No form/onSubmit -- "preview" is a read GET-like
               action, not a write, so there is nothing here for Enter to
@@ -788,6 +787,10 @@ export default function Entry() {
             </>
           )}
         </>
+      ) : mode === 'marks' ? (
+        <Marks />
+      ) : (
+        <Snapshot />
       )}
 
       {added.length > 0 && (

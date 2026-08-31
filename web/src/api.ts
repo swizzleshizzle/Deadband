@@ -241,6 +241,77 @@ export const createFills = (body: { account_id: string; fills: FillLegIn[] }) =>
   send<CreatedFills>('/api/fills', 'POST', body)
 export const deleteFill = (id: string) => send<void>(`/api/fills/${id}`, 'DELETE')
 
+// --- marks and statement snapshots (spec section 4) ---
+//
+// Money stays a STRING end to end here as everywhere else: these values reach
+// NUMERIC columns and a round-trip through JS `number` would quietly lose
+// precision the ledger is built to preserve.
+
+export interface MarkRow {
+  instrument_id: string
+  symbol: string
+  natural_key: string
+  quantity: string
+  accounts: { id: string; name: string }[]
+  // null means NO mark exists -- distinct from a mark of "0", which is legal
+  // (mark_price_chk is `price >= 0`) and means the thing is worth nothing.
+  last_mark: { price: string; as_of: string } | null
+}
+
+export interface MarksPage {
+  marks: MarkRow[]
+  generated_at: string
+}
+
+export interface MarkIn {
+  instrument_id: string
+  price: string
+}
+
+export interface SetMarksResult {
+  marks_set: number
+  as_of: string
+}
+
+export interface StoredSnapshot {
+  as_of: string
+  cash_balance: string
+  total_equity: string
+  note: string | null
+}
+
+export interface SnapshotIn {
+  account_id: string
+  as_of: string
+  cash_balance: string
+  total_equity: string
+  note: string | null
+}
+
+export interface CreatedSnapshot {
+  account_id: string
+  as_of: string
+  replaced: boolean
+}
+
+export const fetchMarks = () => get<MarksPage>('/api/marks')
+
+// `send` is the file's existing JSON helper (used by createFills/deleteFill).
+// It already routes a 404 to NotFound and pulls the API's `detail` string out
+// of an error body via errorMessage() -- which matters here, because the 422s
+// these routes return name the offending row ("marks[2].price: ...") and the
+// screens surface that text verbatim. Do not add a second POST helper.
+export const setMarks = (body: { as_of: string; marks: MarkIn[] }) =>
+  send<SetMarksResult>('/api/marks', 'POST', body)
+
+export const fetchSnapshot = (accountId: string, asOf: string) =>
+  get<{ snapshot: StoredSnapshot | null }>(
+    `/api/accounts/${accountId}/snapshot?as_of=${encodeURIComponent(asOf)}`,
+  )
+
+export const createSnapshot = (body: SnapshotIn) =>
+  send<CreatedSnapshot>('/api/snapshots', 'POST', body)
+
 // The CSV import wizard (api/imports.py). Mirrors db/import_flow.py's
 // dataclasses field-for-field -- see that module's docstrings for what each
 // field means and why it exists; restating the reasoning here would be a

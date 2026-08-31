@@ -7,8 +7,6 @@ Decimal -- never through float (spec section 5).
 
 from __future__ import annotations
 
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -18,6 +16,7 @@ from pydantic import BaseModel
 from api.deps import get_write_conn
 from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
+from api.validation import parse_decimal, parse_instant
 from db.accounts import get_account
 from db.fills import add_manual_fills, delete_manual_fill
 from db.instruments import upsert_instrument
@@ -40,16 +39,6 @@ class LegIn(BaseModel):
 class FillsIn(BaseModel):
     account_id: UUID
     fills: list[LegIn]
-
-
-def _decimal(raw: str, field: str) -> Decimal:
-    try:
-        value = Decimal(raw)
-    except InvalidOperation:
-        raise HTTPException(422, f"{field}: {raw!r} is not a valid number") from None
-    if not value.is_finite():
-        raise HTTPException(422, f"{field}: {raw!r} must be finite")
-    return value
 
 
 @router.post("/api/fills", status_code=201)
@@ -75,7 +64,7 @@ async def create_fills(
         symbol = leg.symbol.strip()
         if not symbol:
             raise HTTPException(422, f"fills[{i}].symbol: must not be blank")
-        quantity = _decimal(leg.quantity, f"fills[{i}].quantity")
+        quantity = parse_decimal(leg.quantity, f"fills[{i}].quantity")
         if quantity <= 0:
             raise HTTPException(422, f"fills[{i}].quantity: must be positive")
         try:
@@ -87,10 +76,17 @@ async def create_fills(
                 symbol.upper(),
                 side,
                 quantity,
-                _decimal(leg.price, f"fills[{i}].price"),
-                _decimal(leg.fee, f"fills[{i}].fee"),
+                parse_decimal(leg.price, f"fills[{i}].price"),
+                parse_decimal(leg.fee, f"fills[{i}].fee"),
                 leg.fee_currency,
-                datetime.fromisoformat(leg.executed_at),
+                # Not a bare `datetime.fromisoformat`: that raises ValueError on a
+                # malformed string, and nothing here caught it, so a fat-fingered
+                # timestamp left as an uncaught 500 for what is plainly a bad
+                # request. A naive one was refused too, but only downstream by
+                # Fill.__post_init__ (ledger/types.py) and likewise as a 500 --
+                # correct outcome, unusable message. parse_instant refuses both
+                # as a 422 naming the leg, before the transaction opens. Gap #75.
+                parse_instant(leg.executed_at, f"fills[{i}].executed_at"),
             )
         )
 
