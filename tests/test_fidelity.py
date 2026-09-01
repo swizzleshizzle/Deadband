@@ -1243,3 +1243,88 @@ def test_zero_money_acat_row_warns_without_blocking():
     assert batch.transfers == ()
     assert batch.cash == ()
     assert any("TRANSFER OF ASSETS" in w for w in batch.warnings)
+
+
+def test_blank_symbol_row_is_identified_by_its_isin():
+    """Issue #27. `instrument.symbol` is TEXT NOT NULL but the EMPTY STRING was
+    never forbidden, and because instrument_natural_key derives from the
+    symbol, every blank-symbol row for ANY security collapsed onto one
+    `equity::USD` instrument -- on the real ledger, 17 fills across 2022-2025
+    and three distinct securities, presenting as one nameless-but-valuable
+    position with unvaluable_reason NULL.
+
+    The ISIN is preferred over the description because it survives the renames
+    that a reorganisation or reverse split inflicts on a listing."""
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,YOU BOUGHT,"",FAKECO MINING INC COM NEW ISIN ZZ000000BBB2,'
+            'Cash,0.61,164,"","","",-100.04,0,""'
+        )
+    )
+    assert batch.blocking == ()
+    assert len(batch.fills) == 1
+    assert batch.fills[0].instrument.symbol == "ISIN:ZZ000000BBB2"
+    assert any("blank symbol" in w for w in batch.warnings)
+
+
+def test_two_isins_for_one_company_stay_two_instruments():
+    """The whole point of keying on the ISIN. One issuer in the real
+    ledger carries three ISINs from two successive identity changes; a
+    description-derived key would merge them back into one row and reintroduce
+    issue #27 in a subtler form, since the descriptions differ only by a
+    suffix. ISINs below are invented."""
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,YOU BOUGHT,"",FAKECO MINING INC COM NPV ISIN ZZ000000AAA1,'
+            'Cash,0.61,164,"","","",-100.04,0,""',
+            '03/12/2026,YOU BOUGHT,"",FAKECO MINING INC COM NEW ISIN ZZ000000BBB2,'
+            'Cash,0.46,215,"","","",-98.90,0,""',
+        )
+    )
+    assert batch.blocking == ()
+    assert {f.instrument.symbol for f in batch.fills} == {
+        "ISIN:ZZ000000AAA1",
+        "ISIN:ZZ000000BBB2",
+    }
+
+
+def test_blank_symbol_without_an_isin_falls_back_to_the_description():
+    """4 of the real ledger's 17 blank-symbol rows carry no ISIN -- they are a
+    reverse-split notice -- but all four share one identical description, so a
+    description-derived key groups them correctly rather than refusing rows
+    that are perfectly identifiable to a human."""
+    row = (
+        '03/11/2026,YOU BOUGHT,"",FAKE TR II SOMEFUND OP 1 FOR 5 R/S INTO FAKE TRUST II,'
+        'Cash,22.53,20,"","","",-450.60,0,""'
+    )
+    batch = FidelityImporter().parse(_history(row, row.replace("03/11", "03/12")))
+    assert batch.blocking == ()
+    assert len(batch.fills) == 2
+    symbols = {f.instrument.symbol for f in batch.fills}
+    assert len(symbols) == 1, "identical descriptions must yield ONE instrument"
+    assert symbols.pop().startswith("DESC:FAKE TR II SOMEFUND")
+
+
+def test_blank_symbol_and_blank_description_is_refused():
+    """The one genuinely unnameable case. Inventing a name here would be worse
+    than refusing: it would mint an instrument nobody can ever identify."""
+    batch = FidelityImporter().parse(
+        _history('03/11/2026,YOU BOUGHT,"","",Cash,0.61,164,"","","",-100.04,0,""')
+    )
+    assert batch.fills == ()
+    assert len(batch.blocking) == 1
+    assert "blank symbol" in batch.blocking[0][1]
+
+
+def test_a_named_fill_row_is_still_accepted():
+    """The derivation must not disturb ordinary rows."""
+    batch = FidelityImporter().parse(
+        _history(
+            '03/11/2026,YOU BOUGHT,ZXCO,FAKECO INC COM,Cash,0.61,164,'
+            '"","","",-100.04,0,""'
+        )
+    )
+    assert batch.blocking == ()
+    assert len(batch.fills) == 1
+    assert batch.fills[0].instrument.symbol == "ZXCO"
+    assert not any("blank symbol" in w for w in batch.warnings)
