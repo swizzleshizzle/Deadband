@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import enum
+import hashlib
 import io
 import re
 from dataclasses import dataclass
@@ -55,6 +56,47 @@ _normalize_field = normalize_field
 SWEEP_SYMBOLS: frozenset[str] = frozenset({
     "SPAXX", "FDRXX", "FZFXX", "SPRXX", "FDLXX", "QPIHQ",
 })
+
+
+_ISIN_RE = re.compile(r"ISIN\s*#?\s*([A-Z]{2}[A-Z0-9]{9}[0-9])")
+
+
+def derive_symbol(description: str | None) -> str | None:
+    """A stand-in symbol for a fill row whose Symbol column is blank (issue #27).
+
+    Fidelity leaves Symbol empty for some securities but still names them in
+    Description, often with an ISIN. Before this existed, `symbol = ''` reached
+    upsert_instrument, and because instrument_natural_key derives from the
+    symbol, EVERY blank-symbol row for ANY security collapsed onto one
+    `equity::USD` row: on the real ledger, 17 fills spanning 2022-2025 across
+    three distinct securities, presenting as one nameless-but-valuable
+    position with unvaluable_reason NULL.
+
+    ISIN first, because it is the security's actual identifier and survives the
+    renames a reorganisation or reverse split inflicts on a listing. One issuer
+    in the real ledger carries THREE ISINs from two successive identity changes,
+    and their descriptions differ only by a suffix -- a description-only key
+    would merge them back together and reintroduce this bug in a subtler form.
+
+    Falling back to the description is deliberate rather than refusing: some of
+    those rows carry no ISIN at all (a reverse-split notice), yet share one
+    identical description, so it groups them correctly rather than refusing
+    rows a human can identify at a glance. The digest keeps the key
+    unique where the readable prefix is not; the prefix keeps it identifiable
+    to whoever has to price it.
+
+    Returns None only when there is nothing to derive from at all -- the caller
+    refuses that row rather than inventing a name for it.
+    """
+    text = " ".join((description or "").split())
+    if not text:
+        return None
+    isin = _ISIN_RE.search(text.upper())
+    if isin:
+        return f"ISIN:{isin.group(1)}"
+    prefix = "".join(c for c in text.upper()[:20] if c.isalnum() or c == " ").strip()
+    digest = hashlib.sha1(text.upper().encode()).hexdigest()[:6]
+    return f"DESC:{prefix}:{digest}" if prefix else f"DESC:{digest}"
 
 
 def is_sweep(symbol: str | None) -> bool:
@@ -1037,6 +1079,25 @@ class FidelityImporter:
             reinvest_security rule — both produce a CanonicalFill from the
             same quantity/price/fee columns, differing only in side and
             funding_source."""
+            # Issue #27, checked FIRST because a nameless fill makes every
+            # check below it meaningless. See derive_symbol for what went
+            # wrong and why the ISIN is preferred over the description.
+            fill_symbol = symbol.strip()
+            if not fill_symbol:
+                fill_symbol = derive_symbol(row.get("description")) or ""
+                if not fill_symbol:
+                    reject(
+                        row, raw_row, account, line_no,
+                        f"line {line_no}: fill row has a blank symbol and no "
+                        "description to derive one from, refused",
+                    )
+                    return
+                warnings.append(
+                    f"line {line_no}: blank symbol column; identifying this "
+                    f"security as {fill_symbol} from its description. Rename it "
+                    "once you know the ticker -- the key is stable either way."
+                )
+
             try:
                 raw_qty = _decimal(row.get("quantity"))
                 price = _decimal(row.get("price"))
@@ -1065,14 +1126,14 @@ class FidelityImporter:
             # (see importers.base.zero_price_warning's docstring), not a free
             # trade -- report it, but still record the fill: suppressing it
             # would trade one silent-loss failure mode for another.
-            warn = zero_price_warning(line_no, symbol, abs(raw_qty), price)
+            warn = zero_price_warning(line_no, fill_symbol, abs(raw_qty), price)
             if warn is not None:
                 warnings.append(warn)
 
-            instrument = parse_option_symbol(symbol) or Instrument(
+            instrument = parse_option_symbol(fill_symbol) or Instrument(
                 id=None,
                 asset_class=AssetClass.EQUITY,
-                symbol=symbol.upper(),
+                symbol=fill_symbol.upper(),
                 quote_currency="USD",
             )
 
