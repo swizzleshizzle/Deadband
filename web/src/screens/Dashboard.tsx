@@ -123,13 +123,7 @@ export default function Dashboard() {
           </table>
         )}
         {data.unvaluable.length > 0 && (
-          <ul className="warnings">
-            {data.unvaluable.map((u, i) => (
-              <li key={i}>
-                {u.instrument.symbol}: {u.reason}
-              </li>
-            ))}
-          </ul>
+          <UnvaluableNotice rows={data.unvaluable} />
         )}
       </section>
 
@@ -173,6 +167,63 @@ export default function Dashboard() {
         Read-only view. Marks are manual — every valuation shows the mark's age rather than
         pretending to be live. <Link to="/trades">Browse trades →</Link>
       </p>
+    </>
+  )
+}
+
+
+/* Why this is grouped rather than listed.
+ *
+ * Every unvaluable position used to get its own bordered row. With no marks
+ * recorded that is one row per holding -- 45 of them on the real ledger,
+ * taller than the positions table above it, and 43 of those rows said the
+ * same four words. The signal ("some of these need attention") was buried in
+ * its own repetition.
+ *
+ * They are NOT all the same, which is the reason for grouping by reason
+ * rather than just truncating. "no mark recorded" means the position is
+ * perfectly valuable and simply has no price yet -- one action fixes all of
+ * them at once. Any other reason (a spread, a mixed direction, a NULL
+ * quantity) means the position cannot be priced at all and each needs its own
+ * look. Collapsing the first while listing the second puts the bulk case
+ * behind one line and leaves the genuinely odd ones visible.
+ *
+ * The symbols are still all shown. spec section 4 wants an unvaluable holding
+ * visible, and a bare count would hide WHICH ones -- the per-row nulls in the
+ * table above are the other half of that, and remain untouched.
+ */
+function UnvaluableNotice({
+  rows,
+}: {
+  rows: { instrument: { symbol: string }; account_id: string; reason: string }[]
+}) {
+  const unmarked = rows.filter((u) => u.reason === 'no mark recorded')
+  const other = rows.filter((u) => u.reason !== 'no mark recorded')
+
+  return (
+    <>
+      {unmarked.length > 0 && (
+        <div className="why">
+          <strong>
+            {unmarked.length} {unmarked.length === 1 ? 'holding has' : 'holdings have'} no mark
+            recorded
+          </strong>{' '}
+          — priced as soon as you record one.{' '}
+          <Link to="/entry?tab=marks">record marks →</Link>
+          <div className="muted symbols">
+            {unmarked.map((u) => u.instrument.symbol || '(unnamed)').join(' · ')}
+          </div>
+        </div>
+      )}
+      {other.length > 0 && (
+        <ul className="warnings">
+          {other.map((u, i) => (
+            <li key={i}>
+              {u.instrument.symbol || '(unnamed)'}: {u.reason}
+            </li>
+          ))}
+        </ul>
+      )}
     </>
   )
 }
