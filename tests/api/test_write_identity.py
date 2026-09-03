@@ -73,6 +73,10 @@ async def _post_snapshot(client):
     )
 
 
+async def _patch_account(client):
+    return await client.patch(f"/api/accounts/{uuid4()}", json={"name": "Anything"})
+
+
 async def _commit_import(client):
     return await client.post(
         "/api/imports/commit",
@@ -95,6 +99,7 @@ _WRITE_REQUESTS = [
     pytest.param(_commit_import, id="commit-import"),
     pytest.param(_post_marks, id="post-marks"),
     pytest.param(_post_snapshot, id="post-snapshot"),
+    pytest.param(_patch_account, id="patch-account"),
 ]
 
 

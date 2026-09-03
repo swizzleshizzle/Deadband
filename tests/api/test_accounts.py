@@ -214,3 +214,62 @@ async def test_list_flags_which_accounts_have_a_rule(client, conn):
 async def test_detail_404s_on_an_unknown_account(client):
     r = await client.get(f"/api/accounts/{uuid4()}")
     assert r.status_code == 404
+
+
+# --- PATCH /api/accounts/{id}: renaming ------------------------------------
+#
+# Accounts arrive from an import named after their number ("Fidelity 856"),
+# which says nothing about what the account is for.
+
+
+async def test_rename_changes_the_name_and_nothing_else(client, conn):
+    acc = await create_account(conn, name="Fidelity 856", venue="fidelity", account_type="cash")
+    before = await conn.fetchrow("SELECT * FROM account WHERE id = $1", acc)
+
+    r = await client.patch(f"/api/accounts/{acc}", json={"name": "Options income"})
+    assert r.status_code == 200
+    assert r.json()["name"] == "Options income"
+
+    after = await conn.fetchrow("SELECT * FROM account WHERE id = $1", acc)
+    assert after["name"] == "Options income"
+    # external_ref is what imports route on (never the nickname -- see the
+    # comment in importers/fidelity.py). Renaming must not disturb it, or a
+    # rename would silently orphan every future import for this account.
+    assert after["external_ref"] == before["external_ref"]
+    assert after["venue"] == before["venue"]
+    assert after["account_type"] == before["account_type"]
+
+
+async def test_rename_refuses_a_blank_name(client, conn):
+    """`account.name` is TEXT NOT NULL, which does NOT forbid the empty string
+    -- the exact shape of issue #27, where a blank instrument symbol produced
+    a row that was visibly populated and silently nameless. A rename endpoint
+    that accepted "" would reintroduce it one table over."""
+    acc = await create_account(conn, name="Fidelity 856", venue="fidelity", account_type="cash")
+    for blank in ("", "   ", "\t"):
+        r = await client.patch(f"/api/accounts/{acc}", json={"name": blank})
+        assert r.status_code == 422, f"{blank!r} was accepted"
+    assert await conn.fetchval("SELECT name FROM account WHERE id = $1", acc) == "Fidelity 856"
+
+
+async def test_rename_trims_surrounding_whitespace(client, conn):
+    """Stored trimmed, so " Roth " and "Roth" cannot become two names that
+    render identically in a picker."""
+    acc = await create_account(conn, name="Fidelity 856", venue="fidelity", account_type="cash")
+    r = await client.patch(f"/api/accounts/{acc}", json={"name": "  Roth IRA  "})
+    assert r.status_code == 200
+    assert await conn.fetchval("SELECT name FROM account WHERE id = $1", acc) == "Roth IRA"
+
+
+async def test_rename_404s_on_an_unknown_account(client):
+    r = await client.patch(f"/api/accounts/{uuid4()}", json={"name": "Anything"})
+    assert r.status_code == 404
+
+
+async def test_rename_shows_up_in_the_accounts_list(client, conn):
+    """The rename is worthless if the screen that displays it does not see it."""
+    acc = await create_account(conn, name="Fidelity 856", venue="fidelity", account_type="cash")
+    await client.patch(f"/api/accounts/{acc}", json={"name": "Swing book"})
+    listing = (await client.get("/api/accounts")).json()["accounts"]
+    names = {a["id"]: a["name"] for a in listing}
+    assert names[str(acc)] == "Swing book"

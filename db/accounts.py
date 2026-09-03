@@ -103,3 +103,32 @@ async def funded_rule(conn: asyncpg.Connection, account_id: UUID) -> asyncpg.Rec
     return await conn.fetchrow(
         "SELECT * FROM funded_account_rule WHERE account_id = $1", account_id
     )
+
+
+async def rename_account(conn: asyncpg.Connection, account_id: UUID, name: str) -> bool:
+    """Change an account's display name. Returns whether a row changed.
+
+    `account.name` is TEXT NOT NULL, and NOT NULL does not forbid the empty
+    string -- exactly the shape of issue #27, where a blank instrument symbol
+    produced a row that was visibly populated and silently nameless. Accepting
+    "" here would reintroduce that one table over, so blank is refused twice:
+    once in Python for a clean message, and once in SQL (`btrim($2) <> ''`) so
+    a caller that skips the first cannot bypass the rule. Same belt-and-braces
+    as db/fills.py's delete_manual_fill, and for the same reason -- the CLI and
+    tests call this directly, not only the HTTP layer.
+
+    Stored trimmed, so " Roth " and "Roth" cannot become two names that render
+    identically in a picker and refuse to match each other.
+
+    Deliberately touches `name` ONLY. `external_ref` is what imports route on
+    -- never the nickname, see importers/fidelity.py -- so a rename that
+    disturbed it would silently orphan every future import for the account.
+    """
+    if not name.strip():
+        raise ValueError("account name must not be blank")
+    row = await conn.fetchrow(
+        "UPDATE account SET name = btrim($2) WHERE id = $1 AND btrim($2) <> '' RETURNING id",
+        account_id,
+        name,
+    )
+    return row is not None

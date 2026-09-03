@@ -390,3 +390,21 @@ thead th button.sort:hover { color: var(--fg, #e8e8e8); text-decoration: underli
 thead th button.sort:focus-visible { outline: 1px solid currentColor; outline-offset: 2px; }
 /* Fixed-width so the arrow appearing does not shift the column heading. */
 thead th .arrow { width: 1em; display: inline-block; font-size: 0.85em; opacity: 0.8; }
+
+/* Inline account rename. The row is a link, so these controls sit above it
+   and stop propagation in the component. */
+.rename { display: inline-flex; gap: 0.4em; align-items: center; }
+.rename input { font: inherit; padding: 0.15em 0.4em; }
+button.rename-open {
+  all: unset;
+  cursor: pointer;
+  margin-left: 0.6em;
+  font-size: 0.8em;
+  opacity: 0;
+  text-decoration: underline;
+}
+/* Revealed on row hover or keyboard focus -- visible always would clutter a
+   column that is mostly read, never edited. focus-within keeps it reachable
+   without a mouse. */
+tr:hover button.rename-open, tr:focus-within button.rename-open { opacity: 0.7; }
+button.rename-open:hover, button.rename-open:focus-visible { opacity: 1; }

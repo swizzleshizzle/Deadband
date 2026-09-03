@@ -55,6 +55,7 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     # longer the only thing standing between this app and an unauthenticated
     # write. Registered before the SPA catch-all.
     if enable_writes:
+        from api.accounts import write_router as accounts_write_router
         from api.fills import router as fills_router
         from api.imports import router as imports_router
         from api.marks import router as marks_router
@@ -77,6 +78,10 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         # "already exists for this date" warning, so it is gated with the
         # write it feeds rather than published on the read-only instance.
         app.include_router(snapshots_router)
+        # PATCH /api/accounts/{id} lives on its own router because the account
+        # READ router above is registered unconditionally -- a write hung off
+        # that one would be reachable on the published read-only instance.
+        app.include_router(accounts_write_router)
 
     if _WEB_DIST.exists():
         from fastapi.responses import FileResponse
