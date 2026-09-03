@@ -184,6 +184,13 @@ export const fetchTradeDetail = (id: string) => get<TradeDetail>(`/api/trades/${
 export const fetchAccounts = () => get<{ accounts: AccountSummary[] }>('/api/accounts')
 export const fetchAccountDetail = (id: string) => get<AccountDetail>(`/api/accounts/${id}`)
 
+// Renames an account. Accounts arrive from an import named after their
+// number, which says nothing about what the account is for. The API refuses a
+// blank name with a 422 -- `account.name` is TEXT NOT NULL, and NOT NULL does
+// not forbid the empty string.
+export const renameAccount = (id: string, name: string) =>
+  send<{ id: string; name: string }>(`/api/accounts/${id}`, 'PATCH', { name })
+
 // The Entry screen's write path. Money and quantities stay STRINGS end to end.
 export interface FillLegIn {
   symbol: string
