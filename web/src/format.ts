@@ -24,7 +24,23 @@ export function signedMoney(value: string | null | undefined): string {
 
 export function qty(value: string | null | undefined): string {
   if (value == null) return '—'
-  return trimZeros(value)
+  const n = Number(value)
+  if (!Number.isFinite(n)) return trimZeros(value)
+  // Quantities that reach here are often DERIVED, not stored: a corporate
+  // action's ratio division under ledger/reconcile.py's `ctx.prec = 50`
+  // produces repeating decimals, so a third rendered 50 digits wide and blew
+  // the QTY column into its neighbours. No stored fill carries more than 6
+  // decimal places, so rounding the display discards arithmetic noise, never
+  // data.
+  //
+  // The small-magnitude escape is the same posture money() takes directly
+  // above, and this file's header states why: a satoshi-scale holding
+  // flattened to "0.000" would read as nothing held, which is worse than an
+  // ugly number. Below the rounding threshold, keep every digit.
+  if (n !== 0 && Math.abs(n) < 0.001) return trimZeros(value)
+  // toFixed, not Intl.NumberFormat: the latter would introduce thousands
+  // separators this column has never had, changing every row to fix a few.
+  return trimZeros(n.toFixed(3))
 }
 
 function trimZeros(value: string): string {
