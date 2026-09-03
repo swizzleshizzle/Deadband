@@ -58,7 +58,7 @@ function legIndexFromError(msg: string): number | null {
 }
 
 export default function Entry() {
-  const [mode, setMode] = useState<'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'>('fill')
+  const [mode, setMode] = useState<'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'>('import')
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [account, setAccount] = useState('')
   const [executedAt, setExecutedAt] = useState('')
@@ -265,10 +265,19 @@ export default function Entry() {
       <p className="eyebrow">by hand</p>
       <h1>Entry</h1>
 
-      {/* Fixed five-way switch -- D11: no rearrangeable or configurable
+      {/* Fixed five-way switch, import first because it is the landing view
+          and a landing tab that is not leftmost reads as an afterthought.
+          D11: no rearrangeable or configurable
           panes. This is the only way to change modes; the layout of any
           mode itself is likewise fixed. */}
       <div className="segmented" role="tablist" aria-label="Entry mode">
+        <button
+          type="button" role="tab" aria-selected={mode === 'import'}
+          className={mode === 'import' ? 'active' : undefined}
+          onClick={() => switchMode('import')}
+        >
+          import
+        </button>
         <button
           type="button" role="tab" aria-selected={mode === 'fill'}
           className={mode === 'fill' ? 'active' : undefined}
@@ -282,13 +291,6 @@ export default function Entry() {
           onClick={() => switchMode('multileg')}
         >
           multi-leg
-        </button>
-        <button
-          type="button" role="tab" aria-selected={mode === 'import'}
-          className={mode === 'import' ? 'active' : undefined}
-          onClick={() => switchMode('import')}
-        >
-          import
         </button>
         <button
           type="button" role="tab" aria-selected={mode === 'marks'}

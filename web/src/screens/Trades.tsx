@@ -1,4 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
+
+// [sort key, right-aligned]. The keys are the ones api/trades.py's `sort`
+// Literal accepts -- an unlisted one is a 422, so these must stay in step.
+const SORT_COLUMNS: [string, boolean][] = [
+  ['opened', false], ['symbol', false], ['dir', false], ['status', false],
+  ['qty', true], ['entry', true], ['exit', true], ['realized', true],
+  ['r', true], ['tag', false],
+]
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { fetchAccounts, fetchTrades, type AccountSummary, type TradesPage } from '../api'
 import { money, pnlClass, qty, shortDate, signedMoney } from '../format'
@@ -23,21 +31,41 @@ export default function Trades() {
   }, [])
 
   const offset = Number(params.get('offset') ?? '0')
+  // Sort lives in the URL beside the filters, not in component state: a
+  // sorted view is then shareable and survives a refresh, and the two cannot
+  // disagree about what the table is showing.
+  const sortKey = params.get('sort') ?? 'opened'
+  const sortDir = params.get('dir') ?? 'desc'
   const query = useMemo(() => {
     const q = new URLSearchParams()
     for (const key of FILTERS) {
       const v = params.get(key)
       if (v) q.set(key, v)
     }
+    q.set('sort', sortKey)
+    q.set('dir', sortDir)
     q.set('limit', String(PAGE))
     q.set('offset', String(offset))
     return q
-  }, [params, offset])
+  }, [params, offset, sortKey, sortDir])
 
   useEffect(() => {
     setPage(null)
     fetchTrades(query).then(setPage).catch((e) => setError(String(e)))
   }, [query])
+
+  // Column order is SERVER-side (api/trades.py). Sorting the 50 rows already
+  // on screen would answer "the biggest win on this page", which looks
+  // identical to the real answer and is not it.
+  function toggleSort(key: string) {
+    const next = new URLSearchParams(params)
+    next.set('sort', key)
+    // Same column flips direction; a new column starts descending, which is
+    // what "show me the biggest" means for every numeric column here.
+    next.set('dir', key === sortKey && sortDir === 'desc' ? 'asc' : 'desc')
+    next.delete('offset') // a re-sort restarts paging, same as a new filter
+    setParams(next, { replace: true })
+  }
 
   function setFilter(key: string, value: string) {
     const next = new URLSearchParams(params)
@@ -135,16 +163,18 @@ export default function Trades() {
         <table>
           <thead>
             <tr>
-              <th>opened</th>
-              <th>symbol</th>
-              <th>dir</th>
-              <th>status</th>
-              <th className="right">qty</th>
-              <th className="right">entry</th>
-              <th className="right">exit</th>
-              <th className="right">realized</th>
-              <th className="right">r</th>
-              <th>tag</th>
+              {SORT_COLUMNS.map(([key, right]) => (
+                <th key={key} className={right ? 'right' : undefined} aria-sort={
+                  sortKey === key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'
+                }>
+                  <button type="button" className="sort" onClick={() => toggleSort(key)}>
+                    {key}
+                    <span className="arrow">
+                      {sortKey === key ? (sortDir === 'asc' ? '▲' : '▼') : ''}
+                    </span>
+                  </button>
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
