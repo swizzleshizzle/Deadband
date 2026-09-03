@@ -600,6 +600,48 @@ _QUERY_TRADES_PREDICATE = """
 """
 
 
+# Sortable columns for query_trades, mapped from the API's stable sort keys to
+# SQL expressions. This is a WHITELIST and it is the security boundary: the
+# ORDER BY clause is built by string concatenation (the SQL below), so a key
+# that reached it unchecked would be an injection point. Nothing outside this
+# mapping is ever interpolated -- an unknown key raises rather than falling
+# back to a default, because silently sorting by something other than what was
+# asked is the confidently-wrong-answer shape this codebase avoids elsewhere.
+_TRADE_SORTS = {
+    "opened": "t.opened_at",
+    "symbol": "i.symbol",
+    "dir": "t.direction",
+    "status": "t.status",
+    "qty": "t.qty_opened",
+    "entry": "t.avg_entry",
+    "exit": "t.avg_exit",
+    "realized": "t.realized_pnl",
+    "r": "t.r_multiple",
+    "tag": "t.strategy_tag",
+}
+
+
+def _trade_order_by(sort: str, direction: str) -> str:
+    """ORDER BY fragment for query_trades, or ValueError.
+
+    NULLS LAST in BOTH directions, deliberately. A NULL here means "not
+    applicable yet" -- an open trade has no exit, no realized P&L and no R --
+    not "lowest". Postgres would otherwise sort NULLs first on ASC, so asking
+    for the worst losers would return a page of trades that have not closed.
+
+    `t.id` is always the final term. Without a unique tiebreaker, rows that
+    compare equal have no defined order between queries, so paging through
+    ties can show the same trade twice and skip another entirely -- and every
+    sortable column here except opened_at has ties in real data.
+    """
+    column = _TRADE_SORTS.get(sort)
+    if column is None:
+        raise ValueError(f"unsortable column {sort!r}; expected one of {sorted(_TRADE_SORTS)}")
+    if direction not in ("asc", "desc"):
+        raise ValueError(f"direction must be 'asc' or 'desc', got {direction!r}")
+    return f" ORDER BY {column} {direction.upper()} NULLS LAST, t.id"
+
+
 async def query_trades(
     conn: asyncpg.Connection,
     *,
@@ -610,6 +652,8 @@ async def query_trades(
     opened_from=None,
     opened_before=None,
     tag: str | None = None,
+    sort: str = "opened",
+    direction: str = "desc",
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[asyncpg.Record], int]:
@@ -628,7 +672,8 @@ async def query_trades(
           LEFT JOIN instrument i ON i.id = COALESCE(t.effective_instrument_id, f.instrument_id)
         """
         + _QUERY_TRADES_PREDICATE
-        + " ORDER BY t.opened_at DESC, t.id LIMIT $8 OFFSET $9",
+        + _trade_order_by(sort, direction)
+        + " LIMIT $8 OFFSET $9",
         *args,
         limit,
         offset,

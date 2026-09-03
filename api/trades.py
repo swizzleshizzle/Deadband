@@ -30,6 +30,15 @@ async def trades(
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = None,
     tag: str | None = None,
+    # Literal, not a bare str validated in the handler: FastAPI refuses an
+    # unknown value as a 422 before any of this runs, so a key that could be
+    # interpolated into ORDER BY never reaches db/trades.py. That module
+    # whitelists them again anyway -- the CLI and tests call it directly, and
+    # a guard that only exists at the HTTP edge protects only HTTP callers.
+    sort: Literal[
+        "opened", "symbol", "dir", "status", "qty", "entry", "exit", "realized", "r", "tag"
+    ] = "opened",
+    dir: Literal["asc", "desc"] = "desc",
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> DeadbandJSONResponse:
@@ -47,6 +56,8 @@ async def trades(
             else None
         ),
         tag=tag,
+        sort=sort,
+        direction=dir,
         limit=limit,
         offset=offset,
     )
@@ -54,7 +65,14 @@ async def trades(
     # jsonable_encoder would str() every Decimal first (a quantized zero
     # becomes '0E-18') and the exact-decimal renderer would never see them.
     return DeadbandJSONResponse(
-        {"trades": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+        {
+            "trades": [dict(r) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+            "dir": dir,
+        }
     )
 
 
