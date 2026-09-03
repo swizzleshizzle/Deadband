@@ -223,3 +223,36 @@ async def test_an_unknown_sort_key_is_refused_not_interpolated(client):
 async def test_an_unknown_direction_is_refused(client):
     r = await client.get("/api/trades", params={"sort": "realized", "dir": "sideways"})
     assert r.status_code == 422
+
+
+def test_the_order_by_fragment_always_ends_in_a_unique_tiebreaker():
+    """Structural, because the behavioural test above cannot prove this.
+
+    Rows that compare equal have no defined order without a unique tiebreaker,
+    so paging through ties can show one trade twice and skip another. But that
+    is a *may*, not a *must*: on a table this small Postgres returns a
+    consistent order anyway, and the paging test passes with the tiebreaker
+    removed. Asserting on the generated SQL is the only check here that
+    actually goes red when `t.id` is dropped."""
+    from db.trades import _TRADE_SORTS, _trade_order_by
+
+    for key in _TRADE_SORTS:
+        for direction in ("asc", "desc"):
+            frag = _trade_order_by(key, direction)
+            assert frag.rstrip().endswith("t.id"), f"{key}/{direction} has no tiebreaker: {frag}"
+            assert "NULLS LAST" in frag, f"{key}/{direction} would sort NULLs first on asc"
+
+
+def test_the_order_by_whitelist_refuses_anything_it_does_not_know():
+    """The db layer guards independently of FastAPI's Literal. cli.py and the
+    tests call query_trades directly, so a check that lives only at the HTTP
+    edge protects only HTTP callers."""
+    import pytest as _pytest
+
+    from db.trades import _trade_order_by
+
+    for bad in ("t.id; DROP TABLE trade", "opened_at", "", "1", "symbol) --"):
+        with _pytest.raises(ValueError, match="unsortable"):
+            _trade_order_by(bad, "asc")
+    with _pytest.raises(ValueError, match="direction"):
+        _trade_order_by("opened", "asc; DROP TABLE trade")
