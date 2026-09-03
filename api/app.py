@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import pathlib
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 
 from api.accounts import router as accounts_router
 from api.dashboard import router as dashboard_router
@@ -25,6 +25,13 @@ from api.serialization import DeadbandJSONResponse
 from api.trades import router as trades_router
 
 _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
+
+# `no-cache` does NOT mean "do not store" -- it means "revalidate before
+# reusing". index.html is the one document that names the content-hashed
+# bundles, so serving a stale copy pins the whole app to a previous deploy.
+# Revalidation is cheap: FileResponse already sends an ETag, so an unchanged
+# file costs a 304 with no body.
+_NO_CACHE = {"cache-control": "no-cache"}
 
 
 def create_app(enable_writes: bool | None = None) -> FastAPI:
@@ -87,13 +94,57 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
         from fastapi.responses import FileResponse
         from fastapi.staticfiles import StaticFiles
 
-        app.mount("/assets", StaticFiles(directory=_WEB_DIST / "assets"), name="assets")
+        class _ImmutableAssets(StaticFiles):
+            """Vite writes content-hashed filenames into /assets, so a given
+            URL's bytes can never change -- a new build produces a new name.
+            They are therefore safe to cache forever, and `immutable` tells the
+            browser not to even revalidate.
+
+            Without any Cache-Control at all (the previous behaviour) browsers
+            fall back to HEURISTIC caching, roughly a tenth of the age since
+            Last-Modified. That is the worse half of both worlds: assets that
+            could be cached for a year are re-fetched, and index.html -- which
+            must never be cached -- is served stale, pointing at a bundle from
+            the previous deploy. A deploy then appeared not to land until a
+            manual hard refresh.
+            """
+
+            def file_response(self, *args, **kwargs):
+                response = super().file_response(*args, **kwargs)
+                response.headers["cache-control"] = "public, max-age=31536000, immutable"
+                return response
+
+        app.mount("/assets", _ImmutableAssets(directory=_WEB_DIST / "assets"), name="assets")
 
         # SPA fallback, not StaticFiles(html=True): the client router owns
         # /trades and friends, so a refresh there must serve index.html
         # rather than 404. Registered last -- every /api route wins first.
+        def _maybe_304(request, response):
+            """Honour If-None-Match on the SPA fallback.
+
+            `no-cache` on index.html is only affordable because the
+            revalidation it forces can come back empty. Starlette's
+            FileResponse SETS an ETag but does not CHECK the request's
+            If-None-Match -- only StaticFiles does that -- so without this the
+            browser would re-download the whole document on every navigation
+            rather than getting a bodyless 304. Small document, but the
+            comment above claimed a cheap revalidation and this is what makes
+            that claim true.
+            """
+            # The stat_result is passed at construction below precisely so
+            # this header exists here: Starlette's FileResponse otherwise sets
+            # it lazily during __call__, by which point the response has been
+            # returned and there is nothing left to intercept.
+            etag = response.headers.get("etag")
+            if etag and request.headers.get("if-none-match") == etag:
+                return Response(
+                    status_code=304,
+                    headers={"etag": etag, "cache-control": _NO_CACHE["cache-control"]},
+                )
+            return response
+
         @app.get("/{path:path}", include_in_schema=False)
-        async def spa(path: str) -> FileResponse:
+        async def spa(request: Request, path: str):
             # Containment is structural, not a substring check. pathlib's `/`
             # operator DISCARDS the left side when the right is absolute, so
             # a request for `//etc/hostname` used to make `path` the string
@@ -111,8 +162,16 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
                 candidate = (_WEB_DIST / path).resolve()
                 root = _WEB_DIST.resolve()
                 if candidate.is_relative_to(root) and candidate.is_file():
-                    return FileResponse(candidate)
-            return FileResponse(_WEB_DIST / "index.html")
+                    return _maybe_304(
+                        request,
+                        FileResponse(
+                            candidate, headers=_NO_CACHE, stat_result=candidate.stat()
+                        ),
+                    )
+            index = _WEB_DIST / "index.html"
+            return _maybe_304(
+                request, FileResponse(index, headers=_NO_CACHE, stat_result=index.stat())
+            )
 
     return app
 
