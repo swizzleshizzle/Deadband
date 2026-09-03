@@ -372,3 +372,21 @@ tbody tr.rowlink:hover td { background: var(--surface); }
 .compare { width: 100%; margin: 1rem 0; }
 .compare th[scope='row'] { text-align: left; font-weight: normal; }
 .warn { border-left: 3px solid var(--warn, #b8860b); padding-left: 0.75rem; margin: 0.75rem 0; }
+
+/* Sortable column headers. The header IS the button so the whole cell is the
+   hit target; without this it inherits button chrome and stops looking like a
+   table head. */
+thead th button.sort {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 0.35em;
+  align-items: baseline;
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+thead th button.sort:hover { color: var(--fg, #e8e8e8); text-decoration: underline; }
+thead th button.sort:focus-visible { outline: 1px solid currentColor; outline-offset: 2px; }
+/* Fixed-width so the arrow appearing does not shift the column heading. */
+thead th .arrow { width: 1em; display: inline-block; font-size: 0.85em; opacity: 0.8; }
