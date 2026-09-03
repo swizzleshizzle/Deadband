@@ -14,14 +14,29 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
-from api.deps import get_conn
+from api.deps import get_conn, get_write_conn
+from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
-from db.accounts import account_rollups, funded_rule, get_account, list_accounts
+from db.accounts import (
+    account_rollups,
+    funded_rule,
+    get_account,
+    list_accounts,
+    rename_account,
+)
 from db.cash import MixedCurrencyError, account_cash
 from db.positions import open_positions
 
 router = APIRouter()
+# A SECOND router, registered by api/app.py only when writes are enabled. The
+# read router above is registered unconditionally, so hanging a write route off
+# it would put a write on the published read-only instance and trip the
+# method/pool guard in tests/api/test_write_pool.py. Same module, because the
+# account read and write shapes belong together; different router, because
+# their exposure does not.
+write_router = APIRouter()
 
 # external_ref is excluded from both responses on purpose. It carries the real
 # venue account number, and while this API binds localhost, it is served to a
@@ -105,3 +120,28 @@ async def account_detail(
             "open_positions": positions,
         }
     )
+
+
+class AccountPatch(BaseModel):
+    name: str
+
+
+@write_router.patch("/api/accounts/{account_id}")
+async def patch_account(
+    account_id: UUID,
+    body: AccountPatch,
+    # Identity before get_write_conn -- see api/fills.py's create_fills for why
+    # the ORDER matters, not just that both are present.
+    _identity: str = Depends(require_trusted_identity),
+    conn: asyncpg.Connection = Depends(get_write_conn),
+) -> DeadbandJSONResponse:
+    """Rename an account. Accounts arrive from an import named after their
+    number, which says nothing about what the account is for."""
+    if await get_account(conn, account_id) is None:
+        raise HTTPException(404, "account not found")
+    try:
+        await rename_account(conn, account_id, body.name)
+    except ValueError as exc:
+        raise HTTPException(422, f"name: {exc}") from None
+    row = await get_account(conn, account_id)
+    return DeadbandJSONResponse({"id": row["id"], "name": row["name"]})
