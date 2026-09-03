@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   commitImport, createFills, deleteFill, fetchAccounts, previewImport,
   type AccountSummary, type FillLegIn, type ImportCommitReport, type PreviewReport,
@@ -58,7 +59,12 @@ function legIndexFromError(msg: string): number | null {
 }
 
 export default function Entry() {
-  const [mode, setMode] = useState<'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'>('import')
+  // Which tab is open lives in the URL, matching the Trades screen: it makes
+  // a tab linkable, so the Dashboard's "record marks" prompt can land on the
+  // marks form instead of dumping you on import and leaving you to find it.
+  const [params, setParams] = useSearchParams()
+  const mode = (params.get('tab') ?? 'import') as
+    'fill' | 'multileg' | 'import' | 'marks' | 'snapshot'
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [account, setAccount] = useState('')
   const [executedAt, setExecutedAt] = useState('')
@@ -109,6 +115,15 @@ export default function Entry() {
       .then((r) => { setAccounts(r.accounts); setAccount((a) => a || r.accounts[0]?.id || '') })
       .catch(() => setAccounts([]))
   }, [])
+
+  function setMode(m: string) {
+    const next = new URLSearchParams(params)
+    // `import` is the default view, so it needs no parameter -- keeps the
+    // plain /entry URL clean rather than always carrying ?tab=import.
+    if (m === 'import') next.delete('tab')
+    else next.set('tab', m)
+    setParams(next, { replace: true })
+  }
 
   function switchMode(m: 'fill' | 'multileg' | 'import' | 'marks' | 'snapshot') {
     // Switching mid-typing shouldn't leave a stale error from the other

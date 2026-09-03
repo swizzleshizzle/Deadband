@@ -408,3 +408,13 @@ button.rename-open {
    without a mouse. */
 tr:hover button.rename-open, tr:focus-within button.rename-open { opacity: 0.7; }
 button.rename-open:hover, button.rename-open:focus-visible { opacity: 1; }
+
+/* The unvaluable notice. The bulk case ("no mark recorded") is one line plus
+   a symbol run, rather than one bordered row per holding -- at 43 holdings
+   that list was taller than the positions table it annotated. */
+.why .symbols {
+  margin-top: 0.35em;
+  font-size: 0.85em;
+  line-height: 1.6;
+  word-break: break-word;
+}
