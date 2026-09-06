@@ -1631,3 +1631,104 @@ async def test_regroup_without_transfers_leaves_qty_transferred_null(conn):
     await regroup_account(conn, acc)
     trades = await list_trades(conn, acc)
     assert trades[0]["qty_transferred"] is None
+
+
+async def test_an_expired_long_option_realizes_the_whole_premium_as_a_loss(conn):
+    """The bug this file gained a test for on 2026-09-06.
+
+    A long option that expires worthless is closed at price zero, so the
+    realized P&L is the entire premium paid, as a loss. Nothing subtle --
+    but it was reported as exactly 0.00 for 31 real trades, because the
+    importer booked the expiry with the wrong SIDE: negative Quantity was
+    read as "a short position" and turned into a BUY, which ADDED free
+    contracts rather than closing anything. The position then never closed,
+    so no P&L was ever realized.
+
+    Tested here rather than only in the importer because the importer test
+    can only prove which side was emitted. This proves the number the user
+    actually sees, through grouping and P&L, which is where the complaint
+    came from.
+
+    Two contracts at 0.50 with a multiplier of 100 is 100.00 of premium.
+    """
+    acc = await create_account(conn, name="Opt", venue="manual", account_type="cash")
+    opt = await upsert_instrument(
+        conn,
+        Instrument(
+            id=None,
+            asset_class=AssetClass.OPTION,
+            symbol="-ZXCO261121C500",
+            quote_currency="USD",
+            underlying="ZXCO",
+            strike=Decimal("500"),
+            expiry=date(2026, 11, 21),
+            option_right="call",
+            contract_multiplier=Decimal("100"),
+        ),
+    )
+
+    def f(side, qty, price, minutes, ref):
+        return Fill(
+            id=uuid4(), account_id=acc, instrument_id=opt,
+            executed_at=T0 + timedelta(minutes=minutes), side=side,
+            quantity=Decimal(qty), price=Decimal(price), fee=Decimal("0"),
+            fee_currency="USD", source=FillSource.MANUAL, venue_fill_id=ref,
+            is_estimated=False,
+        )
+
+    await insert_fills(
+        conn,
+        [
+            f(Side.BUY, "2", "0.50", 0, "open"),
+            # The expiry, as the importer now emits it: a SELL at zero.
+            f(Side.SELL, "2", "0", 60, "expiry"),
+        ],
+    )
+    await regroup_account(conn, acc)
+
+    (trade,) = await list_trades(conn, acc)
+    assert trade["status"] == "closed", "an expired option must not stay open"
+    assert trade["qty_closed"] == Decimal(2)
+    assert trade["avg_exit"] == Decimal(0)
+    # The whole premium, lost. Not 0.00, which is what the bug reported.
+    assert trade["realized_pnl"] == Decimal("-100.00")
+
+
+async def test_an_expiry_booked_as_a_buy_leaves_the_position_open(conn):
+    """The shape of the bug, pinned so the regression is recognisable.
+
+    With the expiry booked as a BUY at zero -- what the importer produced
+    before the fix -- the contracts are ADDED at no cost. The position stays
+    open, realized P&L stays 0, and avg_entry is dragged down by the free
+    contracts. Every symptom the user reported follows from this one row.
+    """
+    acc = await create_account(conn, name="OptBug", venue="manual", account_type="cash")
+    opt = await upsert_instrument(
+        conn,
+        Instrument(
+            id=None, asset_class=AssetClass.OPTION, symbol="-ZXCO261121C501",
+            quote_currency="USD", underlying="ZXCO", strike=Decimal("501"),
+            expiry=date(2026, 11, 21), option_right="call", contract_multiplier=Decimal("100"),
+        ),
+    )
+
+    def f(side, qty, price, minutes, ref):
+        return Fill(
+            id=uuid4(), account_id=acc, instrument_id=opt,
+            executed_at=T0 + timedelta(minutes=minutes), side=side,
+            quantity=Decimal(qty), price=Decimal(price), fee=Decimal("0"),
+            fee_currency="USD", source=FillSource.MANUAL, venue_fill_id=ref,
+            is_estimated=False,
+        )
+
+    await insert_fills(
+        conn,
+        [f(Side.BUY, "2", "0.50", 0, "open"), f(Side.BUY, "2", "0", 60, "wrong")],
+    )
+    await regroup_account(conn, acc)
+
+    (trade,) = await list_trades(conn, acc)
+    assert trade["status"] == "open"
+    assert trade["realized_pnl"] == Decimal(0)
+    assert trade["qty_opened"] == Decimal(4), "the free contracts inflate the position"
+    assert trade["avg_entry"] == Decimal("0.25"), "and halve the average entry"

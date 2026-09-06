@@ -550,6 +550,22 @@ def test_an_expired_short_call_closes_and_realises_its_premium():
     recorded: the short stayed open forever, was valued as a liability that
     did not exist, and its premium was never realised.
 
+    NOTE on the fixture's expiry Quantity, corrected 2026-09-06 from -1 to +1.
+    Quantity on an EXPIRED row is the position DELTA -- what left the account.
+    A long closing shows NEGATIVE (evidenced by all 27 expiry rows in five
+    years of real exports, every one of them negative against a long
+    position); a short closing therefore shows POSITIVE, because the
+    contracts come back.
+
+    That second half is REASONED, NOT OBSERVED. The real data contains 133
+    long option opens and exactly one short, and that short was closed by
+    buying it back rather than by expiring -- so no short has ever expired and
+    the sign convention for one is unverified. The owner chose the delta
+    convention over blocking the import (see known-gaps). If Fidelity instead
+    writes a negative quantity on EVERY expiry regardless of direction, this
+    row and the branch it exercises are both wrong, and a real short expiry is
+    what will show it. Do not "correct" this back to -1 without one.
+
     This test pins the PARSED SHAPE only -- sides, prices, dates, quantities.
     That the two fills actually group into one closed trade, and that the
     trade realises the premium, is
