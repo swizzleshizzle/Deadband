@@ -997,23 +997,52 @@ def test_the_actual_trailing_disclaimer_line_still_does_not_block_after_the_fix(
 def test_expired_short_call_closes_with_a_buy_at_zero():
     """The row describes the POSITION being removed, not a trade direction.
     A negative quantity is a short, and a short is closed by buying it back.
-    Reading the sign as a side would open a second short instead of closing
-    the first, and the phantom would never go away."""
+    CORRECTED 2026-09-06. This test previously asserted Side.BUY, following
+    the design doc's claim that Quantity is "negative for a short position,
+    positive for a long one". That claim is FALSE, and the code, this test and
+    the spec all encoded it together, so nothing caught it.
+
+    Checked against every EXPIRED row in five years of real exports: 27 of 27
+    carry a NEGATIVE quantity while the position built from the account's own
+    BOUGHT/SOLD rows is LONG. Zero rows agree with the spec. There are no
+    positive expiry quantities in the data at all, so the "+2" the spec cites
+    as an observed long was never received from the broker -- exactly the
+    "modelling from documentation rather than from a row actually received"
+    that decision E1's own rationale warns produces wrong fixtures.
+
+    Quantity on an EXPIRED row is the position DELTA: what left the account.
+    Negative means contracts went away, which closes a long -- a SELL.
+
+    The cost of getting this backwards was not subtle: a long option expiring
+    was recorded as a BUY at zero, so it ADDED contracts at no cost instead of
+    closing the position. 31 trades sat past their expiry still marked open,
+    each reporting exactly 0 realized P&L instead of the loss actually taken,
+    and the phantom zero-cost contracts dragged avg_entry down as well."""
     header = FIXTURE.splitlines()[0]
     row = header + "\n11/24/2026,X1,EXPIRED CALL (ZXCO) ZXCO CORP,-ZXCO261121C500,,-1,,,,0.00\n"
     result = FidelityImporter().parse(row)
     (fill,) = result.fills
-    assert fill.side is Side.BUY
+    assert fill.side is Side.SELL
     assert fill.quantity == Decimal(1)
     assert fill.price == Decimal(0)
 
 
-def test_expired_long_put_closes_with_a_sell_at_zero():
+def test_expired_short_position_closes_with_a_buy_at_zero():
+    """The mirror of the case above, and the reason the sign is read at all
+    rather than hardcoding SELL.
+
+    A POSITIVE quantity means contracts arrived, which closes a short -- a
+    BUY. Flagged honestly: **no positive expiry quantity appears anywhere in
+    the real exports** (0 of 27), so unlike its sibling this direction is
+    reasoned from the delta convention rather than observed. It is kept
+    because hardcoding SELL would silently mishandle a short expiry the first
+    time one occurs, and a wrong answer there is the same failure this whole
+    fix is correcting. If a real one ever arrives, check it against this."""
     header = FIXTURE.splitlines()[0]
     row = header + "\n11/24/2026,X1,EXPIRED PUT (ZXCO) ZXCO CORP,-ZXCO261121P10,,2,,,,0.00\n"
     result = FidelityImporter().parse(row)
     (fill,) = result.fills
-    assert fill.side is Side.SELL
+    assert fill.side is Side.BUY
     assert fill.quantity == Decimal(2)
 
 

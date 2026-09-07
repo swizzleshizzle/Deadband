@@ -1199,11 +1199,27 @@ class FidelityImporter:
                 )
                 return
 
-            # The row describes the POSITION being removed, not a trade
-            # direction -- there is no verb here to read a side from. A short
-            # (negative) position is closed by buying it back, a long one by
-            # selling it.
-            side = Side.BUY if raw_qty < 0 else Side.SELL
+            # The row describes what LEFT the account, not a trade direction --
+            # there is no verb here to read a side from. Quantity is the
+            # position DELTA: negative means contracts went away, which closes
+            # a long (a SELL); positive means they arrived, closing a short (a
+            # BUY).
+            #
+            # CORRECTED 2026-09-06, and worth the space because the wrong
+            # version survived a spec, an implementation and two tests that
+            # all agreed with each other. The design doc asserted Quantity was
+            # "negative for a short position, positive for a long one" and this
+            # line implemented that faithfully. Checked against every EXPIRED
+            # row in five years of real exports: 27 of 27 are NEGATIVE against
+            # a position the account's own BOUGHT/SOLD rows show is LONG. None
+            # agree with the old reading.
+            #
+            # Getting it backwards meant a long option expiring was booked as a
+            # BUY at zero, ADDING free contracts instead of closing anything:
+            # 31 trades sat past expiry still marked open, each realizing 0
+            # instead of the loss actually taken, with avg_entry diluted by the
+            # phantom contracts on top.
+            side = Side.SELL if raw_qty < 0 else Side.BUY
 
             # The option's own expiry, NOT `Run Date`. In the real export
             # this fix was built from, Fidelity booked a Friday expiry the
