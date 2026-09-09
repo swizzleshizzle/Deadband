@@ -34,9 +34,28 @@ _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
 _NO_CACHE = {"cache-control": "no-cache"}
 
 
+# Values of DEADBAND_ENABLE_WRITES that turn the write surface ON. Everything
+# else -- "0", "false", a typo, whitespace -- leaves it off.
+#
+# This used to be `bool(os.environ.get(...))`, which treats every non-empty
+# string as true, so `DEADBAND_ENABLE_WRITES=0` and `=false` both ENABLED
+# writes (known-gap #61). An operator zeroing the value to shut writes off got
+# the exact opposite of what they asked for, silently.
+#
+# Unrecognised values disable rather than raise. Writes are opt-in, so off is
+# the safe direction to fail, and a startup exception would take reads down
+# with them -- a mistyped flag should degrade this to a read-only instance,
+# which is visible immediately in the UI, not to no instance at all.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _writes_enabled_in_environment() -> bool:
+    return os.environ.get("DEADBAND_ENABLE_WRITES", "").strip().lower() in _TRUTHY
+
+
 def create_app(enable_writes: bool | None = None) -> FastAPI:
     if enable_writes is None:
-        enable_writes = bool(os.environ.get("DEADBAND_ENABLE_WRITES"))
+        enable_writes = _writes_enabled_in_environment()
     app = FastAPI(
         title="deadband",
         default_response_class=DeadbandJSONResponse,

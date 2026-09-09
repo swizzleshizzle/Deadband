@@ -9,6 +9,13 @@ narrower: registration-level gating -- with the flag absent or empty, no
 write route is registered at all; with it set, the write routes appear (and
 an explicit `enable_writes` argument overrides the environment either way).
 
+The flag is also parsed rather than merely tested for emptiness. Until
+2026-09-09 it was `bool(os.environ.get(...))`, so `=0` and `=false` both read
+as ENABLED -- an operator zeroing the value to turn writes off got the exact
+opposite (known-gap #61). Only an affirmative token enables writes now, and
+anything unrecognised disables them, because for an opt-in flag the safe
+direction to fail is off.
+
 Note what is deliberately NOT tested, here or anywhere in this codebase: a
 source-address check. The deployment proxies every path to the local port, so
 the proxy is the client and request.client.host reads 127.0.0.1 for remote
@@ -16,6 +23,7 @@ callers -- such a check would pass for exactly the requests it exists to
 stop.
 """
 
+import pytest
 from fastapi.routing import APIRoute, iter_route_contexts
 
 from api.app import create_app
@@ -53,3 +61,32 @@ def test_writes_are_present_when_enabled(monkeypatch):
 def test_explicit_argument_overrides_the_environment(monkeypatch):
     monkeypatch.setenv("DEADBAND_ENABLE_WRITES", "1")
     assert _write_paths(create_app(enable_writes=False)) == set()
+
+
+# --- gap #61: the flag is parsed, not merely tested for emptiness ----------
+#
+# Every case below passes vacuously under the old `bool(os.environ.get(...))`
+# for the DISABLING half only -- which is the half that matters, since that
+# implementation read all of these as enabled. Restoring it turns every
+# `_DISABLING` case red.
+
+_DISABLING = ["0", "false", "False", "FALSE", "no", "off", "OFF", "  0  ", "banana", "  "]
+_ENABLING = ["1", "true", "True", "TRUE", "yes", "on", "ON", "  1  ", "\tyes\n"]
+
+
+@pytest.mark.parametrize("value", _DISABLING)
+def test_a_negative_or_unrecognised_flag_leaves_writes_absent(monkeypatch, value):
+    """`=0` meaning "enabled" was the actual defect. Anything unrecognised
+    joins it on the disabled side: writes are opt-in, so an unparseable value
+    must not be the thing that opens them."""
+    monkeypatch.setenv("DEADBAND_ENABLE_WRITES", value)
+    assert _write_paths(create_app()) == set()
+
+
+@pytest.mark.parametrize("value", _ENABLING)
+def test_an_affirmative_flag_registers_the_write_routes(monkeypatch, value):
+    """The other half of the guard: narrowing what counts as enabled must not
+    have narrowed it to nothing. Without this, deleting the affirmative set
+    entirely would still leave the tests above green."""
+    monkeypatch.setenv("DEADBAND_ENABLE_WRITES", value)
+    assert "/api/fills" in _write_paths(create_app())
