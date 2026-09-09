@@ -32,6 +32,23 @@ extend-exclude = ["docs"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.flake8-bugbear]
+# `def route(conn = Depends(get_conn))` is how FastAPI declares a dependency,
+# and B008 (function-call-in-default-argument) flags every one of them -- 17
+# across api/ as of 2026-09-09. Naming those calls immutable is narrower than
+# ignoring B008, which would also stop catching what the rule is actually for:
+# a genuinely mutable or time-varying default like `def f(x=[])` or
+# `def f(t=datetime.now())`. Those still fail.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

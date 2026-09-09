@@ -10,6 +10,11 @@ export default function AccountDetailScreen() {
 
   useEffect(() => {
     if (!id) return
+    // Clearing on id change is the point: without it, navigating between two
+    // accounts shows the PREVIOUS account's numbers under the new account's
+    // name until the fetch lands. That is the one failure mode a ledger screen
+    // must not have, so this stays an effect rather than derived state.
+    // oxlint-disable-next-line react/set-state-in-effect
     setData(null)
     fetchAccountDetail(id)
       .then(setData)

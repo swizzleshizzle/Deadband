@@ -90,6 +90,8 @@ def require_trusted_identity(request: Request) -> str:
 
     normalized = login.strip().lower()
     if normalized not in allowlist:
-        raise HTTPException(status_code=403, detail="Caller is not on the trusted-identity allowlist")
+        raise HTTPException(
+            status_code=403, detail="Caller is not on the trusted-identity allowlist"
+        )
 
     return normalized

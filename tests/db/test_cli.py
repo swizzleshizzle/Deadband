@@ -8,6 +8,7 @@ import pathlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -4844,10 +4845,11 @@ _ACAT_HISTORY_CSV = (
 
 
 async def _seed_zxco_position(conn, acc):
+    from uuid import uuid4 as _u
+
     from db.fills import insert_fills
     from db.instruments import upsert_instrument
     from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
-    from uuid import uuid4 as _u
 
     inst = await upsert_instrument(
         conn,
@@ -4927,9 +4929,10 @@ async def test_cmd_import_transfer_without_position_fails_cleanly(
 
 
 async def test_cmd_transfers_lists_a_transfer(conn, monkeypatch, capsys):
+    from uuid import uuid4 as _u
+
     from db.transfers import insert_transfers
     from ledger.types import AssetTransfer
-    from uuid import uuid4 as _u
 
     acc = await create_account(conn, name="TL", venue="fidelity", account_type="cash")
     await _seed_zxco_position(conn, acc)
@@ -4977,9 +4980,10 @@ async def test_cmd_regroup_transfer_error_is_a_clean_exit_2(conn, monkeypatch, c
     """cmd_import already refuses a transfer the ledger cannot honour with a
     clean exit 2; cmd_regroup hits the same TransferError through the same
     regroup_account and must not dump a traceback instead."""
+    from uuid import uuid4 as _u
+
     from db.transfers import insert_transfers
     from ledger.types import AssetTransfer
-    from uuid import uuid4 as _u
 
     acc = await create_account(conn, name="RG", venue="fidelity", account_type="cash")
     inst = await conn.fetchval(
@@ -5017,9 +5021,10 @@ async def test_cmd_corporate_add_transfer_conflict_refuses_cleanly(
     apply (fills rescale, the post-ex transfer does not). The refusal must be
     a clean exit 2 with the action rolled back -- not a TransferError
     traceback out of _regroup_holders with a half-explained rollback."""
+    from uuid import uuid4 as _u
+
     from db.transfers import insert_transfers
     from ledger.types import AssetTransfer
-    from uuid import uuid4 as _u
 
     acc = await create_account(conn, name="CC", venue="fidelity", account_type="cash")
     inst = await conn.fetchval(
@@ -5069,9 +5074,10 @@ async def test_cmd_corporate_add_transfer_conflict_refuses_cleanly(
 
 
 async def _seed_fill(conn, acc, inst, *, qty, price, at):
+    from uuid import uuid4 as _u
+
     from db.fills import insert_fills
     from ledger.types import Fill, FillSource, Side
-    from uuid import uuid4 as _u
 
     await insert_fills(
         conn,
@@ -5103,8 +5109,6 @@ async def _seed_fill(conn, acc, inst, *, qty, price, at):
 # non-None venue_fill_id/content_hash; `rm` wraps delete_manual_fill, which
 # returns False for an imported fill (the source='manual' check lives in its
 # own WHERE clause, so it can't be bypassed by a caller that forgets it).
-
-from types import SimpleNamespace
 
 
 def _fills_add_args(*, account, symbol, side="buy", quantity="5", price="20",

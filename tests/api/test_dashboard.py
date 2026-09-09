@@ -6,7 +6,6 @@ from decimal import Decimal
 from uuid import uuid4
 
 from db.accounts import create_account
-from db.cash import account_cash
 from db.fills import insert_fills
 from db.instruments import upsert_instrument
 from db.marks import set_mark

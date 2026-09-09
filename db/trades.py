@@ -13,6 +13,7 @@ from db.accounts import UnknownAccountError, get_account
 from db.corporate import actions_with_ids_for_instruments
 from db.fills import fetch_fills
 from db.instruments import get_multipliers
+from db.transfers import fetch_transfers
 
 # `_spinoff_fill_id` is private by name, but this is the allowed import direction
 # (db -> ledger; the purity test only forbids the reverse), and inverting this
@@ -26,7 +27,6 @@ from ledger.corporate import (
     adjust_transfers,
 )
 from ledger.grouping import group_fills
-from db.transfers import fetch_transfers
 from ledger.pnl import compute_pnl
 from ledger.types import TradeIntent
 

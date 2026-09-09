@@ -50,6 +50,10 @@ export default function Trades() {
   }, [params, offset, sortKey, sortDir])
 
   useEffect(() => {
+    // Same reasoning as AccountDetail: without this, changing a filter or sort
+    // leaves the previous result set on screen under the new controls, which
+    // reads as "these are your matching trades" and is not.
+    // oxlint-disable-next-line react/set-state-in-effect
     setPage(null)
     fetchTrades(query).then(setPage).catch((e) => setError(String(e)))
   }, [query])

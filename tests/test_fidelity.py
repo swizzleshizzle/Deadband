@@ -777,7 +777,9 @@ def test_a_sweep_symbol_priced_far_from_par_warns():
     set has acquired a non-sweep symbol or a sweep has broken the buck -- both
     need a human, and neither should pass unremarked."""
     header = FIXTURE.splitlines()[0]
-    row = header + "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
+    row = header + (
+        "\n06/01/2026,X1,REINVESTMENT MM (SPAXX) (CASH),SPAXX,MM,10,1.40,0.00,0.00,-14.00\n"
+    )
     result = FidelityImporter().parse(row)
     assert any("sweep" in w.lower() and "SPAXX" in w for w in result.warnings)
 
@@ -788,7 +790,9 @@ def test_an_unlisted_symbol_reinvesting_at_par_warns_the_set_may_be_stale():
     net cash nets to zero and a phantom position appears, silently. The warning is
     the only thing that surfaces a missing ticker."""
     header = FIXTURE.splitlines()[0]
-    row = header + "\n06/01/2026,X1,REINVESTMENT MM (NEWSW) (CASH),NEWSW,MM,10,1.00,0.00,0.00,-10.00\n"
+    row = header + (
+        "\n06/01/2026,X1,REINVESTMENT MM (NEWSW) (CASH),NEWSW,MM,10,1.00,0.00,0.00,-10.00\n"
+    )
     result = FidelityImporter().parse(row)
     assert any("NEWSW" in w for w in result.warnings)
 
