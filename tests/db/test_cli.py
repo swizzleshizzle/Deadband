@@ -3648,8 +3648,25 @@ async def test_the_spinoff_ratio_is_left_blank_when_the_account_is_short(
     out = capsys.readouterr().out
     assert "ratio: UNAVAILABLE" in out
     assert "holds no LONG position" in out
-    assert "-100" not in out
     assert "--ratio <FILL IN>" in out
+
+    # The account UUID is interpolated into the very message under test, so a
+    # raw substring scan for "-100" also scanned the id -- and about 1 in 2,073
+    # uuid4 renderings contains "-100", which is issue #18's latent flake.
+    # Scrub the id first: same assertion about the SHORT holding, no lottery.
+    # Verified by mutation, not assumed: with `HAVING SUM(...) <> 0` this run
+    # prints `ratio: 3:-5 (derived from the ledger: 60 child share(s) against
+    # -100 ZXQ share(s) held at ...)`. So the ratio itself renders REDUCED, not
+    # as the `60:-100` this test's docstring describes -- but the raw -100
+    # survives in the derivation note, which is what this assertion catches.
+    # Once the account id is scrubbed, the SELL quantity is the only place it
+    # can come from.
+    #
+    # A regex over the whole ratio line was tried instead and rejected: the
+    # UNAVAILABLE reason legitimately carries an ex-date, so `-\d` matches
+    # 2026-03-15 and the assertion fires on correct output.
+    scrubbed = out.replace(str(acc), "<account-id>")
+    assert "-100" not in scrubbed
 
 
 # --- Task 3: the split ratio completed from the ledger ---------------------
