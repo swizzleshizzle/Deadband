@@ -458,7 +458,7 @@ class _CorporateActionRow:
 
 
 def _group_corporate_actions(
-    rows: list["_CorporateActionRow"],
+    rows: list[_CorporateActionRow],
 ) -> tuple[tuple[CorporateActionProposal, ...], tuple[str, ...]]:
     """Group recognised corporate-action rows into proposals on the venue's
     own #REOR reference (spec §5), preserving first-seen order. A row with no
@@ -541,7 +541,7 @@ def _group_corporate_actions(
 
 
 def _derive_cusip_pair(
-    group_rows: list["_CorporateActionRow"],
+    group_rows: list[_CorporateActionRow],
 ) -> tuple[str | None, str | None]:
     """source_cusip (the entity given up) and resulting_cusip (the entity
     received), read from each row's OWN paren-adjacent cusip token (see
@@ -618,7 +618,7 @@ def _reduce_ratio(new_qty: Decimal, old_qty: Decimal) -> tuple[Decimal, Decimal]
 
 
 def _derive_quantity_ratio(
-    group_rows: list["_CorporateActionRow"],
+    group_rows: list[_CorporateActionRow],
 ) -> tuple[Decimal, Decimal] | None:
     """(new, old), reduced -- the direction adjust_fills consumes, and the
     direction the "1 FOR 3" idiom itself uses (1 new FOR 3 old). Only
@@ -662,7 +662,7 @@ def _derive_quantity_ratio(
 
 def _derive_ratio(
     kind: str,
-    group_rows: list["_CorporateActionRow"],
+    group_rows: list[_CorporateActionRow],
     description: str,
     lines: str,
 ) -> tuple[

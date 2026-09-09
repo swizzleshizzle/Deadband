@@ -337,7 +337,7 @@ class ImportBatch:
     # clean and silently drops those rows from probing or commit -- the
     # transfers field needed edits at ~10 scattered sites when it landed.
 
-    def unrouted(self) -> "ImportBatch":
+    def unrouted(self) -> ImportBatch:
         """Rows with no per-row account ref (History-dialect files carry
         none); they route only via --account."""
         return ImportBatch(
@@ -350,7 +350,7 @@ class ImportBatch:
         """True when any committable row kind is present."""
         return bool(self.fills or self.cash or self.transfers)
 
-    def merge_rows(self, other: "ImportBatch") -> "ImportBatch":
+    def merge_rows(self, other: ImportBatch) -> ImportBatch:
         """Row kinds combined; report-only fields (warnings, blocking, ...)
         deliberately untouched -- merging happens after those are handled."""
         return ImportBatch(

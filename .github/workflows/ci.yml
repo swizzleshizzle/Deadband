@@ -49,6 +49,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --extra dev
 
+      # Added 2026-09-09. Until then CI ran no lint step at all (known-gap
+      # #74) and main had accumulated 41 findings. Runs BEFORE the suites so a
+      # formatting-only failure costs seconds rather than the DB lane's five
+      # minutes -- and after `uv sync`, because ruff is a dev dependency and
+      # this pins the version in uv.lock rather than whatever is newest.
+      - name: Lint
+        run: uv run ruff check .
+
       - name: Pure suite
         # tests/api is DB-gated despite living outside tests/db -- it belongs
         # to the DB lane below, where the skip guard covers it.
@@ -84,6 +92,15 @@ jobs:
       - name: Install
         working-directory: web
         run: pnpm install --frozen-lockfile
+      # `pnpm lint` alone exits 0 on warnings, so it would report without
+      # gating. --max-warnings 0 makes it a gate. The two pre-existing
+      # set-state-in-effect warnings are suppressed at their sites with the
+      # reasoning inline, rather than tolerated by a non-zero threshold that a
+      # later warning could quietly occupy.
+      - name: Lint
+        working-directory: web
+        run: pnpm exec oxlint --max-warnings 0
+
       - name: Typecheck and build
         working-directory: web
         run: pnpm build

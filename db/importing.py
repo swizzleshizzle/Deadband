@@ -18,9 +18,15 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from db.fills import insert_fills
-from db.transfers import insert_transfers
 from db.instruments import upsert_instrument
-from importers.base import CanonicalCash, CanonicalFill, CanonicalTransfer, ImportBatch, content_hash
+from db.transfers import insert_transfers
+from importers.base import (
+    CanonicalCash,
+    CanonicalFill,
+    CanonicalTransfer,
+    ImportBatch,
+    content_hash,
+)
 from ledger.types import AssetTransfer, Fill, FillSource
 
 

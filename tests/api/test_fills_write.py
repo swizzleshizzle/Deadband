@@ -49,7 +49,9 @@ async def test_post_fills_rolls_back_every_leg_when_one_is_invalid(client, conn)
 
 async def test_post_fills_renders_quantities_as_strings(client, conn):
     acc = await create_account(conn, name="ApiStrings", venue="manual", account_type="cash")
-    await client.post("/api/fills", json={"account_id": str(acc), "fills": [_leg(qty="0.00000001")]})
+    await client.post(
+        "/api/fills", json={"account_id": str(acc), "fills": [_leg(qty="0.00000001")]}
+    )
     got = await conn.fetchval("SELECT quantity FROM fill WHERE account_id = $1", acc)
     assert got == Decimal("0.00000001")
 
@@ -61,7 +63,9 @@ async def test_post_fills_404s_on_an_unknown_account(client):
 
 async def test_delete_fill_removes_a_manual_fill(client, conn):
     acc = await create_account(conn, name="ApiDelete", venue="manual", account_type="cash")
-    posted = (await client.post("/api/fills", json={"account_id": str(acc), "fills": [_leg()]})).json()
+    posted = (
+        await client.post("/api/fills", json={"account_id": str(acc), "fills": [_leg()]})
+    ).json()
     fill_id = posted["fill_ids"][0]
     assert (await client.delete(f"/api/fills/{fill_id}")).status_code == 204
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE account_id = $1", acc) == 0
@@ -69,6 +73,7 @@ async def test_delete_fill_removes_a_manual_fill(client, conn):
 
 async def test_delete_fill_409s_on_an_imported_fill(client, conn):
     from datetime import UTC, datetime
+
     from db.fills import insert_fills
     from db.instruments import upsert_instrument
     from ledger.types import AssetClass, Fill, FillSource, Instrument, Side

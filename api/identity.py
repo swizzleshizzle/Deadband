@@ -18,10 +18,12 @@ one would pass exactly the requests this dependency exists to stop, so
 neither is read here -- anywhere.
 
 `DEADBAND_TRUSTED_LOGINS` must fail closed: unset or empty means refuse,
-never "permit everyone". This is deliberately the opposite of
-`DEADBAND_ENABLE_WRITES` elsewhere in this codebase, whose `bool(os.environ
-.get(...))` treats `=0` as enabled (known-gap #61) -- that shape must not be
-repeated here.
+never "permit everyone". `DEADBAND_ENABLE_WRITES` used to be the cautionary
+example here, because `bool(os.environ.get(...))` read `=0` as enabled
+(known-gap #61); that was fixed on 2026-09-09 and both flags now fail in the
+safe direction. The shape itself is still the thing to avoid: an environment
+variable consulted for a security decision gets parsed, never merely tested
+for emptiness.
 
 Concretely: if a caller could sneak in their own copy of the header and have
 the proxy's copy sort second, `Headers.get` would silently return the
@@ -88,6 +90,8 @@ def require_trusted_identity(request: Request) -> str:
 
     normalized = login.strip().lower()
     if normalized not in allowlist:
-        raise HTTPException(status_code=403, detail="Caller is not on the trusted-identity allowlist")
+        raise HTTPException(
+            status_code=403, detail="Caller is not on the trusted-identity allowlist"
+        )
 
     return normalized
