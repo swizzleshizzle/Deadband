@@ -551,6 +551,11 @@ async def test_migration_005_is_safe_to_re_run(conn):
         "ALTER TABLE instrument VALIDATE CONSTRAINT instrument_symbol_not_blank"
     )
     await conn.execute(MIGRATION_005.read_text())
+    # And the file that actually re-runs on every deploy: apply() executes
+    # schema.sql unconditionally, so the guard there is the one that could
+    # quietly reset this. Testing only the migration file would miss it --
+    # the migration is recorded in schema_migrations and never runs twice.
+    await apply(conn)
 
     still_validated = await conn.fetchval(
         """SELECT convalidated FROM pg_constraint
