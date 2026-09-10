@@ -466,3 +466,104 @@ async def test_migration_004_survives_populated_rows_and_widens_the_kind_check(p
                     )
         finally:
             await tx.rollback()
+
+
+# --- migration 005: NOT VALID is what lets it reach a dirty database --------
+
+MIGRATION_005 = DB_DIR / "migrations" / "005_instrument_symbol_not_blank.sql"
+
+_BLANK_SYMBOL_ROW = """
+    INSERT INTO instrument (natural_key, asset_class, symbol, quote_currency)
+    VALUES ('legacy:blank::USD', 'equity', '', 'USD')
+"""
+
+
+async def test_migration_005_applies_to_a_database_holding_a_blank_symbol(conn):
+    """The production scenario, and the entire reason the constraint is added
+    NOT VALID rather than plain.
+
+    The live ledger still holds one instrument with symbol = '' (known-gap
+    #77: 17 fills across four securities, merged by the pre-#35 importer). A
+    validating ADD CONSTRAINT scans existing rows and would fail against it --
+    and `cli.py migrate` runs on EVERY deploy, so that is not one failed
+    migration, it is a permanently broken deploy path.
+
+    The migration file itself is read and executed here, not a paraphrase of
+    it: a hand-copied SQL string in a test certifies whatever the test author
+    typed, which is how a fixture in this repo once certified a row shape that
+    did not exist.
+    """
+    await conn.execute("ALTER TABLE instrument DROP CONSTRAINT instrument_symbol_not_blank")
+    await conn.execute(_BLANK_SYMBOL_ROW)
+
+    await conn.execute(MIGRATION_005.read_text())
+
+    validated = await conn.fetchval(
+        """SELECT convalidated FROM pg_constraint
+           WHERE conname = 'instrument_symbol_not_blank'
+             AND conrelid = 'instrument'::regclass"""
+    )
+    assert validated is False
+
+    # It applied over the bad row -- and it still enforces on new rows, which
+    # is the property that makes NOT VALID a real guard rather than a no-op.
+    # Savepoint: a constraint violation aborts the enclosing transaction, and
+    # this test keeps querying afterwards.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        async with conn.transaction():
+            await conn.execute(
+                """INSERT INTO instrument (natural_key, asset_class, symbol, quote_currency)
+                   VALUES ('new:blank::USD', 'equity', '', 'USD')"""
+            )
+
+    survivor = await conn.fetchval(
+        "SELECT symbol FROM instrument WHERE natural_key = 'legacy:blank::USD'"
+    )
+    assert survivor == "", "the legacy row must survive; repairing it needs owner input"
+
+
+async def test_a_validating_constraint_would_have_broken_the_deploy(conn):
+    """Proves the NOT VALID choice is load-bearing rather than decorative.
+
+    Without this, migration 005 could be 'tidied' into a plain ADD CONSTRAINT
+    and every test above would still pass -- they run against a test database
+    that has no blank-symbol row, so the scan finds nothing to reject. This is
+    the test that fails.
+    """
+    await conn.execute("ALTER TABLE instrument DROP CONSTRAINT instrument_symbol_not_blank")
+    await conn.execute(_BLANK_SYMBOL_ROW)
+
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            """ALTER TABLE instrument
+                   ADD CONSTRAINT instrument_symbol_not_blank
+                   CHECK (btrim(symbol) <> '')"""
+        )
+
+
+async def test_migration_005_is_safe_to_re_run(conn):
+    """schema.sql carries the same DO-block and re-runs on every deploy, so
+    re-application must be a no-op. The usual `DROP CONSTRAINT IF EXISTS` +
+    `ADD` pair would satisfy that too -- but it would also silently undo a
+    later VALIDATE CONSTRAINT on the next deploy, re-diverging from a fresh
+    install. This asserts the guard survives, validated state and all."""
+    await conn.execute(
+        "ALTER TABLE instrument VALIDATE CONSTRAINT instrument_symbol_not_blank"
+    )
+    await conn.execute(MIGRATION_005.read_text())
+    # And the file that actually re-runs on every deploy: apply() executes
+    # schema.sql unconditionally, so the guard there is the one that could
+    # quietly reset this. Testing only the migration file would miss it --
+    # the migration is recorded in schema_migrations and never runs twice.
+    await apply(conn)
+
+    still_validated = await conn.fetchval(
+        """SELECT convalidated FROM pg_constraint
+           WHERE conname = 'instrument_symbol_not_blank'
+             AND conrelid = 'instrument'::regclass"""
+    )
+    assert still_validated is True, (
+        "re-running the migration reset a validated constraint back to NOT "
+        "VALID -- schema.sql re-runs on every deploy, so this would undo the "
+        "eventual gap #77 closure silently"
+    )
