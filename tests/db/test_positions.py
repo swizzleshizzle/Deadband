@@ -244,11 +244,22 @@ async def test_a_trade_whose_opening_fill_was_deleted_is_reported_not_dropped(
 async def test_an_empty_symbol_is_not_labelled_an_unknown_instrument(conn):
     """Final-review finding (M5): the fallback used to be
     `r["symbol"] or "(unknown instrument)"`, keyed off the symbol's own
-    truthiness. `instrument.symbol` is TEXT NOT NULL with no non-empty check,
-    so a reachable instrument with an empty symbol -- a thin importer or a
-    hand-inserted row -- got labelled "(unknown instrument)" while its
-    quantity, basis and mark were still priced normally: a row that
-    contradicts itself. Reachability is what decides the label."""
+    truthiness. A reachable instrument with an empty symbol got labelled
+    "(unknown instrument)" while its quantity, basis and mark were still
+    priced normally: a row that contradicts itself. Reachability is what
+    decides the label.
+
+    Migration 005 now forbids minting such a row, so this test drops that
+    constraint to build one. That is not a workaround -- it is the accurate
+    setup. The constraint is deliberately NOT VALID precisely because the live
+    ledger still HOLDS a blank-symbol instrument (known-gap #77), inherited
+    from the pre-#35 importer and not repairable without owner input. So this
+    row is exactly what production has: one that can no longer be created, and
+    still has to render correctly. When gap #77 is repaired and the constraint
+    validated, this test becomes about history and can go."""
+    await conn.execute(
+        "ALTER TABLE instrument DROP CONSTRAINT instrument_symbol_not_blank"
+    )
     acc = await create_account(conn, name="EmptySym", venue="manual", account_type="cash")
     inst = await upsert_instrument(
         conn,

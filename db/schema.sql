@@ -59,6 +59,25 @@ CREATE TABLE IF NOT EXISTS instrument (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Issue #27: an instrument may not carry a blank symbol. Added NOT VALID and
+-- guarded by IF NOT EXISTS, matching db/migrations/005 exactly -- see that
+-- file for the full reasoning. Both halves must agree because
+-- test_schema_equivalence compares pg_get_constraintdef(), which prints the
+-- literal "NOT VALID"; and this file re-runs on every deploy, so a
+-- drop-and-re-add here would undo a later VALIDATE CONSTRAINT.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'instrument_symbol_not_blank'
+          AND conrelid = 'instrument'::regclass
+    ) THEN
+        ALTER TABLE instrument
+            ADD CONSTRAINT instrument_symbol_not_blank
+            CHECK (btrim(symbol) <> '') NOT VALID;
+    END IF;
+END $$;
+
 -- fill is created before trade: trade.opening_fill_id references fill(id), so
 -- fill must exist first or the schema will not apply to a clean database.
 CREATE TABLE IF NOT EXISTS fill (
