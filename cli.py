@@ -49,6 +49,18 @@ from ledger.reconcile import Position, ReconcileVerdict, Snapshot, UnvaluableRef
 from ledger.types import AssetClass, Fill, FillSource, Instrument, Side
 from venues.coinbase_client import CoinbaseCredentials, fetch_all_fills
 
+# Migrations that invalidate derived columns already written to the database.
+# Membership means "applying this to a POPULATED database leaves realized_pnl
+# and friends computed under a superseded convention", not merely "this is a
+# schema change" -- every migration is that. Only 001 qualifies today: it
+# changed how realized_pnl is derived. A migration that adds a constraint, a
+# column, or an index changes no derivation and must never appear here.
+#
+# Add to this set only alongside the migration that earns it, and say why in
+# its file. Getting this wrong in the safe direction (omitting one) means a
+# real staleness goes unannounced, which is worse than the noise it replaced.
+_DERIVED_COLUMN_MIGRATIONS = frozenset({"001_a2_ledger_completion.sql"})
+
 
 async def cmd_migrate(_args) -> int:
     pool = await create_pool()
@@ -81,16 +93,27 @@ async def cmd_migrate(_args) -> int:
         print(f"applied {len(applied)} migration(s):")
         for name in applied:
             print(f"  {name}")
-        if existed_before:
-            # A migration can add columns but cannot recompute existing rows —
-            # migration 001 changes how realized_pnl is derived, so rows written
-            # before it keep the old convention until regrouped. A virgin
-            # database has no pre-existing rows to be stale, so this warning is
-            # scoped to `existed_before` rather than printed unconditionally;
-            # doing otherwise on every fresh install would train the operator
-            # to ignore it.
+        stale_makers = sorted(_DERIVED_COLUMN_MIGRATIONS.intersection(applied))
+        if existed_before and stale_makers:
+            # A migration can add columns but cannot recompute existing rows,
+            # so applying one that changes a derivation leaves already-written
+            # rows on the old convention until regrouped. Two separate scopes
+            # are needed and only one used to be applied:
+            #
+            #   existed_before -- a virgin database has no pre-existing rows to
+            #     be stale, so a fresh install must not print this.
+            #   stale_makers   -- and neither must a migration that changes no
+            #     derivation at all. Migration 005 (a CHECK constraint) tripped
+            #     this in production on 2026-09-10 and told the operator to
+            #     regroup every account for nothing.
+            #
+            # The second omission is the failure this comment's own last
+            # sentence warned about, one level up: a warning that fires when
+            # nothing is wrong is one the operator learns to skip, and it is
+            # then just as unread when something IS wrong.
+            names = ", ".join(stale_makers)
             print(
-                "\nDerived columns are stale: migration 001 changes how realized_pnl\n"
+                f"\nDerived columns are stale: {names} changes how realized_pnl\n"
                 "is computed. Run `regroup --account <uuid>` for every account before\n"
                 "trusting any P&L figure."
             )

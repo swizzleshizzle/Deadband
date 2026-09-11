@@ -162,15 +162,20 @@ async def test_cmd_migrate_warns_to_regroup_when_migrations_applied_to_an_existi
     """Migration 001 changes how realized_pnl is computed, but a migration
     cannot rewrite rows that already exist under the old convention — only a
     regroup can. `conn` already has a schema applied by the fixtures (i.e.
-    this is not a virgin database), so forcing apply() to report something
-    applied must produce the regroup warning. Fails if cmd_migrate stays
-    silent about stale derived columns after applying migrations."""
+    this is not a virgin database), so forcing apply() to report 001 applied
+    must produce the regroup warning. Fails if cmd_migrate stays silent about
+    stale derived columns after applying migrations.
+
+    The name here is the REAL migration filename. It used to be a stand-in
+    ("001_fake.sql"), which passed against a warning that fired for any
+    migration whatsoever -- so this test could not tell the two apart, and
+    did not notice when migration 005 started warning for nothing."""
 
     async def fake_create_pool(*_a, **_kw):
         return _FakePool(conn)
 
     async def fake_apply(_conn):
-        return ["001_fake.sql"]
+        return ["001_a2_ledger_completion.sql"]
 
     monkeypatch.setattr(cli, "create_pool", fake_create_pool)
     monkeypatch.setattr(cli, "apply_migrations", fake_apply)
@@ -5170,3 +5175,75 @@ async def test_fills_rm_refuses_an_imported_fill(conn, monkeypatch, capsys):
     assert rc == 1
     assert "immutable" in capsys.readouterr().err
     assert await conn.fetchval("SELECT count(*) FROM fill WHERE id = $1", imported.id) == 1
+
+
+async def test_cmd_migrate_does_not_warn_for_a_migration_that_changes_no_derivation(
+    conn, monkeypatch, capsys
+):
+    """The production regression, 2026-09-10. Migration 005 adds a CHECK
+    constraint and recomputes nothing, but deploying it printed "Derived
+    columns are stale ... Run regroup for every account before trusting any
+    P&L figure" -- advice that was pure noise, on a database whose figures
+    were fine.
+
+    `existed_before` alone was never enough: it distinguishes a fresh install
+    from a populated one, not a migration that invalidates derived columns
+    from one that does not."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_apply(_conn):
+        return ["005_instrument_symbol_not_blank.sql"]
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "apply_migrations", fake_apply)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "005_instrument_symbol_not_blank.sql" in out  # still reported as applied
+    assert "regroup" not in out.lower()  # but not as a reason to regroup
+
+
+async def test_cmd_migrate_warns_when_a_mixed_batch_includes_a_derivation_change(
+    conn, monkeypatch, capsys
+):
+    """A pending batch on a long-untouched database applies several at once.
+    One qualifying member is enough, and the message must name it rather than
+    the batch -- an operator told "migrations are stale" cannot tell which
+    figures to distrust."""
+
+    async def fake_create_pool(*_a, **_kw):
+        return _FakePool(conn)
+
+    async def fake_apply(_conn):
+        return ["001_a2_ledger_completion.sql", "005_instrument_symbol_not_blank.sql"]
+
+    monkeypatch.setattr(cli, "create_pool", fake_create_pool)
+    monkeypatch.setattr(cli, "apply_migrations", fake_apply)
+
+    rc = await cli.cmd_migrate(argparse.Namespace())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "regroup" in out.lower()
+    stale_line = next(ln for ln in out.splitlines() if "Derived columns are stale" in ln)
+    assert "001_a2_ledger_completion.sql" in stale_line
+    assert "005_instrument_symbol_not_blank.sql" not in stale_line
+
+
+def test_every_derived_column_migration_names_a_real_file():
+    """The failure mode a string set invites: rename or renumber the migration
+    and the constant silently stops matching, so the warning never fires again.
+
+    An earlier draft of this docstring claimed the behavioural tests above
+    "can never" catch that. Mutation-testing disproved it -- renaming the
+    entry to `001_a2_ledger_completion_RENAMED.sql` fails those tests too,
+    because they feed cmd_migrate the real filename. This test earns its place
+    on diagnosis rather than coverage: it fails saying the constant names a
+    file that is not on disk, where the others fail saying a warning did not
+    appear, which is the symptom two steps downstream."""
+    migrations = pathlib.Path(cli.__file__).parent / "db" / "migrations"
+    present = {p.name for p in migrations.glob("*.sql")}
+    missing = cli._DERIVED_COLUMN_MIGRATIONS - present
+    assert not missing, f"named in _DERIVED_COLUMN_MIGRATIONS but not on disk: {sorted(missing)}"
