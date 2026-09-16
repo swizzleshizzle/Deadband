@@ -79,7 +79,19 @@ async def quotes(
     unquoted: list[dict] = []
     wanted: dict[str, UUID] = {}
     for instrument_id, symbol in ordered.items():
-        r = rows[instrument_id]
+        r = rows.get(instrument_id)
+        if r is None:
+            # markable_positions filters these out, so this is unreachable
+            # today -- an UNREACHABLE-instrument position is keyed on its
+            # TRADE id rather than an instrument id (ledger/positions.py), so
+            # the lookup finds nothing. Reporting it beats a KeyError: this is
+            # a read endpoint, and a 500 here takes the marks screen down with
+            # it for a row that was never priceable anyway.
+            unquoted.append({
+                "instrument_id": instrument_id, "symbol": symbol,
+                "reason": "no instrument record for this position",
+            })
+            continue
         try:
             mapped = provider_symbol(
                 asset_class=r["asset_class"],
