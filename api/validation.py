@@ -106,3 +106,23 @@ def refuse_future(value: datetime, now: datetime, field: str) -> None:
             f"{field}: {value.isoformat()} is in the future "
             f"(tolerance: {MARK_FUTURE_TOLERANCE})",
         )
+
+
+def parse_source(raw: str, field: str) -> str:
+    """A mark's provenance: where the price came from.
+
+    Free text, not an enum. `mark.source` is TEXT and a second provider must
+    be able to record itself without a migration or a change here -- the
+    column exists to answer "where did this number come from", and an
+    allowlist would answer it only for providers that existed when the
+    allowlist was written.
+
+    Blank is refused, though, and that is not the same choice. `source` is
+    NOT NULL DEFAULT 'manual', so storing "" produces a mark that claims to
+    know its provenance and names nothing -- strictly worse than the default
+    it displaced, because "manual" is at least true of a mark a human typed.
+    """
+    cleaned = raw.strip()
+    if not cleaned:
+        raise HTTPException(422, f"{field}: source must not be blank")
+    return cleaned

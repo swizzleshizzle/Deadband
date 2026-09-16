@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from api.deps import get_conn, get_write_conn
 from api.identity import require_trusted_identity
 from api.serialization import DeadbandJSONResponse
-from api.validation import parse_decimal, parse_instant, refuse_future
+from api.validation import parse_decimal, parse_instant, parse_source, refuse_future
 from db.marks import latest_marks, set_mark
 from db.positions import open_positions
 
@@ -94,6 +94,11 @@ async def marks(conn: asyncpg.Connection = Depends(get_conn)) -> DeadbandJSONRes
 class MarkIn(BaseModel):
     instrument_id: UUID
     price: str
+    # Omitted means manual, which is what every caller before the quotes
+    # screen meant and what db/marks.py already defaults to. Per mark, not per
+    # batch: the marks screen submits fetched and hand-typed prices together,
+    # and one source for the batch would mislabel half of them.
+    source: str | None = None
 
 
 class MarksIn(BaseModel):
@@ -145,7 +150,7 @@ async def create_marks(
     # must not leave rows 1-3 written. The transaction makes that true anyway,
     # but failing early keeps the error clean -- api/fills.py's identical
     # comment.
-    parsed: list[tuple[UUID, Decimal]] = []
+    parsed: list[tuple[UUID, Decimal, str | None]] = []
     for i, m in enumerate(body.marks):
         price = parse_decimal(m.price, f"marks[{i}].price")
         # mark_price_chk is `price >= 0 AND price < 'Infinity'`. Zero is a
@@ -155,7 +160,8 @@ async def create_marks(
         # 500 for what is plainly a bad request.
         if price < 0:
             raise HTTPException(422, f"marks[{i}].price: {m.price!r} must not be negative")
-        parsed.append((m.instrument_id, price))
+        source = parse_source(m.source, f"marks[{i}].source") if m.source is not None else None
+        parsed.append((m.instrument_id, price, source))
 
     known = {
         r["id"]
@@ -168,7 +174,12 @@ async def create_marks(
         raise HTTPException(404, f"instrument not found: {sorted(str(m) for m in missing)[0]}")
 
     async with conn.transaction():
-        for instrument_id, price in parsed:
-            await set_mark(conn, instrument_id, price, as_of)
+        for instrument_id, price, source in parsed:
+            # set_mark's own default is "manual"; passing None through would
+            # overwrite it with NULL on a NOT NULL column.
+            if source is None:
+                await set_mark(conn, instrument_id, price, as_of)
+            else:
+                await set_mark(conn, instrument_id, price, as_of, source=source)
 
     return DeadbandJSONResponse({"marks_set": len(parsed), "as_of": as_of}, status_code=201)

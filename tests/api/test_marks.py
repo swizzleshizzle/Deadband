@@ -300,3 +300,104 @@ async def test_post_marks_404s_on_an_unknown_instrument(client):
               "marks": [{"instrument_id": str(uuid4()), "price": "10"}]},
     )
     assert r.status_code == 404
+
+
+# --- a mark's source travels with it (spec D7) -----------------------------
+
+
+async def test_a_mark_records_manual_by_default(conn, client):
+    """No caller changes: every existing POST omits `source`, and those marks
+    must keep saying manual -- which is true of them."""
+    acc = await create_account(conn, name="S1", venue="manual", account_type="cash")
+    inst = await _held(conn, acc, "ZSRC")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-06-01T15:30:00Z",
+              "marks": [{"instrument_id": str(inst), "price": "10"}]},
+    )
+    assert r.status_code == 201
+
+    assert await conn.fetchval("SELECT source FROM mark WHERE instrument_id = $1", inst) == "manual"
+
+
+async def test_a_fetched_price_records_its_provider(conn, client):
+    """Spec D7: a delayed third-party price must never be mistaken for a
+    broker-confirmed one. Without this the whole quotes feature would store
+    scraped numbers indistinguishable from ones a human typed off a
+    statement."""
+    acc = await create_account(conn, name="S2", venue="manual", account_type="cash")
+    inst = await _held(conn, acc, "ZSRD")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-06-01T15:30:00Z",
+              "marks": [{"instrument_id": str(inst), "price": "10", "source": "yahoo"}]},
+    )
+    assert r.status_code == 201
+
+    assert await conn.fetchval("SELECT source FROM mark WHERE instrument_id = $1", inst) == "yahoo"
+
+
+async def test_an_unknown_source_is_accepted(conn, client):
+    """Provenance, not an enum. A second provider must not need a migration
+    or a code change here to record where its price came from."""
+    acc = await create_account(conn, name="S3", venue="manual", account_type="cash")
+    inst = await _held(conn, acc, "ZSRE")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-06-01T15:30:00Z",
+              "marks": [{"instrument_id": str(inst), "price": "10", "source": "some-future-feed"}]},
+    )
+    assert r.status_code == 201
+    assert (
+        await conn.fetchval("SELECT source FROM mark WHERE instrument_id = $1", inst)
+        == "some-future-feed"
+    )
+
+
+async def test_a_blank_source_is_refused_rather_than_stored(conn, client):
+    """A blank provenance is worse than none: `source` is NOT NULL DEFAULT
+    'manual', so storing '' would produce a mark that claims to know where it
+    came from and names nothing."""
+    acc = await create_account(conn, name="S4", venue="manual", account_type="cash")
+    inst = await _held(conn, acc, "ZSRF")
+
+    r = await client.post(
+        "/api/marks",
+        json={"as_of": "2026-06-01T15:30:00Z",
+              "marks": [{"instrument_id": str(inst), "price": "10", "source": "   "}]},
+    )
+    assert r.status_code == 422
+    assert "marks[0].source" in r.json()["detail"]
+
+
+async def test_each_mark_in_a_batch_keeps_its_own_source(conn, client):
+    """The mixed batch the marks screen actually submits: some rows fetched,
+    some typed after the user corrected them. A per-batch source would mislabel
+    half of them."""
+    acc = await create_account(conn, name="S5", venue="manual", account_type="cash")
+    fetched = await _held(conn, acc, "ZSRG")
+    typed = await _held(conn, acc, "ZSRH")
+
+    r = await client.post(
+        "/api/marks",
+        json={
+            "as_of": "2026-06-01T15:30:00Z",
+            "marks": [
+                {"instrument_id": str(fetched), "price": "10", "source": "yahoo"},
+                {"instrument_id": str(typed), "price": "20"},
+            ],
+        },
+    )
+    assert r.status_code == 201
+
+    rows = dict(
+        (r["instrument_id"], r["source"])
+        for r in await conn.fetch(
+            "SELECT instrument_id, source FROM mark WHERE instrument_id = ANY($1::uuid[])",
+            [fetched, typed],
+        )
+    )
+    assert rows == {fetched: "yahoo", typed: "manual"}
