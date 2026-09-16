@@ -224,3 +224,50 @@ async def test_a_provider_that_raises_does_not_500_the_endpoint(conn, api_app, c
     assert body["quotes"] == []
     assert [u["instrument_id"] for u in body["unquoted"]] == [str(inst)]
     assert "provider" in body["unquoted"][0]["reason"].lower()
+
+
+async def test_an_unvaluable_position_is_neither_quoted_nor_listed(conn, api_app, client):
+    """The filter in api/markable.py, exercised rather than assumed.
+
+    Mutation-tested 2026-09-16: deleting `unvaluable_reason is None` from
+    api/markable.py left all 23 tests in this file and test_marks.py green,
+    because nothing seeded an unvaluable position. The agreement test above
+    cannot catch it either -- both endpoints change together and stay equal.
+
+    Built the way tests/db/test_positions.py builds one: protect a trade with
+    notes, delete its opening fill, regroup. The composite FK nulls
+    opening_fill_id and the protection path nulls open_quantity alongside it,
+    which is the "open quantity unknown" reason in ledger/positions.py. Such a
+    position cannot be priced, so offering a price for it is an action that
+    changes nothing.
+    """
+    from db.trades import list_trades
+
+    acc = await create_account(conn, name="QU", venue="manual", account_type="cash")
+    good = await _held(conn, acc, _equity("ZQGD"), ref="good-1")
+
+    orphan_inst = await upsert_instrument(conn, _equity("ZQOR"))
+    fill = Fill(
+        id=uuid4(), account_id=acc, instrument_id=orphan_inst,
+        executed_at=datetime(2026, 6, 1, 15, 30, tzinfo=UTC), side=Side.BUY,
+        quantity=Decimal("5"), price=Decimal("10"), fee=Decimal("0"),
+        fee_currency="USD", source=FillSource.MANUAL, venue_fill_id="orphan-1",
+        is_estimated=False,
+    )
+    await insert_fills(conn, [fill])
+    await regroup_account(conn, acc)
+    trade = next(t for t in await list_trades(conn, acc) if t["opening_fill_id"] == fill.id)
+    await conn.execute("UPDATE trade SET notes = 'keep me' WHERE id = $1", trade["id"])
+    await conn.execute("DELETE FROM fill WHERE id = $1", fill.id)
+    await regroup_account(conn, acc)
+
+    api_app.state.quote_source = _StubSource({"ZQGD": "5", "ZQOR": "99"})
+
+    quotes = (await client.get("/api/quotes")).json()
+    marks = (await client.get("/api/marks")).json()
+
+    seen = {q["instrument_id"] for q in quotes["quotes"]} | {
+        u["instrument_id"] for u in quotes["unquoted"]
+    }
+    assert seen == {str(good)}, "an unvaluable position must not be offered a quote"
+    assert {m["instrument_id"] for m in marks["marks"]} == {str(good)}
