@@ -21,8 +21,10 @@ from fastapi import FastAPI, Request, Response
 from api.accounts import router as accounts_router
 from api.dashboard import router as dashboard_router
 from api.health import router as health_router
+from api.quotes import router as quotes_router
 from api.serialization import DeadbandJSONResponse
 from api.trades import router as trades_router
+from marketdata.yahoo import YahooQuotes
 
 _WEB_DIST = pathlib.Path(__file__).resolve().parents[1] / "web" / "dist"
 
@@ -68,10 +70,15 @@ def create_app(enable_writes: bool | None = None) -> FastAPI:
     )
     app.state.pool = None
     app.state.write_pool = None
+    # Replaced wholesale in tests, so no test can reach a network.
+    app.state.quote_source = YahooQuotes()
     app.include_router(health_router)
     app.include_router(trades_router)
     app.include_router(dashboard_router)
     app.include_router(accounts_router)
+    # A READ route, registered unconditionally with the others: it draws
+    # from the read-only pool and proposes prices, it never writes a mark.
+    app.include_router(quotes_router)
     # Write routes exist ONLY when explicitly enabled. When the flag is unset
     # these endpoints are absent and return 404 to every request -- or 405
     # when web/dist is mounted below, because the SPA catch-all is GET-only
