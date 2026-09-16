@@ -273,6 +273,11 @@ export interface MarksPage {
 export interface MarkIn {
   instrument_id: string
   price: string
+  // Omitted means manual. Sent only for a row still holding exactly the
+  // price the provider returned -- see Marks.tsx, where editing a fetched
+  // value drops it back to manual, because at that point a human chose the
+  // number and the mark should say so.
+  source?: string
 }
 
 export interface SetMarksResult {
@@ -301,7 +306,34 @@ export interface CreatedSnapshot {
   replaced: boolean
 }
 
+// --- quotes: proposed prices, never written by this call ------------------
+
+export interface QuoteRow {
+  instrument_id: string
+  symbol: string
+  provider_symbol: string
+  price: string
+  currency: string
+  source: string
+}
+
+export interface UnquotedRow {
+  instrument_id: string
+  symbol: string
+  // Why this one could not be priced, shown next to its input so the row
+  // reads as "type this yourself" rather than as one nobody got to.
+  reason: string
+}
+
+export interface QuotesPage {
+  quotes: QuoteRow[]
+  unquoted: UnquotedRow[]
+  generated_at: string
+}
+
 export const fetchMarks = () => get<MarksPage>('/api/marks')
+
+export const fetchQuotes = () => get<QuotesPage>('/api/quotes')
 
 // `send` is the file's existing JSON helper (used by createFills/deleteFill).
 // It already routes a 404 to NotFound and pulls the API's `detail` string out

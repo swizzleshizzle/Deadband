@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchMarks, setMarks, type MarkRow } from '../api'
+import { fetchMarks, fetchQuotes, setMarks, type MarkRow } from '../api'
 import { toInstant } from '../datetime'
 import { money, qty } from '../format'
 
@@ -35,6 +35,13 @@ export default function Marks() {
   const [error, setError] = useState<string | null>(null)
   const [errorRow, setErrorRow] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
+  // instrument_id -> the price the provider returned, verbatim. Two jobs: it
+  // labels the row with its source, and it decides at submit whether the
+  // value still IN the input is the fetched one. Editing a fetched price
+  // makes it the user's number, and the mark must then say manual.
+  const [fetched, setFetched] = useState<Record<string, { price: string; source: string }>>({})
+  const [unquoted, setUnquoted] = useState<Record<string, string>>({})
+  const [fetching, setFetching] = useState(false)
 
   // Not `async`/`await`: oxlint's react(set-state-in-effect) rule traces into
   // an async function's setState calls when it is invoked from useEffect
@@ -59,6 +66,39 @@ export default function Marks() {
   // impossible to mark an expired option worthless.
   const filled = Object.entries(prices).filter(([, p]) => p.trim() !== '')
 
+  async function fetchPrices() {
+    if (fetching) return
+    setFetching(true)
+    setError(null)
+    setSaved(null)
+    try {
+      const page = await fetchQuotes()
+      const byId: Record<string, { price: string; source: string }> = {}
+      for (const q of page.quotes) byId[q.instrument_id] = { price: q.price, source: q.source }
+      setFetched(byId)
+      setUnquoted(Object.fromEntries(page.unquoted.map((u) => [u.instrument_id, u.reason])))
+      // MERGE, never replace: a price already typed by hand is not
+      // overwritten. A human typing a number is a stronger signal than a
+      // scrape, and silently clobbering it would be the one behaviour that
+      // makes this button untrustworthy.
+      setPrices((p) => {
+        const next = { ...p }
+        for (const [id, q] of Object.entries(byId)) {
+          if ((next[id] ?? '').trim() === '') next[id] = q.price
+        }
+        return next
+      })
+      setSaved(
+        `${page.quotes.length} quoted` +
+          (page.unquoted.length > 0 ? `, ${page.unquoted.length} need typing` : ''),
+      )
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err))
+    } finally {
+      setFetching(false)
+    }
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (busy || filled.length === 0) return
@@ -73,10 +113,22 @@ export default function Marks() {
       const at = toInstant(asOf, 'as of')
       const r = await setMarks({
         as_of: at,
-        marks: filled.map(([instrument_id, price]) => ({ instrument_id, price: price.trim() })),
+        marks: filled.map(([instrument_id, price]) => {
+          const trimmed = price.trim()
+          const q = fetched[instrument_id]
+          // Only an UNEDITED fetched value carries the provider's name. Once
+          // the user changes it, the number is theirs and the stored
+          // provenance must not claim otherwise -- that claim is the whole
+          // point of recording a source at all.
+          return q && q.price === trimmed
+            ? { instrument_id, price: trimmed, source: q.source }
+            : { instrument_id, price: trimmed }
+        }),
       })
       setSaved(`${r.marks_set} mark${r.marks_set === 1 ? '' : 's'} recorded`)
       setPrices({})
+      setFetched({})
+      setUnquoted({})
       // Reload rather than patching state: the server is the authority on
       // what the stored mark and its age now are, and a mark written at an
       // as_of EARLIER than an existing one does not become "the latest"
@@ -161,6 +213,24 @@ export default function Marks() {
                   }
                   aria-label={`price for ${row.symbol} (${row.natural_key})`}
                 />
+                {/* Three distinct states, deliberately distinguishable: this
+                    price came from a provider and is untouched; it came from
+                    one and you have since edited it, so it will be stored as
+                    manual; or it could not be fetched at all and the reason
+                    says why. An empty box with no note is none of those -- it
+                    is a row nobody has got to yet. */}
+                {fetched[row.instrument_id] &&
+                  (fetched[row.instrument_id].price === (prices[row.instrument_id] ?? '').trim() ? (
+                    <span className="muted"> {fetched[row.instrument_id].source}</span>
+                  ) : (
+                    <span className="muted"> edited · manual</span>
+                  ))}
+                {unquoted[row.instrument_id] && (
+                  <span className="muted" title={unquoted[row.instrument_id]}>
+                    {' '}
+                    not quoted — type it
+                  </span>
+                )}
               </td>
             </tr>
           ))}
@@ -171,6 +241,9 @@ export default function Marks() {
         <span className="muted">
           {filled.length} of {rows.length} filled · blank rows are left untouched
         </span>
+        <button type="button" onClick={() => void fetchPrices()} disabled={busy || fetching}>
+          {fetching ? 'fetching…' : 'Fetch quotes'}
+        </button>
         <button type="submit" disabled={busy || filled.length === 0}>
           {busy ? 'saving…' : 'Save marks'}
         </button>
