@@ -117,3 +117,37 @@ async def test_unmarked_position_nulls_equity_and_lists_unvaluable(client, conn)
     assert pos["mark"] is None
     assert pos["market_value"] is None
     assert pos["unrealized_pnl"] is None
+
+
+async def test_unmarked_position_makes_drift_unreliable_even_when_cash_agrees(client, conn):
+    """The statement matches the ledger's cash to the cent, but an open position
+    has no mark. The comparison left the position out, so it must not say 'ok'."""
+    acc = await create_account(conn, name="R", venue="manual", account_type="cash")
+    inst = await upsert_instrument(
+        conn, Instrument(id=None, asset_class=AssetClass.EQUITY, symbol="ZZR", quote_currency="USD")
+    )
+    await conn.execute(
+        "INSERT INTO cash_movement (account_id, occurred_at, kind, amount)"
+        " VALUES ($1, $2, 'deposit', 1000)",
+        acc,
+        _T,
+    )
+    await insert_fills(
+        conn, [_fill(acc, inst, side=Side.BUY, qty="3", price="10", minutes=0, ref="r1")]
+    )
+    await regroup_account(conn, acc)
+    await add_snapshot(
+        conn,
+        acc,
+        as_of=_T.replace(minute=40),
+        cash_balance=Decimal("970"),
+        total_equity=Decimal("970"),
+    )
+
+    body = (await client.get("/api/dashboard")).json()
+
+    tile = next(a for a in body["accounts"] if a["id"] == str(acc))
+    assert tile["equity"] is None
+    assert tile["drift"]["verdict"] == "unreliable"
+    warning = next(w for w in body["drift_warnings"] if w["account_id"] == str(acc))
+    assert warning["verdict"] == "unreliable"
