@@ -113,6 +113,12 @@ async def dashboard(conn: asyncpg.Connection = Depends(get_conn)) -> DeadbandJSO
                 {"instrument": entry["instrument"], "account_id": p.account_id,
                  "reason": "no mark recorded"}
             )
+            # This position is absent from recon_positions, so unless reconcile
+            # hears about it here, a statement matching cash alone reads as 'ok'.
+            recon_unvaluable.setdefault(p.account_id, []).append(
+                UnvaluableRef(instrument_id=p.instrument_id, symbol=p.symbol,
+                              reason="no mark recorded")
+            )
         positions_payload.append(entry)
 
     marks_prices = {iid: price for iid, (price, _t) in raw_marks.items()}
